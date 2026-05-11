@@ -2,8 +2,35 @@ package postgres
 
 import (
 	"context"
+	"log/slog"
+	"os"
+	"strconv"
 	"strings"
+
+	goredis "github.com/redis/go-redis/v9"
 )
+
+// goredisParseURL / goredisNewClient — narrow aliases so we don't import the
+// goredis package directly in the factory body. Keeps the call sites readable
+// and the dependency obvious in this file alone.
+func goredisParseURL(s string) (*goredis.Options, error) { return goredis.ParseURL(s) }
+func goredisNewClient(o *goredis.Options) *goredis.Client { return goredis.NewClient(o) }
+
+func k8sEnv(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func k8sEnvInt(key string, fallback int) int {
+	if v := os.Getenv(key); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			return i
+		}
+	}
+	return fallback
+}
 
 // Backend is the interface every Postgres provisioning backend must implement.
 type Backend interface {
@@ -28,6 +55,41 @@ func NewBackend(backendType, customersURL, clusterURLs, neonAPIKey, neonRegionID
 	switch backendType {
 	case "neon":
 		return newNeonBackend(neonAPIKey, neonRegionID)
+	case "k8s":
+		// Dedicated-pod-per-resource backend for every tier. Each /db/new
+		// provisions a real Postgres pod in its own namespace; sizing is
+		// driven by `tier` inside Provision (see sizingForTier).
+		//
+		// Env-var driven so we don't have to thread a Config object through
+		// the existing factory signature.
+		kubeconfig := os.Getenv("K8S_KUBECONFIG")
+		storageClass := k8sEnv("K8S_STORAGE_CLASS", "do-block-storage")
+		image := k8sEnv("K8S_POSTGRES_IMAGE", "")
+		externalHost := k8sEnv("K8S_EXTERNAL_HOST", "")
+		// storageSizeGi from env is now a per-resource ceiling; the actual PVC
+		// is tier-sized via sizingForTier. Kept as a no-op default to avoid
+		// breaking the constructor signature.
+		storageSizeGi := k8sEnvInt("K8S_POSTGRES_STORAGE_GI", 50)
+		b, err := newK8sBackend(kubeconfig, storageClass, image, externalHost, storageSizeGi)
+		if err != nil {
+			slog.Error("postgres.k8s_backend_init_failed_fallback_to_local", "error", err)
+			return newLocalBackend(customersURL)
+		}
+		// Route registry: when REDIS_URL_FOR_ROUTES is set (or REDIS_URL),
+		// every successful Provision publishes a route to Redis so the
+		// pg-proxy in front of pg.instanode.dev:5432 can demux by db name.
+		routeRedisURL := k8sEnv("REDIS_URL_FOR_ROUTES", os.Getenv("REDIS_URL"))
+		if routeRedisURL != "" {
+			if opt, perr := goredisParseURL(routeRedisURL); perr == nil {
+				rdb := goredisNewClient(opt)
+				b.EnableRouteRegistry(rdb, k8sEnv("PG_PROXY_ROUTE_PREFIX", "pg_route:"))
+				slog.Info("postgres.route_registry_enabled", "redis_url_set", true)
+			} else {
+				slog.Warn("postgres.route_registry_disabled_bad_redis_url", "error", perr)
+			}
+		}
+		slog.Info("postgres.backend_selected", "backend", "k8s", "external_host", externalHost)
+		return b
 	default:
 		if clusterURLs != "" {
 			urls := strings.Split(clusterURLs, ",")

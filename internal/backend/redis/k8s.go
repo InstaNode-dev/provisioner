@@ -4,11 +4,25 @@ package redis
 // Security model and architecture mirrors the postgres K8sBackend — see postgres/k8s.go.
 //
 // Configuration env vars:
-//   K8S_EXTERNAL_HOST      — hostname in returned URLs (required for k8s backend)
-//   K8S_REDIS_IMAGE        — container image, default "redis:7-alpine"
-//   K8S_STORAGE_CLASS      — PVC storage class, default "gp3"
-//   K8S_REDIS_STORAGE_GI   — PVC size in GiB, default 10
-//   K8S_KUBECONFIG         — path to kubeconfig file; empty = in-cluster
+//   K8S_EXTERNAL_HOST       — legacy NodePort hostname (kept for back-compat / fallback URL)
+//   K8S_REDIS_PUBLIC_HOST   — hostname embedded in customer URLs when redis-proxy is fronting
+//                             the cluster (default "redis.instanode.dev")
+//   K8S_REDIS_IMAGE         — container image, default "redis:7-alpine"
+//   K8S_STORAGE_CLASS       — PVC storage class, default "gp3"
+//   K8S_REDIS_STORAGE_GI    — PVC size in GiB, default 10 (overridden by tier sizing)
+//   K8S_KUBECONFIG          — path to kubeconfig file; empty = in-cluster
+//
+// # External access model
+//
+// Customer connection URLs are of the form `redis://:<pass>@<publicHost>:6379/0`. The
+// redis-proxy (see redis-proxy/) listens on :6379 in the cluster, reads the client's
+// first command (AUTH or HELLO AUTH), looks up `redis_route_by_password:<pass>` in
+// Redis to find the dedicated pod, and forwards bytes transparently. The backend
+// performs the real AUTH check.
+//
+// When K8S_REDIS_PUBLIC_HOST is empty, the URL falls back to the legacy
+// `redis://:<pass>@<K8S_EXTERNAL_HOST>:<NodePort>/0` shape so resources remain
+// reachable in environments without the proxy.
 
 import (
 	"context"
@@ -34,22 +48,105 @@ import (
 )
 
 const (
-	redisK8sNsPrefix    = "instant-customer-"
-	redisK8sRoleLabel   = "instant.dev/role"
-	redisK8sRoleValue   = "customer-resource"
-	redisK8sReadyTO     = 3 * time.Minute
-	redisK8sReadyPoll   = 3 * time.Second
+	redisK8sNsPrefix  = "instant-customer-"
+	redisK8sRoleLabel = "instant.dev/role"
+	redisK8sRoleValue = "customer-resource"
+	redisK8sReadyTO   = 3 * time.Minute
+	redisK8sReadyPoll = 3 * time.Second
 )
+
+// tierSizing maps a billing tier to k8s resource sizing for the provisioned Redis pod.
+// Anonymous (24h trial) gets the smallest viable pod — still a real, dedicated Redis,
+// just configured for low cost so the free tier scales. Each step up gives more
+// headroom; team is large enough to satisfy real production workloads.
+//
+// maxClients is Redis's pod-wide cap on simultaneous client connections (CONFIG SET
+// maxclients <N>). Per-user ACL maxconn would be cleaner but our connection URL uses
+// the default user (no ACL), so pod-level is the natural lever. Since each pod is
+// dedicated to one customer this is functionally a per-customer cap.
+type tierSizing struct {
+	cpuReq, memReq string
+	cpuLim, memLim string
+	pvcMi          int // PVC size in MiB (Redis pods are small relative to postgres)
+	// quotaRequests / quotaLimits cap the whole namespace as defense-in-depth.
+	qCPURequests, qMemRequests string
+	qCPULimits, qMemLimits     string
+	// maxClients is the Redis-level maxclients config applied via --maxclients flag.
+	// Bounds total simultaneous TCP clients connected to this pod.
+	maxClients int
+}
+
+func sizingForTier(tier string) tierSizing {
+	switch tier {
+	case "anonymous":
+		// Anonymous trial: smallest practical pod.
+		// pvcMi=0 → emptyDir: redis stays in-memory only, skipping the
+		// 5-10s DOKS block-storage attach on cold provision.
+		return tierSizing{
+			cpuReq: "50m", memReq: "64Mi",
+			cpuLim: "200m", memLim: "128Mi",
+			pvcMi:        0,
+			qCPURequests: "100m", qMemRequests: "128Mi",
+			qCPULimits: "400m", qMemLimits: "256Mi",
+			maxClients: 10,
+		}
+	case "hobby":
+		return tierSizing{
+			cpuReq: "100m", memReq: "128Mi",
+			cpuLim: "500m", memLim: "512Mi",
+			pvcMi:        1024, // 1Gi
+			qCPURequests: "200m", qMemRequests: "256Mi",
+			qCPULimits: "1", qMemLimits: "1Gi",
+			maxClients: 50,
+		}
+	case "pro":
+		return tierSizing{
+			cpuReq: "250m", memReq: "512Mi",
+			cpuLim: "2", memLim: "2Gi",
+			pvcMi:        10240, // 10Gi
+			qCPURequests: "500m", qMemRequests: "1Gi",
+			qCPULimits: "4", qMemLimits: "4Gi",
+			maxClients: 200,
+		}
+	case "team", "growth":
+		return tierSizing{
+			cpuReq: "500m", memReq: "1Gi",
+			cpuLim: "4", memLim: "4Gi",
+			pvcMi:        51200, // 50Gi
+			qCPURequests: "1", qMemRequests: "2Gi",
+			qCPULimits: "8", qMemLimits: "8Gi",
+			maxClients: 1000,
+		}
+	default:
+		// Unknown tier → conservative hobby-equivalent sizing.
+		return sizingForTier("hobby")
+	}
+}
 
 // K8sBackend provisions a dedicated Redis pod per token.
 type K8sBackend struct {
 	cs            *kubernetes.Clientset
 	storageClass  string // K8S_STORAGE_CLASS
 	image         string // K8S_REDIS_IMAGE
-	externalHost  string // K8S_EXTERNAL_HOST
-	storageSizeGi int    // K8S_REDIS_STORAGE_GI
+	externalHost  string // K8S_EXTERNAL_HOST (legacy NodePort host; kept for back-compat)
+	publicHost    string // K8S_REDIS_PUBLIC_HOST (e.g. redis.instanode.dev) — preferred URL host when set
+	storageSizeGi int    // K8S_REDIS_STORAGE_GI (legacy ceiling; tier sizing overrides per-resource)
+
+	// Route registry — written on every successful Provision so the Redis
+	// routing proxy (redis-proxy/) can demux. Two key families are written:
+	//   <routePrefix><token>            → <service-fqdn>:6379  (debugging / future token-based routing)
+	//   <passwordPrefix><password>      → <service-fqdn>:6379  (consumed by the proxy)
+	// When rdb == nil, no route records are written.
+	rdb            *goredis.Client
+	routePrefix    string
+	passwordPrefix string
 }
 
+// newK8sBackend constructs a K8sBackend. publicHost (K8S_REDIS_PUBLIC_HOST) is
+// the hostname embedded in customer URLs when the routing proxy is in front of
+// the cluster — defaults via SetPublicHost / EnableRouteRegistry from the
+// factory. externalHost is the legacy NodePort hostname; we still record it
+// for any caller that needs the per-pod NodePort URL.
 func newK8sBackend(kubeconfigPath, storageClass, image, externalHost string, storageSizeGi int) (*K8sBackend, error) {
 	var rc *rest.Config
 	var err error
@@ -61,6 +158,7 @@ func newK8sBackend(kubeconfigPath, storageClass, image, externalHost string, sto
 	if err != nil {
 		return nil, fmt.Errorf("k8s redis: build config: %w", err)
 	}
+	slog.Info("k8s.redis.init", "api_host", rc.Host)
 	cs, err := kubernetes.NewForConfig(rc)
 	if err != nil {
 		return nil, fmt.Errorf("k8s redis: new clientset: %w", err)
@@ -77,8 +175,44 @@ func newK8sBackend(kubeconfigPath, storageClass, image, externalHost string, sto
 	return &K8sBackend{cs: cs, storageClass: storageClass, image: image, externalHost: externalHost, storageSizeGi: storageSizeGi}, nil
 }
 
+// EnableRouteRegistry tells the K8sBackend to publish routing records to Redis
+// after every successful Provision so the redis-proxy can forward client
+// traffic to the dedicated pod. Two key families are written per resource:
+//
+//	<prefix><token>                 — debugging / future token-based lookup
+//	<passwordPrefix><password>      — consumed by redis-proxy to demux by AUTH
+//
+// Safe to call once at startup; subsequent calls overwrite. Passing rdb=nil
+// disables route registration (default).
+func (b *K8sBackend) EnableRouteRegistry(rdb *goredis.Client, prefix string) {
+	if prefix == "" {
+		prefix = "redis_route:"
+	}
+	b.rdb = rdb
+	b.routePrefix = prefix
+	if b.passwordPrefix == "" {
+		b.passwordPrefix = "redis_route_by_password:"
+	}
+}
+
+// SetPasswordRoutePrefix overrides the password→backend key family. Default
+// "redis_route_by_password:" matches the redis-proxy default. Must be called
+// before any Provision to take effect.
+func (b *K8sBackend) SetPasswordRoutePrefix(prefix string) {
+	if prefix == "" {
+		return
+	}
+	b.passwordPrefix = prefix
+}
+
+// SetPublicHost sets the hostname embedded in customer connection URLs when
+// the redis-proxy is fronting the cluster. Empty value keeps the legacy
+// K8S_EXTERNAL_HOST + NodePort URL shape.
+func (b *K8sBackend) SetPublicHost(host string) { b.publicHost = host }
+
 // Provision creates a dedicated Redis instance. The pod is started with --requirepass
-// injected via a k8s Secret — no init step needed (unlike Postgres).
+// and --maxclients injected via the container command. No post-start init step needed
+// (unlike Postgres).
 func (b *K8sBackend) Provision(ctx context.Context, token, tier string) (*Credentials, error) {
 	ns := redisK8sNsPrefix + token
 	password, err := redisK8sRandHex(16)
@@ -97,22 +231,26 @@ func (b *K8sBackend) Provision(ctx context.Context, token, tier string) (*Creden
 	provCtx, provCancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer provCancel()
 
+	sz := sizingForTier(tier)
+
 	if err := b.applyNamespace(provCtx, ns); err != nil {
 		return nil, fmt.Errorf("k8s redis: namespace: %w", err)
 	}
 	if err := b.applyNetworkPolicy(provCtx, ns, 6379); err != nil {
 		return nil, rollback("network policy", err)
 	}
-	if err := b.applyResourceQuota(provCtx, ns); err != nil {
+	if err := b.applyResourceQuota(provCtx, ns, sz); err != nil {
 		return nil, rollback("resource quota", err)
 	}
 	if err := b.applySecret(provCtx, ns, password); err != nil {
 		return nil, rollback("secret", err)
 	}
-	if err := b.applyPVC(provCtx, ns); err != nil {
-		return nil, rollback("pvc", err)
+	if sz.pvcMi > 0 {
+		if err := b.applyPVC(provCtx, ns, sz); err != nil {
+			return nil, rollback("pvc", err)
+		}
 	}
-	if err := b.applyDeployment(provCtx, ns); err != nil {
+	if err := b.applyDeployment(provCtx, ns, sz); err != nil {
 		return nil, rollback("deployment", err)
 	}
 	svc, err := b.applyService(provCtx, ns)
@@ -125,9 +263,42 @@ func (b *K8sBackend) Provision(ctx context.Context, token, tier string) (*Creden
 	}
 
 	nodePort := int(svc.Spec.Ports[0].NodePort)
-	connURL := fmt.Sprintf("redis://:%s@%s:%d/0", password, b.externalHost, nodePort)
 
-	slog.Info("k8s.redis.provisioned", "namespace", ns, "node_port", nodePort)
+	// Customer-facing URL.
+	//   With publicHost set (typical prod): redis://:<pass>@redis.instanode.dev:6379/0
+	//     — the redis-proxy demuxes by AUTH password and forwards to the right pod.
+	//   Without publicHost (legacy / dev without the proxy): falls back to the
+	//     NodePort URL so the resource is still reachable from outside the cluster.
+	var connURL string
+	if b.publicHost != "" {
+		connURL = fmt.Sprintf("redis://:%s@%s/0", password, b.publicHost)
+	} else {
+		connURL = fmt.Sprintf("redis://:%s@%s:%d/0", password, b.externalHost, nodePort)
+	}
+
+	// Route records consumed by redis-proxy. Failure here does NOT fail the
+	// provision — the pod is functional over its NodePort, and customers using
+	// the public URL will get a clear WRONGPASS at the proxy if the lookup
+	// fails. Worth surfacing via slog.Warn.
+	if b.rdb != nil {
+		serviceFQDN := fmt.Sprintf("redis.%s.svc.cluster.local:6379", ns)
+		regCtx, regCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		if err := b.rdb.Set(regCtx, b.routePrefix+token, serviceFQDN, 0).Err(); err != nil {
+			slog.Warn("k8s.redis.route_register_failed", "token", token, "error", err)
+		} else {
+			slog.Info("k8s.redis.route_registered", "token", token, "backend", serviceFQDN)
+		}
+		// The proxy consumes THIS key — it's the one that actually matters for
+		// external connectivity through redis.instanode.dev.
+		if err := b.rdb.Set(regCtx, b.passwordPrefix+password, serviceFQDN, 0).Err(); err != nil {
+			slog.Warn("k8s.redis.password_route_register_failed", "token", token, "error", err)
+		} else {
+			slog.Info("k8s.redis.password_route_registered", "token", token, "backend", serviceFQDN)
+		}
+		regCancel()
+	}
+
+	slog.Info("k8s.redis.provisioned", "namespace", ns, "node_port", nodePort, "max_clients", sz.maxClients, "public_host", b.publicHost)
 	return &Credentials{URL: connURL, KeyPrefix: "", ProviderResourceID: ns}, nil
 }
 
@@ -162,13 +333,43 @@ func (b *K8sBackend) StorageBytes(ctx context.Context, token, providerResourceID
 }
 
 // Deprovision deletes the customer namespace (cascading GC of all resources).
+// When route registration is enabled, both route records are removed so the
+// redis-proxy fails fast on a stale password instead of hitting a non-existent
+// pod.
 func (b *K8sBackend) Deprovision(ctx context.Context, token, providerResourceID string) error {
 	ns := providerResourceID
 	if ns == "" {
 		ns = redisK8sNsPrefix + token
 	}
+
+	// Read the password BEFORE deleting the namespace so we can clean up the
+	// password→route key. Best-effort — if the secret is already gone (manual
+	// cleanup / replay) we skip that key; a stale entry will fail-close at the
+	// proxy when the pod disappears anyway.
+	var password string
+	if b.rdb != nil {
+		if sec, err := b.cs.CoreV1().Secrets(ns).Get(ctx, "redis-auth", metav1.GetOptions{}); err == nil {
+			password = string(sec.Data["REDIS_PASSWORD"])
+		}
+	}
+
 	if err := b.cs.CoreV1().Namespaces().Delete(ctx, ns, metav1.DeleteOptions{}); err != nil {
-		return fmt.Errorf("k8s redis.Deprovision: delete namespace %s: %w", ns, err)
+		if !k8serrors.IsNotFound(err) {
+			return fmt.Errorf("k8s redis.Deprovision: delete namespace %s: %w", ns, err)
+		}
+		slog.Info("k8s.redis.deprovision.namespace_already_gone", "namespace", ns)
+	}
+	if b.rdb != nil {
+		delCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := b.rdb.Del(delCtx, b.routePrefix+token).Err(); err != nil {
+			slog.Warn("k8s.redis.route_unregister_failed", "token", token, "error", err)
+		}
+		if password != "" {
+			if err := b.rdb.Del(delCtx, b.passwordPrefix+password).Err(); err != nil {
+				slog.Warn("k8s.redis.password_route_unregister_failed", "token", token, "error", err)
+			}
+		}
 	}
 	slog.Info("k8s.redis.deprovisioned", "namespace", ns)
 	return nil
@@ -241,19 +442,20 @@ func (b *K8sBackend) applyNetworkPolicy(ctx context.Context, ns string, dbPort i
 	return err
 }
 
-func (b *K8sBackend) applyResourceQuota(ctx context.Context, ns string) error {
+func (b *K8sBackend) applyResourceQuota(ctx context.Context, ns string, sz tierSizing) error {
+	hard := corev1.ResourceList{
+		corev1.ResourceRequestsCPU:    resource.MustParse(sz.qCPURequests),
+		corev1.ResourceRequestsMemory: resource.MustParse(sz.qMemRequests),
+		corev1.ResourceLimitsCPU:      resource.MustParse(sz.qCPULimits),
+		corev1.ResourceLimitsMemory:   resource.MustParse(sz.qMemLimits),
+		corev1.ResourcePods:           resource.MustParse("3"),
+	}
+	if sz.pvcMi > 0 {
+		hard["persistentvolumeclaims"] = resource.MustParse("2")
+	}
 	_, err := b.cs.CoreV1().ResourceQuotas(ns).Create(ctx, &corev1.ResourceQuota{
 		ObjectMeta: metav1.ObjectMeta{Name: "tenant-quota"},
-		Spec: corev1.ResourceQuotaSpec{
-			Hard: corev1.ResourceList{
-				corev1.ResourceRequestsCPU:    resource.MustParse("100m"),
-				corev1.ResourceRequestsMemory: resource.MustParse("256Mi"),
-				corev1.ResourceLimitsCPU:      resource.MustParse("500m"),
-				corev1.ResourceLimitsMemory:   resource.MustParse("1Gi"),
-				"persistentvolumeclaims":      resource.MustParse("2"),
-				corev1.ResourcePods:           resource.MustParse("3"),
-			},
-		},
+		Spec:       corev1.ResourceQuotaSpec{Hard: hard},
 	}, metav1.CreateOptions{})
 	return err
 }
@@ -266,7 +468,7 @@ func (b *K8sBackend) applySecret(ctx context.Context, ns, password string) error
 	return err
 }
 
-func (b *K8sBackend) applyPVC(ctx context.Context, ns string) error {
+func (b *K8sBackend) applyPVC(ctx context.Context, ns string, sz tierSizing) error {
 	sc := b.storageClass
 	_, err := b.cs.CoreV1().PersistentVolumeClaims(ns).Create(ctx, &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{Name: "redis-data"},
@@ -275,7 +477,7 @@ func (b *K8sBackend) applyPVC(ctx context.Context, ns string) error {
 			StorageClassName: &sc,
 			Resources: corev1.VolumeResourceRequirements{
 				Requests: corev1.ResourceList{
-					corev1.ResourceStorage: resource.MustParse(fmt.Sprintf("%dGi", b.storageSizeGi)),
+					corev1.ResourceStorage: resource.MustParse(fmt.Sprintf("%dMi", sz.pvcMi)),
 				},
 			},
 		},
@@ -283,7 +485,7 @@ func (b *K8sBackend) applyPVC(ctx context.Context, ns string) error {
 	return err
 }
 
-func (b *K8sBackend) applyDeployment(ctx context.Context, ns string) error {
+func (b *K8sBackend) applyDeployment(ctx context.Context, ns string, sz tierSizing) error {
 	replicas := int32(1)
 	noPrivEsc := false
 	runAsUser := int64(999) // redis user in redis:7-alpine
@@ -309,9 +511,16 @@ func (b *K8sBackend) applyDeployment(ctx context.Context, ns string) error {
 					Containers: []corev1.Container{{
 						Name:  "redis",
 						Image: b.image,
-						// Pass requirepass via env var — redis:7-alpine supports REDIS_PASSWORD
-						// via the docker-entrypoint.sh if set; otherwise pass via command args.
-						Command: []string{"redis-server", "--requirepass", "$(REDIS_PASSWORD)", "--appendonly", "yes", "--dir", "/data"},
+						// Tier-specific maxclients passed at start. redis-server respects
+						// --maxclients which takes effect before any client can connect,
+						// so this enforces the cap without needing a post-start CONFIG SET.
+						Command: []string{
+							"redis-server",
+							"--requirepass", "$(REDIS_PASSWORD)",
+							"--appendonly", "yes",
+							"--dir", "/data",
+							"--maxclients", fmt.Sprintf("%d", sz.maxClients),
+						},
 						Env: []corev1.EnvVar{{
 							Name: "REDIS_PASSWORD",
 							ValueFrom: &corev1.EnvVarSource{
@@ -337,12 +546,12 @@ func (b *K8sBackend) applyDeployment(ctx context.Context, ns string) error {
 						},
 						Resources: corev1.ResourceRequirements{
 							Requests: corev1.ResourceList{
-								corev1.ResourceCPU:    resource.MustParse("50m"),
-								corev1.ResourceMemory: resource.MustParse("128Mi"),
+								corev1.ResourceCPU:    resource.MustParse(sz.cpuReq),
+								corev1.ResourceMemory: resource.MustParse(sz.memReq),
 							},
 							Limits: corev1.ResourceList{
-								corev1.ResourceCPU:    resource.MustParse("500m"),
-								corev1.ResourceMemory: resource.MustParse("1Gi"),
+								corev1.ResourceCPU:    resource.MustParse(sz.cpuLim),
+								corev1.ResourceMemory: resource.MustParse(sz.memLim),
 							},
 						},
 						VolumeMounts: []corev1.VolumeMount{
@@ -351,9 +560,7 @@ func (b *K8sBackend) applyDeployment(ctx context.Context, ns string) error {
 						},
 					}},
 					Volumes: []corev1.Volume{
-						{Name: "data", VolumeSource: corev1.VolumeSource{
-							PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "redis-data"},
-						}},
+						{Name: "data", VolumeSource: redisDataVolumeSource(sz)},
 						{Name: "tmp", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 					},
 				},
@@ -418,3 +625,15 @@ func redisK8sRandHex(n int) (string, error) {
 }
 
 func boolPtrR(b bool) *bool { return &b }
+
+// redisDataVolumeSource returns the right volume source for the data dir.
+// Anonymous tier (pvcMi == 0) uses emptyDir: redis is in-memory only and
+// data is ephemeral, so the DOKS block-storage attach is wasteful.
+func redisDataVolumeSource(sz tierSizing) corev1.VolumeSource {
+	if sz.pvcMi > 0 {
+		return corev1.VolumeSource{
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "redis-data"},
+		}
+	}
+	return corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}
+}

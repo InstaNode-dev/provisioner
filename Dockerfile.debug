@@ -1,0 +1,40 @@
+# Dockerfile.debug — same /provisioner binary as the production image, but
+# packaged on alpine instead of distroless so operators (and agents) can
+# `kubectl exec` in to run curl, nslookup, ss, env, etc.
+#
+# How to build + push (manual, not in CI):
+#   docker buildx build --platform linux/amd64 \
+#     -f provisioner/Dockerfile.debug \
+#     -t ghcr.io/<org>/instant-provisioner:debug-<git-sha> --push .
+#
+# How to use:
+#   # Run a one-off debug pod alongside the real provisioner:
+#   kubectl -n instant-infra run prov-debug --rm -it \
+#     --image=ghcr.io/<org>/instant-provisioner:debug-<git-sha> \
+#     --command -- sh
+#
+# Never set this image on the production Deployment — the production image
+# stays distroless for attack surface reduction. This variant is for
+# diagnostics only.
+
+FROM golang:1.24-alpine AS builder
+WORKDIR /app
+COPY proto/ /proto/
+COPY common/ /common/
+COPY provisioner/go.mod provisioner/go.sum ./
+RUN go mod download
+COPY provisioner/ .
+RUN CGO_ENABLED=0 go build -o /provisioner .
+
+FROM alpine:3.20
+# Tools an operator/agent typically reaches for when something inside the
+# pod misbehaves. Keep this list short — the point is "shell + the bare
+# minimum to diagnose," not "shell + everything imaginable."
+RUN apk add --no-cache \
+    ca-certificates \
+    curl \
+    bind-tools \
+    netcat-openbsd \
+    iproute2
+COPY --from=builder /provisioner /provisioner
+ENTRYPOINT ["/provisioner"]

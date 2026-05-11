@@ -77,6 +77,7 @@ func main() {
 				PostgresSize: cfg.PoolPostgresSize,
 				RedisSize:    cfg.PoolRedisSize,
 				MongoSize:    cfg.PoolMongoSize,
+				QueueSize:    cfg.PoolQueueSize,
 			}
 
 			poolMgr = pool.NewWithConfig(dbPool, aesKey, poolCfg, cfg)
@@ -88,6 +89,7 @@ func main() {
 				"postgres_target", cfg.PoolPostgresSize,
 				"redis_target", cfg.PoolRedisSize,
 				"mongo_target", cfg.PoolMongoSize,
+				"queue_target", cfg.PoolQueueSize,
 			)
 		}
 	} else {

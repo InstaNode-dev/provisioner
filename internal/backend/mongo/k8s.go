@@ -4,11 +4,27 @@ package mongo
 // Security model mirrors postgres/k8s.go — see that file for architecture notes.
 //
 // Configuration env vars:
-//   K8S_EXTERNAL_HOST      — hostname in returned URLs (required)
-//   K8S_MONGO_IMAGE        — container image, default "mongo:7"
-//   K8S_STORAGE_CLASS      — PVC storage class, default "gp3"
-//   K8S_MONGO_STORAGE_GI   — PVC size in GiB, default 50
-//   K8S_KUBECONFIG         — path to kubeconfig; empty = in-cluster
+//   K8S_EXTERNAL_HOST       — legacy NodePort hostname (kept for back-compat / fallback URL)
+//   K8S_MONGO_PUBLIC_HOST   — hostname embedded in customer URLs when mongo-proxy is fronting
+//                             the cluster (default "mongo.instanode.dev")
+//   K8S_MONGO_IMAGE         — container image, default "mongo:7"
+//   K8S_STORAGE_CLASS       — PVC storage class, default "gp3"
+//   K8S_MONGO_STORAGE_GI    — PVC size in GiB, default 50 (overridden by tier sizing)
+//   K8S_KUBECONFIG          — path to kubeconfig; empty = in-cluster
+//
+// # External access model
+//
+// Customer connection URLs are of the form
+// `mongodb://<user>:<pass>@<publicHost>:27017/<db>?authSource=<db>`. The
+// mongo-proxy (see mongo-proxy/) listens on :27017 in the cluster, reads
+// enough of the client's pre-auth handshake to extract the SCRAM username
+// from saslStart, looks up `mongo_route_by_user:<user>` in Redis to find the
+// dedicated pod, and forwards bytes transparently. The backend performs the
+// real SCRAM check.
+//
+// When K8S_MONGO_PUBLIC_HOST is empty, the URL falls back to the legacy
+// `mongodb://<user>:<pass>@<K8S_EXTERNAL_HOST>:<NodePort>/<db>?authSource=<db>`
+// shape so resources remain reachable in environments without the proxy.
 
 import (
 	"context"
@@ -22,6 +38,7 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 	mongoclient "go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
+	goredis "github.com/redis/go-redis/v9"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -43,13 +60,97 @@ const (
 	mongoK8sReadyPoll = 3 * time.Second
 )
 
+// tierSizing maps a billing tier to k8s resource sizing for the provisioned Mongo pod.
+// Anonymous (24h trial) gets the smallest viable pod — still a real, dedicated Mongo,
+// just configured for low cost so the free tier scales. Each step up gives more
+// headroom; team is large enough for real production workloads.
+//
+// Mongo doesn't have a per-user connection limit, only --maxConns at the pod level.
+// Because each pod is dedicated to one customer this is functionally a per-customer
+// cap — we pass it via the container command. CPU/RAM limits + maxConns together
+// provide noisy-neighbor protection without needing per-user enforcement.
+type tierSizing struct {
+	cpuReq, memReq string
+	cpuLim, memLim string
+	pvcMi          int // PVC size in MiB (lets us go below 1Gi for anonymous)
+	// quotaRequests / quotaLimits cap the whole namespace as defense-in-depth.
+	qCPURequests, qMemRequests string
+	qCPULimits, qMemLimits     string
+	// maxConns is the pod-wide cap on simultaneous client connections. Mongo
+	// has no per-user equivalent; this is informational at the tier level but
+	// load-bearing as a pod-wide DoS guard.
+	maxConns int
+}
+
+func sizingForTier(tier string) tierSizing {
+	switch tier {
+	case "anonymous":
+		// Anonymous trial: smallest practical pod.
+		// Memory limit MUST be > 256Mi or the docker-entrypoint.sh init phase
+		// gets OOM-killed: the entrypoint briefly runs TWO mongod processes
+		// (a temp 127.0.0.1 instance to seed the root user + the real one),
+		// and WiredTiger's default cache_size is 256MB, so 256Mi total is
+		// instant OOM. 384Mi is the smallest size that survives init + serves
+		// a low-traffic anonymous workload reliably.
+		// pvcMi=0 → emptyDir: skips the 5-10s DOKS block-storage attach on
+		// cold provision. Anonymous data is 24h TTL so ephemeral is fine.
+		return tierSizing{
+			cpuReq: "50m", memReq: "192Mi",
+			cpuLim: "250m", memLim: "384Mi",
+			pvcMi:        0,
+			qCPURequests: "100m", qMemRequests: "384Mi",
+			qCPULimits: "500m", qMemLimits: "640Mi",
+			maxConns: 20,
+		}
+	case "hobby":
+		return tierSizing{
+			cpuReq: "100m", memReq: "256Mi",
+			cpuLim: "500m", memLim: "1Gi",
+			pvcMi:        1024, // 1Gi
+			qCPURequests: "200m", qMemRequests: "512Mi",
+			qCPULimits: "1", qMemLimits: "2Gi",
+			maxConns: 100,
+		}
+	case "pro":
+		return tierSizing{
+			cpuReq: "250m", memReq: "1Gi",
+			cpuLim: "2", memLim: "2Gi",
+			pvcMi:        10240, // 10Gi
+			qCPURequests: "500m", qMemRequests: "2Gi",
+			qCPULimits: "4", qMemLimits: "4Gi",
+			maxConns: 500,
+		}
+	case "team", "growth":
+		return tierSizing{
+			cpuReq: "500m", memReq: "2Gi",
+			cpuLim: "4", memLim: "4Gi",
+			pvcMi:        51200, // 50Gi
+			qCPURequests: "1", qMemRequests: "4Gi",
+			qCPULimits: "8", qMemLimits: "8Gi",
+			maxConns: 2000,
+		}
+	default:
+		return sizingForTier("hobby")
+	}
+}
+
 // K8sBackend provisions a dedicated MongoDB pod per token.
 type K8sBackend struct {
 	cs            *kubernetes.Clientset
 	storageClass  string // K8S_STORAGE_CLASS
 	image         string // K8S_MONGO_IMAGE
-	externalHost  string // K8S_EXTERNAL_HOST
-	storageSizeGi int    // K8S_MONGO_STORAGE_GI
+	externalHost  string // K8S_EXTERNAL_HOST (legacy NodePort host; kept for back-compat)
+	publicHost    string // K8S_MONGO_PUBLIC_HOST (e.g. mongo.instanode.dev) — preferred URL host when set
+	storageSizeGi int    // K8S_MONGO_STORAGE_GI (legacy ceiling; tier sizing overrides per-resource)
+
+	// Route registry — written on every successful Provision so the Mongo
+	// routing proxy (mongo-proxy/) can demux. Two key families are written:
+	//   <routePrefix><dbName>           → <service-fqdn>:27017  (debugging / future db-based routing)
+	//   <userPrefix><appUser>           → <service-fqdn>:27017  (consumed by the proxy)
+	// When rdb == nil, no route records are written.
+	rdb         *goredis.Client
+	routePrefix string
+	userPrefix  string
 }
 
 func newK8sBackend(kubeconfigPath, storageClass, image, externalHost string, storageSizeGi int) (*K8sBackend, error) {
@@ -63,6 +164,7 @@ func newK8sBackend(kubeconfigPath, storageClass, image, externalHost string, sto
 	if err != nil {
 		return nil, fmt.Errorf("k8s mongo: build config: %w", err)
 	}
+	slog.Info("k8s.mongo.init", "api_host", rc.Host)
 	cs, err := kubernetes.NewForConfig(rc)
 	if err != nil {
 		return nil, fmt.Errorf("k8s mongo: new clientset: %w", err)
@@ -78,6 +180,43 @@ func newK8sBackend(kubeconfigPath, storageClass, image, externalHost string, sto
 	}
 	return &K8sBackend{cs: cs, storageClass: storageClass, image: image, externalHost: externalHost, storageSizeGi: storageSizeGi}, nil
 }
+
+// EnableRouteRegistry tells the K8sBackend to publish routing records to Redis
+// after every successful Provision so the mongo-proxy can forward client
+// traffic to the dedicated pod. Two key families are written per resource:
+//
+//	<prefix><dbName>                — debugging / future db-based lookup
+//	<userPrefix><appUser>           — consumed by mongo-proxy to demux by SCRAM username
+//
+// Safe to call once at startup; subsequent calls overwrite. Passing rdb=nil
+// disables route registration (default).
+func (b *K8sBackend) EnableRouteRegistry(rdb *goredis.Client, prefix string) {
+	if prefix == "" {
+		prefix = "mongo_route:"
+	}
+	b.rdb = rdb
+	b.routePrefix = prefix
+	if b.userPrefix == "" {
+		b.userPrefix = "mongo_route_by_user:"
+	}
+}
+
+// SetPasswordRoutePrefix overrides the user→backend key family. Default
+// "mongo_route_by_user:" matches the mongo-proxy default. The name mirrors
+// the redis backend's SetPasswordRoutePrefix even though Mongo routes by
+// username (not password) — keeping a single naming convention for the
+// "route by auth identity" knob across both backends.
+func (b *K8sBackend) SetPasswordRoutePrefix(prefix string) {
+	if prefix == "" {
+		return
+	}
+	b.userPrefix = prefix
+}
+
+// SetPublicHost sets the hostname embedded in customer connection URLs when
+// the mongo-proxy is fronting the cluster. Empty value keeps the legacy
+// K8S_EXTERNAL_HOST + NodePort URL shape.
+func (b *K8sBackend) SetPublicHost(host string) { b.publicHost = host }
 
 // Provision creates a dedicated MongoDB instance with a restricted app user.
 func (b *K8sBackend) Provision(ctx context.Context, token, tier string) (*Credentials, error) {
@@ -104,22 +243,26 @@ func (b *K8sBackend) Provision(ctx context.Context, token, tier string) (*Creden
 	provCtx, provCancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer provCancel()
 
+	sz := sizingForTier(tier)
+
 	if err := b.applyNamespace(provCtx, ns); err != nil {
 		return nil, fmt.Errorf("k8s mongo: namespace: %w", err)
 	}
 	if err := b.applyNetworkPolicy(provCtx, ns, 27017); err != nil {
 		return nil, rollback("network policy", err)
 	}
-	if err := b.applyResourceQuota(provCtx, ns); err != nil {
+	if err := b.applyResourceQuota(provCtx, ns, sz); err != nil {
 		return nil, rollback("resource quota", err)
 	}
 	if err := b.applyAdminSecret(provCtx, ns, adminPass); err != nil {
 		return nil, rollback("admin secret", err)
 	}
-	if err := b.applyPVC(provCtx, ns); err != nil {
-		return nil, rollback("pvc", err)
+	if sz.pvcMi > 0 {
+		if err := b.applyPVC(provCtx, ns, sz); err != nil {
+			return nil, rollback("pvc", err)
+		}
 	}
-	if err := b.applyDeployment(provCtx, ns); err != nil {
+	if err := b.applyDeployment(provCtx, ns, sz); err != nil {
 		return nil, rollback("deployment", err)
 	}
 	svc, err := b.applyService(provCtx, ns)
@@ -134,15 +277,53 @@ func (b *K8sBackend) Provision(ctx context.Context, token, tier string) (*Creden
 	clusterIP := svc.Spec.ClusterIP
 	nodePort := int(svc.Spec.Ports[0].NodePort)
 
-	adminURI := fmt.Sprintf("mongodb://root:%s@%s:27017/admin", adminPass, clusterIP)
+	// Force SCRAM-SHA-256: the mongo:7 image only initialises the root user
+	// with SHA-256, but the Go driver's negotiator can pick SHA-1 first which
+	// the server then rejects. Pinning the mechanism removes the race.
+	adminURI := fmt.Sprintf("mongodb://root:%s@%s:27017/admin?authMechanism=SCRAM-SHA-256", adminPass, clusterIP)
 	if err := b.initMongo(provCtx, adminURI, dbName, appUser, appPass); err != nil {
 		return nil, rollback("init mongo", err)
 	}
 
-	connURL := fmt.Sprintf("mongodb://%s:%s@%s:%d/%s?authSource=%s",
-		appUser, appPass, b.externalHost, nodePort, dbName, dbName)
+	// Customer-facing URL.
+	//   With publicHost set (typical prod):
+	//     mongodb://<user>:<pass>@mongo.instanode.dev:27017/<db>?authSource=<db>
+	//     — the mongo-proxy demuxes by SCRAM username (extracted from saslStart)
+	//       and forwards to the right pod.
+	//   Without publicHost (legacy / dev without the proxy): falls back to the
+	//     NodePort URL so the resource is still reachable from outside the cluster.
+	var connURL string
+	if b.publicHost != "" {
+		connURL = fmt.Sprintf("mongodb://%s:%s@%s:27017/%s?authSource=%s",
+			appUser, appPass, b.publicHost, dbName, dbName)
+	} else {
+		connURL = fmt.Sprintf("mongodb://%s:%s@%s:%d/%s?authSource=%s",
+			appUser, appPass, b.externalHost, nodePort, dbName, dbName)
+	}
 
-	slog.Info("k8s.mongo.provisioned", "namespace", ns, "node_port", nodePort)
+	// Route records consumed by mongo-proxy. Failure here does NOT fail the
+	// provision — the pod is functional over its NodePort, and customers using
+	// the public URL will get a clean network error at the proxy if the lookup
+	// fails. Worth surfacing via slog.Warn.
+	if b.rdb != nil {
+		serviceFQDN := fmt.Sprintf("mongodb.%s.svc.cluster.local:27017", ns)
+		regCtx, regCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		if err := b.rdb.Set(regCtx, b.routePrefix+dbName, serviceFQDN, 0).Err(); err != nil {
+			slog.Warn("k8s.mongo.route_register_failed", "db", dbName, "error", err)
+		} else {
+			slog.Info("k8s.mongo.route_registered", "db", dbName, "backend", serviceFQDN)
+		}
+		// The proxy consumes THIS key — it's the one that actually matters
+		// for external connectivity through mongo.instanode.dev.
+		if err := b.rdb.Set(regCtx, b.userPrefix+appUser, serviceFQDN, 0).Err(); err != nil {
+			slog.Warn("k8s.mongo.user_route_register_failed", "user", appUser, "error", err)
+		} else {
+			slog.Info("k8s.mongo.user_route_registered", "user", appUser, "backend", serviceFQDN)
+		}
+		regCancel()
+	}
+
+	slog.Info("k8s.mongo.provisioned", "namespace", ns, "node_port", nodePort, "max_conns", sz.maxConns, "public_host", b.publicHost)
 	return &Credentials{URL: connURL, DatabaseName: dbName, ProviderResourceID: ns}, nil
 }
 
@@ -191,13 +372,31 @@ func (b *K8sBackend) StorageBytes(ctx context.Context, token, providerResourceID
 }
 
 // Deprovision deletes the customer namespace (cascading GC of all resources).
+// When route registration is enabled, both route records are removed so the
+// mongo-proxy fails fast on a stale username instead of hitting a non-existent
+// pod.
 func (b *K8sBackend) Deprovision(ctx context.Context, token, providerResourceID string) error {
 	ns := providerResourceID
 	if ns == "" {
 		ns = mongoK8sNsPrefix + token
 	}
 	if err := b.cs.CoreV1().Namespaces().Delete(ctx, ns, metav1.DeleteOptions{}); err != nil {
-		return fmt.Errorf("k8s mongo.Deprovision: delete namespace %s: %w", ns, err)
+		if !k8serrors.IsNotFound(err) {
+			return fmt.Errorf("k8s mongo.Deprovision: delete namespace %s: %w", ns, err)
+		}
+		slog.Info("k8s.mongo.deprovision.namespace_already_gone", "namespace", ns)
+	}
+	if b.rdb != nil {
+		dbName := "db_" + mongoK8sShort(token)
+		appUser := "usr_" + mongoK8sShort(token)
+		delCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := b.rdb.Del(delCtx, b.routePrefix+dbName).Err(); err != nil {
+			slog.Warn("k8s.mongo.route_unregister_failed", "db", dbName, "error", err)
+		}
+		if err := b.rdb.Del(delCtx, b.userPrefix+appUser).Err(); err != nil {
+			slog.Warn("k8s.mongo.user_route_unregister_failed", "user", appUser, "error", err)
+		}
 	}
 	slog.Info("k8s.mongo.deprovisioned", "namespace", ns)
 	return nil
@@ -270,21 +469,26 @@ func (b *K8sBackend) applyNetworkPolicy(ctx context.Context, ns string, dbPort i
 	return err
 }
 
-func (b *K8sBackend) applyResourceQuota(ctx context.Context, ns string) error {
+func (b *K8sBackend) applyResourceQuota(ctx context.Context, ns string, sz tierSizing) error {
 	_, err := b.cs.CoreV1().ResourceQuotas(ns).Create(ctx, &corev1.ResourceQuota{
 		ObjectMeta: metav1.ObjectMeta{Name: "tenant-quota"},
-		Spec: corev1.ResourceQuotaSpec{
-			Hard: corev1.ResourceList{
-				corev1.ResourceRequestsCPU:    resource.MustParse("500m"),
-				corev1.ResourceRequestsMemory: resource.MustParse("512Mi"),
-				corev1.ResourceLimitsCPU:      resource.MustParse("2"),
-				corev1.ResourceLimitsMemory:   resource.MustParse("2Gi"),
-				"persistentvolumeclaims":      resource.MustParse("2"),
-				corev1.ResourcePods:           resource.MustParse("3"),
-			},
-		},
+		Spec:       corev1.ResourceQuotaSpec{Hard: mongoQuotaHard(sz)},
 	}, metav1.CreateOptions{})
 	return err
+}
+
+func mongoQuotaHard(sz tierSizing) corev1.ResourceList {
+	hard := corev1.ResourceList{
+		corev1.ResourceRequestsCPU:    resource.MustParse(sz.qCPURequests),
+		corev1.ResourceRequestsMemory: resource.MustParse(sz.qMemRequests),
+		corev1.ResourceLimitsCPU:      resource.MustParse(sz.qCPULimits),
+		corev1.ResourceLimitsMemory:   resource.MustParse(sz.qMemLimits),
+		corev1.ResourcePods:           resource.MustParse("3"),
+	}
+	if sz.pvcMi > 0 {
+		hard["persistentvolumeclaims"] = resource.MustParse("2")
+	}
+	return hard
 }
 
 func (b *K8sBackend) applyAdminSecret(ctx context.Context, ns, adminPass string) error {
@@ -298,7 +502,7 @@ func (b *K8sBackend) applyAdminSecret(ctx context.Context, ns, adminPass string)
 	return err
 }
 
-func (b *K8sBackend) applyPVC(ctx context.Context, ns string) error {
+func (b *K8sBackend) applyPVC(ctx context.Context, ns string, sz tierSizing) error {
 	sc := b.storageClass
 	_, err := b.cs.CoreV1().PersistentVolumeClaims(ns).Create(ctx, &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{Name: "mongo-data"},
@@ -307,7 +511,7 @@ func (b *K8sBackend) applyPVC(ctx context.Context, ns string) error {
 			StorageClassName: &sc,
 			Resources: corev1.VolumeResourceRequirements{
 				Requests: corev1.ResourceList{
-					corev1.ResourceStorage: resource.MustParse(fmt.Sprintf("%dGi", b.storageSizeGi)),
+					corev1.ResourceStorage: resource.MustParse(fmt.Sprintf("%dMi", sz.pvcMi)),
 				},
 			},
 		},
@@ -315,7 +519,7 @@ func (b *K8sBackend) applyPVC(ctx context.Context, ns string) error {
 	return err
 }
 
-func (b *K8sBackend) applyDeployment(ctx context.Context, ns string) error {
+func (b *K8sBackend) applyDeployment(ctx context.Context, ns string, sz tierSizing) error {
 	replicas := int32(1)
 	noPrivEsc := false
 	runAsUser := int64(999) // mongodb UID in the official mongo:7 image
@@ -341,6 +545,21 @@ func (b *K8sBackend) applyDeployment(ctx context.Context, ns string) error {
 					Containers: []corev1.Container{{
 						Name:  "mongodb",
 						Image: b.image,
+						// docker-entrypoint.sh requires the first arg to be literally "mongod"
+						// for it to run its initialisation logic (which creates the
+						// MONGO_INITDB_ROOT_USERNAME root user from the secret env vars).
+						// If the first arg is anything else (e.g. "--bind_ip_all"), the
+						// entrypoint just execs the args directly and never creates the
+						// root user — leaving --auth turned on with no users, which is
+						// exactly the AuthenticationFailed loop we hit before this fix.
+						// See https://github.com/docker-library/mongo/blob/master/docker-entrypoint.sh
+						// (the `if [ "$originalArgOne" = 'mongod' ]` check.)
+						Args: []string{
+							"mongod",
+							"--bind_ip_all",
+							"--auth",
+							"--maxConns", fmt.Sprintf("%d", sz.maxConns),
+						},
 						Ports: []corev1.ContainerPort{{ContainerPort: 27017, Protocol: corev1.ProtocolTCP}},
 						ReadinessProbe: &corev1.Probe{
 							ProbeHandler: corev1.ProbeHandler{
@@ -362,12 +581,12 @@ func (b *K8sBackend) applyDeployment(ctx context.Context, ns string) error {
 						},
 						Resources: corev1.ResourceRequirements{
 							Requests: corev1.ResourceList{
-								corev1.ResourceCPU:    resource.MustParse("100m"),
-								corev1.ResourceMemory: resource.MustParse("256Mi"),
+								corev1.ResourceCPU:    resource.MustParse(sz.cpuReq),
+								corev1.ResourceMemory: resource.MustParse(sz.memReq),
 							},
 							Limits: corev1.ResourceList{
-								corev1.ResourceCPU:    resource.MustParse("2"),
-								corev1.ResourceMemory: resource.MustParse("2Gi"),
+								corev1.ResourceCPU:    resource.MustParse(sz.cpuLim),
+								corev1.ResourceMemory: resource.MustParse(sz.memLim),
 							},
 						},
 						VolumeMounts: []corev1.VolumeMount{
@@ -376,9 +595,7 @@ func (b *K8sBackend) applyDeployment(ctx context.Context, ns string) error {
 						},
 					}},
 					Volumes: []corev1.Volume{
-						{Name: "data", VolumeSource: corev1.VolumeSource{
-							PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "mongo-data"},
-						}},
+						{Name: "data", VolumeSource: mongoDataVolumeSource(sz)},
 						{Name: "tmp", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 					},
 				},
@@ -425,8 +642,44 @@ func (b *K8sBackend) waitPodReady(ctx context.Context, ns, labelSelector string)
 // initMongo connects as admin and creates a restricted app user.
 // The user is created IN the customer database (not admin), so the connection URL
 // can use authSource=dbName — the user's authenticating database matches where they live.
+//
+// Retry rationale: the official mongo image's entrypoint script creates the
+// MONGO_INITDB_ROOT_USERNAME *after* the server starts accepting TCP connections.
+// Our k8s readiness probe only checks port 27017 is open, so initMongo can race
+// the init script. Retry on AuthenticationFailed for up to ~30s to ride out that
+// window. Other errors fail fast.
 func (b *K8sBackend) initMongo(ctx context.Context, adminURI, dbName, appUser, appPass string) error {
-	clientOpts := options.Client().ApplyURI(adminURI).SetServerSelectionTimeout(10 * time.Second)
+	const (
+		maxAttempts = 15
+		retryDelay  = 2 * time.Second
+	)
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		err := b.tryInitMongo(ctx, adminURI, dbName, appUser, appPass)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		msg := err.Error()
+		// Retry on auth races (root user not yet created by entrypoint script)
+		// and topology/handshake transients.
+		if !strings.Contains(msg, "AuthenticationFailed") &&
+			!strings.Contains(msg, "auth error") &&
+			!strings.Contains(msg, "server selection") &&
+			!strings.Contains(msg, "connection refused") {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(retryDelay):
+		}
+	}
+	return fmt.Errorf("initMongo: gave up after %d attempts: %w", maxAttempts, lastErr)
+}
+
+func (b *K8sBackend) tryInitMongo(ctx context.Context, adminURI, dbName, appUser, appPass string) error {
+	clientOpts := options.Client().ApplyURI(adminURI).SetServerSelectionTimeout(5 * time.Second)
 	client, err := mongoclient.Connect(ctx, clientOpts)
 	if err != nil {
 		return fmt.Errorf("connect: %w", err)
@@ -469,3 +722,15 @@ func mongoK8sRandHex(n int) (string, error) {
 }
 
 func mongoK8sBoolPtr(b bool) *bool { return &b }
+
+// mongoDataVolumeSource returns the right volume source for /data/db.
+// Anonymous tier (pvcMi == 0) uses emptyDir — skips DOKS block-storage attach.
+// WiredTiger writes still work; data is lost on pod restart, fine for 24h TTL.
+func mongoDataVolumeSource(sz tierSizing) corev1.VolumeSource {
+	if sz.pvcMi > 0 {
+		return corev1.VolumeSource{
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "mongo-data"},
+		}
+	}
+	return corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}
+}

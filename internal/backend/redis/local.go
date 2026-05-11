@@ -10,6 +10,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"os"
 	"strings"
 
 	goredis "github.com/redis/go-redis/v9"
@@ -62,11 +63,18 @@ func (b *LocalBackend) Provision(ctx context.Context, token, tier string) (*Cred
 		"~"+keyPrefix+"*",
 		"+@all",
 	)
+	// userHost is what we embed in the URL returned to clients.
+	// Falls back to the cluster-internal redisHost when no public host is configured.
+	userHost := publicHostPort()
+	if userHost == "" {
+		userHost = b.redisHost
+	}
+
 	if aclCmd.Err() == nil {
 		// ACL succeeded — return an isolated user URL.
 		// KeyPrefix is returned so callers (and pool consumers) know which key namespace
 		// this user is permitted to access (the ACL restricts to keyPrefix+"*").
-		url := fmt.Sprintf("redis://%s:%s@%s/0", username, password, b.redisHost)
+		url := fmt.Sprintf("redis://%s:%s@%s/0", username, password, userHost)
 		return &Credentials{
 			URL:       url,
 			KeyPrefix: keyPrefix,
@@ -76,11 +84,31 @@ func (b *LocalBackend) Provision(ctx context.Context, token, tier string) (*Cred
 	// ACL failed (Redis < 6 or ACL disabled) — fall back to key-namespace isolation.
 	// Return the shared Redis URL. Client must prefix all keys with {token}: to
 	// stay in their namespace.
-	url := fmt.Sprintf("redis://%s/0", b.redisHost)
+	url := fmt.Sprintf("redis://%s/0", userHost)
 	return &Credentials{
 		URL:       url,
 		KeyPrefix: keyPrefix,
 	}, nil
+}
+
+// publicHostPort returns the host:port to embed in user-facing Redis URLs.
+// Resolution order:
+//  1. REDIS_PUBLIC_HOST_PORT (e.g. "redis.instanode.dev:6379")
+//  2. REDIS_PUBLIC_HOST + REDIS_PUBLIC_PORT (port defaults to 6379)
+//  3. "" — caller falls back to the in-cluster redisHost
+func publicHostPort() string {
+	if hp := os.Getenv("REDIS_PUBLIC_HOST_PORT"); hp != "" {
+		return hp
+	}
+	host := os.Getenv("REDIS_PUBLIC_HOST")
+	if host == "" {
+		return ""
+	}
+	port := os.Getenv("REDIS_PUBLIC_PORT")
+	if port == "" {
+		port = "6379"
+	}
+	return host + ":" + port
 }
 
 // StorageBytes returns the estimated memory used by keys with the token prefix.

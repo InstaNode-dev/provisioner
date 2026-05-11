@@ -1,6 +1,35 @@
 package redis
 
-import "context"
+import (
+	"context"
+	"log/slog"
+	"os"
+	"strconv"
+
+	goredis "github.com/redis/go-redis/v9"
+)
+
+// goredisParseURL / goredisNewClient — narrow aliases so we don't import the
+// goredis package directly in the factory body. Keeps the call sites readable
+// and the dependency obvious in this file alone.
+func goredisParseURL(s string) (*goredis.Options, error)   { return goredis.ParseURL(s) }
+func goredisNewClient(o *goredis.Options) *goredis.Client { return goredis.NewClient(o) }
+
+func k8sEnv(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func k8sEnvInt(key string, fallback int) int {
+	if v := os.Getenv(key); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			return i
+		}
+	}
+	return fallback
+}
 
 // Backend is the interface every Redis provisioning backend must implement.
 type Backend interface {
@@ -28,9 +57,54 @@ type Credentials struct {
 }
 
 // NewBackend creates a Backend using the given backend type string.
-// "local" (default) → LocalBackend.
+// "k8s" → K8sBackend (dedicated pod per token, every tier).
+// "local" (default) → LocalBackend (ACL user on shared cluster).
 func NewBackend(backendType, redisHost string) Backend {
-	return newLocalBackend(redisHost)
+	switch backendType {
+	case "k8s":
+		// Dedicated-pod-per-resource backend for every tier. Each /cache/new
+		// provisions a real Redis pod in its own namespace; sizing is driven
+		// by `tier` inside Provision (see sizingForTier).
+		//
+		// Env-var driven so we don't have to thread a Config object through
+		// the existing factory signature.
+		kubeconfig := os.Getenv("K8S_KUBECONFIG")
+		storageClass := k8sEnv("K8S_STORAGE_CLASS", "do-block-storage")
+		image := k8sEnv("K8S_REDIS_IMAGE", "")
+		externalHost := k8sEnv("K8S_EXTERNAL_HOST", "")
+		// K8S_REDIS_PUBLIC_HOST is the hostname embedded in customer URLs when
+		// the redis-proxy is fronting the cluster (typical prod). Default to
+		// `redis.instanode.dev` since that's where DNS + the LB will point
+		// for the production cluster; ops can override per environment.
+		publicHost := k8sEnv("K8S_REDIS_PUBLIC_HOST", "redis.instanode.dev")
+		// storageSizeGi from env is a legacy ceiling; the actual PVC is
+		// tier-sized via sizingForTier (uses MiB for Redis). Kept to avoid
+		// breaking the constructor signature.
+		storageSizeGi := k8sEnvInt("K8S_REDIS_STORAGE_GI", 10)
+		b, err := newK8sBackend(kubeconfig, storageClass, image, externalHost, storageSizeGi)
+		if err != nil {
+			slog.Error("redis.k8s_backend_init_failed_fallback_to_local", "error", err)
+			return newLocalBackend(redisHost)
+		}
+		b.SetPublicHost(publicHost)
+		// Route registry — writes route records per provision so the
+		// redis-proxy can demux client connections by AUTH password.
+		routeRedisURL := k8sEnv("REDIS_URL_FOR_ROUTES", os.Getenv("REDIS_URL"))
+		if routeRedisURL != "" {
+			if opt, perr := goredisParseURL(routeRedisURL); perr == nil {
+				rdb := goredisNewClient(opt)
+				b.EnableRouteRegistry(rdb, k8sEnv("REDIS_PROXY_ROUTE_PREFIX", "redis_route:"))
+				b.SetPasswordRoutePrefix(k8sEnv("REDIS_PROXY_PASSWORD_ROUTE_PREFIX", "redis_route_by_password:"))
+				slog.Info("redis.route_registry_enabled", "redis_url_set", true)
+			} else {
+				slog.Warn("redis.route_registry_disabled_bad_redis_url", "error", perr)
+			}
+		}
+		slog.Info("redis.backend_selected", "backend", "k8s", "external_host", externalHost, "public_host", publicHost)
+		return b
+	default:
+		return newLocalBackend(redisHost)
+	}
 }
 
 // NewDedicatedBackend creates a DedicatedProvider for Team-tier Redis provisioning.

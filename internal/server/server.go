@@ -103,8 +103,8 @@ func New(cfg *config.Config, poolMgr *pool.Manager) *Server {
 		cfg,
 		postgres.NewBackend(cfg.PostgresProvisionBackend, cfg.PostgresCustomersURL, cfg.PostgresClusterURLs, cfg.NeonAPIKey, cfg.NeonRegionID),
 		redis.NewBackend(cfg.RedisProvisionBackend, cfg.RedisProvisionHost),
-		mongo.NewBackend(cfg.MongoAdminURI, cfg.MongoHost),
-		queue.NewBackend(cfg.NATSHost),
+		mongo.NewBackend(cfg.MongoProvisionBackend, cfg.MongoAdminURI, cfg.MongoHost),
+		queue.NewBackend(cfg.QueueProvisionBackend, cfg.NATSHost),
 		minioBackend,
 		dedPG,
 		dedRedis,
@@ -336,7 +336,22 @@ func (s *Server) provisionQueue(ctx context.Context, req *provisionerv1.Provisio
 		}, nil
 	}
 
-	slog.Info("server.provisionQueue: using shared backend", "token", req.Token)
+	// Try the warm pool first — anonymous tier should feel instant. Pool items
+	// are pre-provisioned dedicated NATS pods carrying their own connection URL.
+	if s.pool != nil {
+		item, err := s.pool.Claim(ctx, "queue")
+		if err != nil {
+			slog.Warn("server.provisionQueue: pool claim error (falling back to live)", "error", err)
+		} else if item != nil {
+			slog.Info("server.provisionQueue: pool hit", "pool_id", item.ID)
+			return &provisionerv1.ProvisionResponse{
+				ConnectionUrl:      item.ConnectionURL,
+				ProviderResourceId: item.ProviderResourceID,
+			}, nil
+		}
+	}
+
+	slog.Info("server.provisionQueue: pool miss, provisioning live", "token", req.Token)
 	creds, err := s.queueBackend.Provision(ctx, req.Token, req.Tier)
 	if err != nil {
 		return nil, mapError("ProvisionResource.queue", err)
@@ -370,10 +385,13 @@ func (s *Server) DeprovisionResource(ctx context.Context, req *provisionerv1.Dep
 
 	switch req.ResourceType {
 	case commonv1.ResourceType_RESOURCE_TYPE_POSTGRES:
-		// Route to dedicated backend when a providerResourceID is present (Neon project ID)
-		// or when the dedicated backend is configured for local-dedicated resources.
-		// providerResourceID is non-empty for Neon-provisioned projects; empty for local.
-		if s.dedicatedPostgresBackend != nil && req.ProviderResourceId != "" {
+		// Route to dedicated backend ONLY for legacy Neon-style provider IDs.
+		// k8s namespace IDs (prefix "instant-customer-") go through the regular
+		// postgresBackend which holds the route-registry connection — otherwise
+		// the redis route key for this resource never gets unregistered on
+		// teardown and the proxy keeps a stale entry forever.
+		if s.dedicatedPostgresBackend != nil && req.ProviderResourceId != "" &&
+			!strings.HasPrefix(req.ProviderResourceId, "instant-customer-") {
 			slog.Info("server.DeprovisionResource: postgres using dedicated backend",
 				"token", req.Token, "provider_resource_id", req.ProviderResourceId)
 			if err := s.dedicatedPostgresBackend.Deprovision(ctx, req.Token, req.ProviderResourceId); err != nil {
@@ -387,8 +405,10 @@ func (s *Server) DeprovisionResource(ctx context.Context, req *provisionerv1.Dep
 		return &provisionerv1.DeprovisionResponse{Deprovisioned: true}, nil
 
 	case commonv1.ResourceType_RESOURCE_TYPE_REDIS:
-		// Dedicated Redis deprovision: providerResourceID holds Upstash DB ID when set.
-		if s.dedicatedRedisBackend != nil && req.ProviderResourceId != "" {
+		// Skip dedicated backend for k8s-style provider IDs so the regular
+		// redisBackend's route-registry connection unregisters the route key.
+		if s.dedicatedRedisBackend != nil && req.ProviderResourceId != "" &&
+			!strings.HasPrefix(req.ProviderResourceId, "instant-customer-") {
 			slog.Info("server.DeprovisionResource: redis using dedicated backend",
 				"token", req.Token, "provider_resource_id", req.ProviderResourceId)
 			if err := s.dedicatedRedisBackend.Deprovision(ctx, req.Token, req.ProviderResourceId); err != nil {
@@ -402,7 +422,8 @@ func (s *Server) DeprovisionResource(ctx context.Context, req *provisionerv1.Dep
 		return &provisionerv1.DeprovisionResponse{Deprovisioned: true}, nil
 
 	case commonv1.ResourceType_RESOURCE_TYPE_MONGODB:
-		if s.dedicatedMongoBackend != nil && req.ProviderResourceId != "" {
+		if s.dedicatedMongoBackend != nil && req.ProviderResourceId != "" &&
+			!strings.HasPrefix(req.ProviderResourceId, "instant-customer-") {
 			slog.Info("server.DeprovisionResource: mongo using dedicated backend",
 				"token", req.Token, "provider_resource_id", req.ProviderResourceId)
 			if err := s.dedicatedMongoBackend.Deprovision(ctx, req.Token, req.ProviderResourceId); err != nil {
@@ -416,7 +437,8 @@ func (s *Server) DeprovisionResource(ctx context.Context, req *provisionerv1.Dep
 		return &provisionerv1.DeprovisionResponse{Deprovisioned: true}, nil
 
 	case commonv1.ResourceType_RESOURCE_TYPE_QUEUE:
-		if s.dedicatedQueueBackend != nil && req.ProviderResourceId != "" {
+		if s.dedicatedQueueBackend != nil && req.ProviderResourceId != "" &&
+			!strings.HasPrefix(req.ProviderResourceId, "instant-customer-") {
 			slog.Info("server.DeprovisionResource: queue using dedicated backend",
 				"token", req.Token, "provider_resource_id", req.ProviderResourceId)
 			if err := s.dedicatedQueueBackend.Deprovision(ctx, req.Token, req.ProviderResourceId); err != nil {

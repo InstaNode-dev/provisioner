@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/big"
+	"os"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -220,9 +221,39 @@ func (b *LocalBackend) Deprovision(ctx context.Context, token, providerResourceI
 // sslmode=disable is explicit because the shared postgres-customers cluster does not
 // have SSL configured. Without it, lib/pq defaults to sslmode=prefer and fails with
 // "SSL is not enabled on the server" when the migrator's Verify step connects.
+//
+// Host resolution order:
+//  1. POSTGRES_PUBLIC_HOST_PORT (e.g. "pg.instanode.dev:5432") — explicit override
+//  2. POSTGRES_PUBLIC_HOST + POSTGRES_PUBLIC_PORT (port defaults to 5432)
+//  3. host extracted from adminURL (cluster-internal — only useful from inside the cluster)
+//
+// The returned URL is what clients use to connect. Admin operations (CREATE DATABASE,
+// CREATE USER) still use adminURL directly via pgx.Connect — those run from inside the
+// cluster against the in-cluster postgres-customers Service.
 func buildDBURL(adminURL, username, password, dbName string) string {
-	host := extractHost(adminURL)
+	host := publicHostPort()
+	if host == "" {
+		host = extractHost(adminURL)
+	}
 	return fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=disable", username, password, host, dbName)
+}
+
+// publicHostPort returns the host:port that should be embedded in user-facing
+// connection URLs, or "" if no public host is configured (caller falls back to
+// the cluster-internal host from the admin URL).
+func publicHostPort() string {
+	if hp := os.Getenv("POSTGRES_PUBLIC_HOST_PORT"); hp != "" {
+		return hp
+	}
+	host := os.Getenv("POSTGRES_PUBLIC_HOST")
+	if host == "" {
+		return ""
+	}
+	port := os.Getenv("POSTGRES_PUBLIC_PORT")
+	if port == "" {
+		port = "5432"
+	}
+	return host + ":" + port
 }
 
 // buildAdminNewDBURL builds an admin connection URL targeting a specific database.

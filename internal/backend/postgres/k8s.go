@@ -301,12 +301,27 @@ func (b *K8sBackend) StorageBytes(ctx context.Context, token, providerResourceID
 	}
 	dbName := "db_" + k8sShort(token)
 
+	// Fail-soft when the customer namespace exists but is missing the
+	// modern postgres-admin Secret or postgres Service — these are
+	// legacy rows in the platform DB whose pods are gone; nothing
+	// actionable for the worker to retry. Other Get failures still
+	// propagate so transient apiserver issues still surface.
 	secret, err := b.cs.CoreV1().Secrets(ns).Get(ctx, "postgres-admin", metav1.GetOptions{})
 	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			slog.Debug("k8s postgres.StorageBytes: legacy resource without postgres-admin secret",
+				"namespace", ns, "token", token)
+			return 0, nil
+		}
 		return 0, fmt.Errorf("k8s postgres.StorageBytes: get secret: %w", err)
 	}
 	svc, err := b.cs.CoreV1().Services(ns).Get(ctx, "postgres", metav1.GetOptions{})
 	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			slog.Debug("k8s postgres.StorageBytes: legacy resource without postgres service",
+				"namespace", ns, "token", token)
+			return 0, nil
+		}
 		return 0, fmt.Errorf("k8s postgres.StorageBytes: get service: %w", err)
 	}
 

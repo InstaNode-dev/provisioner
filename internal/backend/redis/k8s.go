@@ -303,6 +303,17 @@ func (b *K8sBackend) Provision(ctx context.Context, token, tier string) (*Creden
 }
 
 // StorageBytes returns used_memory from the Redis INFO command.
+//
+// Returns (0, nil) when the customer namespace exists but is missing the
+// modern `redis-auth` Secret or the `redis` Service. These are legacy
+// resources provisioned before the platform standardised on those names —
+// the resource is no longer reachable from this backend, but it's not an
+// operational error worth a worker retry, just a stale row in the
+// platform DB. Worker logs at debug level; user-facing storage_bytes
+// stays at its last known value (or 0) for that resource.
+//
+// Any other Get error (network, RBAC, transient apiserver failure)
+// propagates so the worker can retry.
 func (b *K8sBackend) StorageBytes(ctx context.Context, token, providerResourceID string) (int64, error) {
 	ns := providerResourceID
 	if ns == "" {
@@ -311,10 +322,20 @@ func (b *K8sBackend) StorageBytes(ctx context.Context, token, providerResourceID
 
 	secret, err := b.cs.CoreV1().Secrets(ns).Get(ctx, "redis-auth", metav1.GetOptions{})
 	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			slog.Debug("k8s redis.StorageBytes: legacy resource without redis-auth secret",
+				"namespace", ns, "token", token)
+			return 0, nil
+		}
 		return 0, fmt.Errorf("k8s redis.StorageBytes: get secret: %w", err)
 	}
 	svc, err := b.cs.CoreV1().Services(ns).Get(ctx, "redis", metav1.GetOptions{})
 	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			slog.Debug("k8s redis.StorageBytes: legacy resource without redis service",
+				"namespace", ns, "token", token)
+			return 0, nil
+		}
 		return 0, fmt.Errorf("k8s redis.StorageBytes: get service: %w", err)
 	}
 

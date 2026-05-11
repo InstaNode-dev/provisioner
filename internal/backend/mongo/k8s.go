@@ -335,12 +335,26 @@ func (b *K8sBackend) StorageBytes(ctx context.Context, token, providerResourceID
 	}
 	dbName := "db_" + mongoK8sShort(token)
 
+	// Fail-soft when the customer namespace exists but is missing the
+	// modern mongo-admin Secret or mongodb Service — these are legacy
+	// rows in the platform DB whose pods are gone; nothing actionable
+	// for the worker to retry. Other Get failures still propagate.
 	secret, err := b.cs.CoreV1().Secrets(ns).Get(ctx, "mongo-admin", metav1.GetOptions{})
 	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			slog.Debug("k8s mongo.StorageBytes: legacy resource without mongo-admin secret",
+				"namespace", ns, "token", token)
+			return 0, nil
+		}
 		return 0, fmt.Errorf("k8s mongo.StorageBytes: get secret: %w", err)
 	}
 	svc, err := b.cs.CoreV1().Services(ns).Get(ctx, "mongodb", metav1.GetOptions{})
 	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			slog.Debug("k8s mongo.StorageBytes: legacy resource without mongodb service",
+				"namespace", ns, "token", token)
+			return 0, nil
+		}
 		return 0, fmt.Errorf("k8s mongo.StorageBytes: get service: %w", err)
 	}
 

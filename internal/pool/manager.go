@@ -21,6 +21,7 @@ import (
 
 	"instant.dev/common/crypto"
 	"instant.dev/provisioner/internal/backend/mongo"
+	"instant.dev/provisioner/internal/backend/queue"
 	"instant.dev/provisioner/internal/backend/postgres"
 	"instant.dev/provisioner/internal/backend/redis"
 )
@@ -36,11 +37,13 @@ type Item struct {
 	KeyPrefix          string
 }
 
-// Config holds pool sizing parameters per resource type.
+// Config holds pool sizing parameters per resource type. Zero disables that
+// resource's pool — handed-out requests fall through to live provisioning.
 type Config struct {
 	PostgresSize int // target number of ready postgres items in pool
 	RedisSize    int // target number of ready redis items in pool
 	MongoSize    int // target number of ready mongodb items in pool
+	QueueSize    int // target number of ready NATS items in pool
 }
 
 // Manager maintains a pool of pre-provisioned resources.
@@ -50,6 +53,7 @@ type Manager struct {
 	postgresB postgres.Backend
 	redisB    redis.Backend
 	mongoB    mongo.Backend
+	queueB    queue.Backend
 	targets   map[string]int
 
 	refillCh chan string
@@ -59,7 +63,7 @@ type Manager struct {
 
 // New creates a Manager. Call Start to begin background maintenance.
 func New(db *pgxpool.Pool, aesKey []byte, cfg Config,
-	postgresB postgres.Backend, redisB redis.Backend, mongoB mongo.Backend,
+	postgresB postgres.Backend, redisB redis.Backend, mongoB mongo.Backend, queueB queue.Backend,
 ) *Manager {
 	return &Manager{
 		db:        db,
@@ -67,12 +71,14 @@ func New(db *pgxpool.Pool, aesKey []byte, cfg Config,
 		postgresB: postgresB,
 		redisB:    redisB,
 		mongoB:    mongoB,
+		queueB:    queueB,
 		targets: map[string]int{
 			"postgres": cfg.PostgresSize,
 			"redis":    cfg.RedisSize,
 			"mongodb":  cfg.MongoSize,
+			"queue":    cfg.QueueSize,
 		},
-		refillCh: make(chan string, 30),
+		refillCh: make(chan string, 40),
 		done:     make(chan struct{}),
 	}
 }
@@ -232,7 +238,9 @@ func (m *Manager) provisionOneItem(ctx context.Context, resourceType string) err
 	defer cancel()
 
 	// Pool tokens use a distinct prefix so they're identifiable in backend logs.
-	poolToken := "pool_" + uuid.NewString()
+	// Use "pool-" (hyphen), not "pool_" — k8s namespace names are RFC 1123,
+	// which disallows underscores.
+	poolToken := "pool-" + uuid.NewString()
 
 	var (
 		encURL             string
@@ -280,6 +288,20 @@ func (m *Manager) provisionOneItem(ctx context.Context, resourceType string) err
 		}
 		encURL = enc
 		databaseName = creds.DatabaseName
+
+	case "queue":
+		// NATS: same pattern as the data services. queue.Credentials has just
+		// URL + ProviderResourceID; no per-resource database/user concept.
+		creds, err := m.queueB.Provision(ctx, poolToken, "anonymous")
+		if err != nil {
+			return fmt.Errorf("provision queue: %w", err)
+		}
+		enc, err := crypto.Encrypt(m.aesKey, creds.URL)
+		if err != nil {
+			return fmt.Errorf("encrypt queue url: %w", err)
+		}
+		encURL = enc
+		providerResourceID = creds.ProviderResourceID
 
 	default:
 		return fmt.Errorf("unknown resource type: %s", resourceType)

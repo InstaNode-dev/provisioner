@@ -15,8 +15,10 @@ type Config struct {
 	NeonRegionID             string // NEON_REGION_ID, default "aws-us-east-1"
 	RedisProvisionBackend    string // REDIS_PROVISION_BACKEND, default "local"
 	RedisProvisionHost       string // REDIS_PROVISION_HOST, default "localhost:6379"
+	MongoProvisionBackend    string // MONGO_PROVISION_BACKEND, default "local"
 	MongoAdminURI            string // MONGO_ADMIN_URI
 	MongoHost                string // MONGO_HOST
+	QueueProvisionBackend    string // QUEUE_PROVISION_BACKEND, default "local"
 	ProvisionerSecret        string // PROVISIONER_SECRET — shared secret for auth interceptor
 
 	// Dedicated provisioning — Team tier.
@@ -36,6 +38,7 @@ type Config struct {
 	PoolPostgresSize       int    // POOL_POSTGRES_SIZE, default 2
 	PoolRedisSize          int    // POOL_REDIS_SIZE, default 3
 	PoolMongoSize          int    // POOL_MONGO_SIZE, default 2
+	PoolQueueSize          int    // POOL_QUEUE_SIZE (NATS), default 2
 
 	// ── Kubernetes dedicated backend (Team tier) ─────────────────────────────
 	//
@@ -103,8 +106,10 @@ func Load() *Config {
 		NeonRegionID:             getenv("NEON_REGION_ID", "aws-us-east-1"),
 		RedisProvisionBackend:    getenv("REDIS_PROVISION_BACKEND", "local"),
 		RedisProvisionHost:       getenv("REDIS_PROVISION_HOST", "localhost:6379"),
+		MongoProvisionBackend:    getenv("MONGO_PROVISION_BACKEND", "local"),
 		MongoAdminURI:            getenv("MONGO_ADMIN_URI", "mongodb://root:root@localhost:27017"),
 		MongoHost:                getenv("MONGO_HOST", "localhost:27017"),
+		QueueProvisionBackend:    getenv("QUEUE_PROVISION_BACKEND", "local"),
 		ProvisionerSecret:        os.Getenv("PROVISIONER_SECRET"),
 		DedicatedPostgresDSN:     os.Getenv("DEDICATED_POSTGRES_DSN"),
 		DedicatedRedisURL:        os.Getenv("DEDICATED_REDIS_URL"),
@@ -114,6 +119,7 @@ func Load() *Config {
 		PoolPostgresSize:         getenvInt("POOL_POSTGRES_SIZE", 2),
 		PoolRedisSize:            getenvInt("POOL_REDIS_SIZE", 3),
 		PoolMongoSize:            getenvInt("POOL_MONGO_SIZE", 2),
+		PoolQueueSize:            getenvInt("POOL_QUEUE_SIZE", 2),
 		K8sDedicatedBackend:      os.Getenv("K8S_DEDICATED_BACKEND") == "true",
 		K8sKubeconfig:            os.Getenv("K8S_KUBECONFIG"),
 		K8sExternalHost:          os.Getenv("K8S_EXTERNAL_HOST"),
@@ -147,6 +153,7 @@ func logStartupConfig(cfg *Config) {
 		"redis_provision_host", cfg.RedisProvisionHost,
 		"mongo_admin_uri_set", cfg.MongoAdminURI != "",
 		"mongo_host", cfg.MongoHost,
+		"queue_provision_backend", cfg.QueueProvisionBackend,
 		"provisioner_secret_set", cfg.ProvisionerSecret != "",
 		"dedicated_postgres_dsn_set", cfg.DedicatedPostgresDSN != "",
 		"dedicated_redis_url_set", cfg.DedicatedRedisURL != "",

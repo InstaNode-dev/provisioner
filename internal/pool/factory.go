@@ -5,6 +5,7 @@ import (
 
 	"instant.dev/provisioner/internal/backend/mongo"
 	"instant.dev/provisioner/internal/backend/postgres"
+	"instant.dev/provisioner/internal/backend/queue"
 	"instant.dev/provisioner/internal/backend/redis"
 	"instant.dev/provisioner/internal/config"
 )
@@ -25,8 +26,13 @@ func NewWithConfig(db *pgxpool.Pool, aesKey []byte, cfg Config, appCfg *config.C
 		appCfg.RedisProvisionHost,
 	)
 	mongoB := mongo.NewBackend(
+		appCfg.MongoProvisionBackend,
 		appCfg.MongoAdminURI,
 		appCfg.MongoHost,
 	)
-	return New(db, aesKey, cfg, postgresB, redisB, mongoB)
+	queueB := queue.NewBackend(
+		appCfg.QueueProvisionBackend,
+		appCfg.NATSHost,
+	)
+	return New(db, aesKey, cfg, postgresB, redisB, mongoB, queueB)
 }

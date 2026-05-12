@@ -26,7 +26,14 @@ COPY common/ /common/
 COPY provisioner/go.mod provisioner/go.sum ./
 RUN go mod download
 COPY provisioner/ .
-RUN CGO_ENABLED=0 go build -o /provisioner .
+# Build-time metadata injected via -ldflags into instant.dev/common/buildinfo.
+# Defaults keep the build runnable without --build-arg; CI passes real values.
+ARG GIT_SHA=dev
+ARG BUILD_TIME=unknown
+ARG VERSION=dev
+RUN CGO_ENABLED=0 go build \
+    -ldflags "-X instant.dev/common/buildinfo.GitSHA=${GIT_SHA} -X instant.dev/common/buildinfo.BuildTime=${BUILD_TIME} -X instant.dev/common/buildinfo.Version=${VERSION}" \
+    -o /provisioner .
 
 # debug — alpine-based image that supports `kubectl exec` for one-off
 # debugging. Bundles the most-likely-needed tools so an operator (or

@@ -17,7 +17,7 @@
 # Build context is the repo root (CLAUDE.md convention); the COPY
 # paths assume `cd cron && docker build -f provisioner/Dockerfile .`.
 
-FROM golang:1.24-alpine AS builder
+FROM golang:1.25-alpine AS builder
 WORKDIR /app
 # Copy replace-directive modules first (go.mod uses replace ../proto and ../common)
 COPY proto/ /proto/

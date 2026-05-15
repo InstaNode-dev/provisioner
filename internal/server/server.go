@@ -13,6 +13,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"instant.dev/common/plans"
 	commonv1 "instant.dev/proto/common/v1"
 	provisionerv1 "instant.dev/proto/provisioner/v1"
 
@@ -544,6 +545,94 @@ func (s *Server) GetStorageBytes(ctx context.Context, req *provisionerv1.Storage
 	default:
 		return nil, status.Errorf(codes.InvalidArgument, "unknown resource_type: %v", req.ResourceType)
 	}
+}
+
+// regradeConnLimits is the source of truth for per-tier Postgres connection
+// caps used by RegradeResource. It is the shared plans registry — the same
+// source the agent API uses via plans.Registry.ConnectionsLimit(tier,
+// "postgres") — so the cap re-applied here stays platform-consistent.
+var regradeConnLimits = plans.Default()
+
+// RegradeResource re-applies the tier's per-role connection cap to an
+// already-provisioned resource. It exists because a plan upgrade does not, on
+// its own, re-apply the higher CONNECTION LIMIT to the customer's Postgres
+// role — the role keeps the old (lower) cap until this RPC runs.
+//
+// Phase 1 is Postgres-only. Non-Postgres resource types and backends with no
+// per-role connection cap (the shared local/dedicated/neon backends) return
+// {applied:false} with a skip reason rather than an error.
+func (s *Server) RegradeResource(ctx context.Context, req *provisionerv1.RegradeRequest) (*provisionerv1.RegradeResponse, error) {
+	if req.Token == "" {
+		return nil, status.Error(codes.InvalidArgument, "token is required")
+	}
+
+	ctx, span := otel.Tracer("instant.dev/provisioner").Start(ctx, "RegradeResource",
+		trace.WithAttributes(
+			attribute.String("resource_type", req.ResourceType.String()),
+			attribute.String("tier", req.Tier),
+			attribute.String("resource.token", req.Token),
+		),
+	)
+	defer span.End()
+
+	// Phase 1: Postgres only.
+	if req.ResourceType != commonv1.ResourceType_RESOURCE_TYPE_POSTGRES {
+		slog.Info("server.RegradeResource",
+			"token", req.Token, "tier", req.Tier,
+			"applied", false, "skip_reason", "unsupported resource type for regrade",
+			"request_id", req.RequestId)
+		return &provisionerv1.RegradeResponse{
+			Applied:    false,
+			SkipReason: "unsupported resource type for regrade",
+		}, nil
+	}
+
+	// Select the backend that actually owns this resource. k8s namespace IDs
+	// (prefix "instant-customer-") go through the regular postgresBackend,
+	// matching the routing DeprovisionResource uses.
+	backend := s.postgresBackend
+	if s.dedicatedPostgresBackend != nil && req.ProviderResourceId != "" &&
+		!strings.HasPrefix(req.ProviderResourceId, "instant-customer-") {
+		backend = s.dedicatedPostgresBackend
+	}
+
+	// Only the k8s backend applies a per-role CONNECTION LIMIT at provision
+	// time. Every other backend would return the same skip via Regrade, but
+	// checking here keeps the contract explicit and avoids a needless k8s/DB
+	// round-trip.
+	if _, ok := backend.(*postgres.K8sBackend); !ok {
+		slog.Info("server.RegradeResource",
+			"token", req.Token, "tier", req.Tier,
+			"applied", false, "skip_reason", "backend has no per-role connection cap",
+			"request_id", req.RequestId)
+		return &provisionerv1.RegradeResponse{
+			Applied:    false,
+			SkipReason: "backend has no per-role connection cap",
+		}, nil
+	}
+
+	// Connection cap comes from the shared plans registry, keeping it
+	// consistent with the cap the agent API reports and the k8s backend
+	// applies at provision time. -1 = unlimited; passed through verbatim.
+	connLimit := regradeConnLimits.ConnectionsLimit(req.Tier, "postgres")
+
+	result, err := backend.Regrade(ctx, req.Token, req.ProviderResourceId, connLimit)
+	if err != nil {
+		return nil, mapError("RegradeResource.postgres", err)
+	}
+
+	slog.Info("server.RegradeResource",
+		"token", req.Token, "tier", req.Tier,
+		"applied", result.Applied,
+		"applied_conn_limit", result.AppliedConnLimit,
+		"skip_reason", result.SkipReason,
+		"request_id", req.RequestId)
+
+	return &provisionerv1.RegradeResponse{
+		Applied:          result.Applied,
+		AppliedConnLimit: int32(result.AppliedConnLimit),
+		SkipReason:       result.SkipReason,
+	}, nil
 }
 
 // mapError converts backend errors to appropriate gRPC status codes.

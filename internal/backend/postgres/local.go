@@ -217,6 +217,13 @@ func (b *LocalBackend) Deprovision(ctx context.Context, token, providerResourceI
 	return nil
 }
 
+// Regrade is a no-op for the shared local backend: Provision sets no per-role
+// CONNECTION LIMIT on the shared cluster, so there is no cap to re-apply on a
+// plan upgrade. Returns a skip result without error.
+func (b *LocalBackend) Regrade(ctx context.Context, token, providerResourceID string, connLimit int) (RegradeResult, error) {
+	return RegradeResult{Applied: false, SkipReason: "backend has no per-role connection cap"}, nil
+}
+
 // buildDBURL constructs the user-facing connection URL for the provisioned database.
 // sslmode=disable is explicit because the shared postgres-customers cluster does not
 // have SSL configured. Without it, lib/pq defaults to sslmode=prefer and fails with

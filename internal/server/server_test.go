@@ -25,6 +25,7 @@ type mockPostgresBackend struct {
 	provision    func(ctx context.Context, token, tier string) (*postgres.Credentials, error)
 	storageBytes func(ctx context.Context, token, providerResourceID string) (int64, error)
 	deprovision  func(ctx context.Context, token, providerResourceID string) error
+	regrade      func(ctx context.Context, token, providerResourceID string, connLimit int) (postgres.RegradeResult, error)
 }
 
 func (m *mockPostgresBackend) Provision(ctx context.Context, token, tier string) (*postgres.Credentials, error) {
@@ -50,6 +51,13 @@ func (m *mockPostgresBackend) Deprovision(ctx context.Context, token, id string)
 		return m.deprovision(ctx, token, id)
 	}
 	return nil
+}
+
+func (m *mockPostgresBackend) Regrade(ctx context.Context, token, id string, connLimit int) (postgres.RegradeResult, error) {
+	if m.regrade != nil {
+		return m.regrade(ctx, token, id, connLimit)
+	}
+	return postgres.RegradeResult{Applied: false, SkipReason: "backend has no per-role connection cap"}, nil
 }
 
 type mockRedisBackend struct {
@@ -354,6 +362,55 @@ func TestGetStorageBytes_Storage_NilMinIOBackend_ReturnsZero(t *testing.T) {
 	}
 	if resp.MeasuredAt == 0 {
 		t.Fatal("expected non-zero MeasuredAt")
+	}
+}
+
+// --- RegradeResource tests ---
+
+func TestRegradeResource_EmptyToken_ReturnsInvalidArgument(t *testing.T) {
+	srv := newTestServer()
+	_, err := srv.RegradeResource(context.Background(), &provisionerv1.RegradeRequest{
+		ResourceType: commonv1.ResourceType_RESOURCE_TYPE_POSTGRES,
+		Tier:         "pro",
+	})
+	assertCode(t, err, codes.InvalidArgument)
+}
+
+func TestRegradeResource_NonPostgres_SkipsWithReason(t *testing.T) {
+	srv := newTestServer()
+	resp, err := srv.RegradeResource(context.Background(), &provisionerv1.RegradeRequest{
+		Token:        "tok-123",
+		ResourceType: commonv1.ResourceType_RESOURCE_TYPE_REDIS,
+		Tier:         "pro",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Applied {
+		t.Fatal("expected applied=false for non-postgres resource")
+	}
+	if resp.SkipReason != "unsupported resource type for regrade" {
+		t.Fatalf("unexpected skip_reason: %q", resp.SkipReason)
+	}
+}
+
+func TestRegradeResource_NonK8sBackend_SkipsWithReason(t *testing.T) {
+	// newTestServer wires the shared mockPostgresBackend, which is not a
+	// *postgres.K8sBackend — the server should skip without touching it.
+	srv := newTestServer()
+	resp, err := srv.RegradeResource(context.Background(), &provisionerv1.RegradeRequest{
+		Token:        "tok-123",
+		ResourceType: commonv1.ResourceType_RESOURCE_TYPE_POSTGRES,
+		Tier:         "pro",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Applied {
+		t.Fatal("expected applied=false for non-k8s backend")
+	}
+	if resp.SkipReason != "backend has no per-role connection cap" {
+		t.Fatalf("unexpected skip_reason: %q", resp.SkipReason)
 	}
 }
 

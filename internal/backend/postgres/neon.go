@@ -178,3 +178,10 @@ func (b *NeonBackend) Deprovision(ctx context.Context, token, providerResourceID
 	slog.Info("db.neon.Deprovision: deprovisioned", "token", token, "project_id", providerResourceID)
 	return nil
 }
+
+// Regrade is a no-op for the Neon backend: connection limits are governed by
+// the Neon project plan, not a per-role CONNECTION LIMIT, so there is nothing
+// to re-apply on a plan upgrade.
+func (b *NeonBackend) Regrade(ctx context.Context, token, providerResourceID string, connLimit int) (RegradeResult, error) {
+	return RegradeResult{Applied: false, SkipReason: "backend has no per-role connection cap"}, nil
+}

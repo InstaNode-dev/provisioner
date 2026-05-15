@@ -43,7 +43,7 @@ permissions:
   packages: write
 
 env:
-  IMAGE_REPO: ghcr.io/mastermanas805/instant-provisioner
+  IMAGE_REPO: ghcr.io/instanode-dev/instant-provisioner
   K8S_NAMESPACE: instant-infra
   K8S_DEPLOYMENT: instant-provisioner
   K8S_CONTAINER: provisioner

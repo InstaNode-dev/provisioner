@@ -37,6 +37,25 @@ type Backend interface {
 	Provision(ctx context.Context, token, tier string) (*Credentials, error)
 	StorageBytes(ctx context.Context, token, providerResourceID string) (int64, error)
 	Deprovision(ctx context.Context, token, providerResourceID string) error
+	// Regrade re-applies the tier's per-role CONNECTION LIMIT to an already
+	// provisioned resource (e.g. after a plan upgrade). Idempotent.
+	//
+	// connLimit is the connection cap to apply (-1 = unlimited). Backends that
+	// own a dedicated pod per resource (k8s) ALTER ROLE in place. The shared
+	// local/dedicated/neon backends set no per-role cap at provision time, so
+	// they return RegradeResult{Applied:false, SkipReason:"..."} without error.
+	//
+	// A non-error RegradeResult{Applied:false} means "nothing to do / not
+	// reachable" — the caller can safely retry on the next sweep. An error is
+	// reserved for unexpected failures.
+	Regrade(ctx context.Context, token, providerResourceID string, connLimit int) (RegradeResult, error)
+}
+
+// RegradeResult is the outcome of a Backend.Regrade call.
+type RegradeResult struct {
+	Applied          bool   // true if the new connection cap was applied
+	AppliedConnLimit int    // the cap that is now in effect (-1 = unlimited)
+	SkipReason       string // populated when Applied is false
 }
 
 // Credentials returned by Provision.

@@ -373,6 +373,65 @@ func (b *K8sBackend) Deprovision(ctx context.Context, token, providerResourceID 
 	return nil
 }
 
+// Regrade re-applies a connection cap to the customer's app Postgres role.
+// Used after a plan upgrade: the role's CONNECTION LIMIT was set at provision
+// time from the old (lower) tier and nothing re-applies the new cap.
+//
+// It resolves the resource → its namespace/Service/admin Secret the same way
+// StorageBytes does, then runs ALTER ROLE on the customer DB. Re-applying the
+// same value is a harmless no-op (idempotent).
+//
+// When the pod is unreachable (paused, terminating, legacy row without the
+// modern Secret/Service) this returns RegradeResult{Applied:false} with a
+// skip reason and no error — the caller retries on the next sweep.
+func (b *K8sBackend) Regrade(ctx context.Context, token, providerResourceID string, connLimit int) (RegradeResult, error) {
+	ns := providerResourceID
+	if ns == "" {
+		ns = k8sNsPrefix + token
+	}
+
+	// Resolve admin connection — identical pattern to StorageBytes. Legacy rows
+	// whose pods are gone (missing Secret/Service) are non-actionable: skip,
+	// don't error, so the caller doesn't retry forever.
+	secret, err := b.cs.CoreV1().Secrets(ns).Get(ctx, "postgres-admin", metav1.GetOptions{})
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			return RegradeResult{Applied: false, SkipReason: "resource not reachable: postgres-admin secret not found"}, nil
+		}
+		return RegradeResult{Applied: false, SkipReason: fmt.Sprintf("resource not reachable: get secret: %v", err)}, nil
+	}
+	svc, err := b.cs.CoreV1().Services(ns).Get(ctx, "postgres", metav1.GetOptions{})
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			return RegradeResult{Applied: false, SkipReason: "resource not reachable: postgres service not found"}, nil
+		}
+		return RegradeResult{Applied: false, SkipReason: fmt.Sprintf("resource not reachable: get service: %v", err)}, nil
+	}
+
+	adminUser := string(secret.Data["POSTGRES_USER"])
+	adminPass := string(secret.Data["POSTGRES_PASSWORD"])
+	// The app role is derived from the token exactly as in Provision.
+	appUser := "usr_" + k8sShort(token)
+
+	dsn := fmt.Sprintf("postgres://%s:%s@%s:5432/postgres?sslmode=disable", adminUser, adminPass, svc.Spec.ClusterIP)
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return RegradeResult{Applied: false, SkipReason: fmt.Sprintf("resource not reachable: connect: %v", err)}, nil
+	}
+	defer conn.Close(ctx)
+
+	// ALTER ROLE re-applies the tier's connection cap. -1 = unlimited (passed
+	// through verbatim). Identifier quoted with %q, mirroring the CREATE USER
+	// path in initDatabase.
+	stmt := fmt.Sprintf(`ALTER ROLE %q CONNECTION LIMIT %d`, appUser, connLimit)
+	if _, err := conn.Exec(ctx, stmt); err != nil {
+		// Role missing on a live pod is non-actionable too — treat as skip.
+		return RegradeResult{Applied: false, SkipReason: fmt.Sprintf("resource not reachable: alter role: %v", err)}, nil
+	}
+
+	return RegradeResult{Applied: true, AppliedConnLimit: connLimit}, nil
+}
+
 // --- private resource creators ---
 
 func (b *K8sBackend) applyNamespace(ctx context.Context, ns string) error {

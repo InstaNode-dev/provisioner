@@ -77,6 +77,14 @@ func (p *DedicatedProvider) Deprovision(ctx context.Context, token, providerReso
 	return p.deprovisionLocal(ctx, token)
 }
 
+// Regrade is a no-op for the dedicated provider. The Neon path manages
+// connection limits through the Neon project plan, not a per-role
+// CONNECTION LIMIT; the local-admin path sets no per-role cap at provision
+// time. Either way there is no cap to re-apply, so a skip result is returned.
+func (p *DedicatedProvider) Regrade(ctx context.Context, token, providerResourceID string, connLimit int) (RegradeResult, error) {
+	return RegradeResult{Applied: false, SkipReason: "backend has no per-role connection cap"}, nil
+}
+
 // --- Neon API path ---
 
 func (p *DedicatedProvider) provisionNeon(ctx context.Context, token, tier string) (*Credentials, error) {

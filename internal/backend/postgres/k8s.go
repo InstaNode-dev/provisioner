@@ -59,6 +59,8 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+
+	"instant.dev/provisioner/internal/ctxkeys"
 )
 
 const (
@@ -67,6 +69,12 @@ const (
 	k8sRoleValue     = "customer-resource"
 	k8sReadyTimeout  = 3 * time.Minute
 	k8sReadyInterval = 3 * time.Second
+
+	// k8sOwnerTeamLabel is applied to dedicated customer namespaces to record
+	// the owning team UUID.  The deploy-side NetworkPolicy in the api repo
+	// combines this label with k8sRoleLabel to scope DB-port egress per-team.
+	// Pentest fix: 2026-05-16.
+	k8sOwnerTeamLabel = "instant.dev/owner-team"
 )
 
 // tierSizing maps a billing tier to k8s resource sizing for the provisioned pod.
@@ -138,7 +146,7 @@ func sizingForTier(tier string) tierSizing {
 // K8sBackend provisions a dedicated Postgres pod per token.
 // All configuration comes from environment variables — see config.go for the full list.
 type K8sBackend struct {
-	cs            *kubernetes.Clientset
+	cs            kubernetes.Interface // kubernetes.Interface allows fake.Clientset in tests
 	storageClass  string // K8S_STORAGE_CLASS: "gp3" (EKS) or "local-path" (dev)
 	image         string // K8S_POSTGRES_IMAGE: "pgvector/pgvector:pg16" (default)
 	externalHost  string // K8S_EXTERNAL_HOST: node IP, LB DNS, or proxy hostname
@@ -226,8 +234,13 @@ func (b *K8sBackend) Provision(ctx context.Context, token, tier string, connLimi
 	// Use a fresh background context for the provisioning sequence.
 	// The gRPC request context (ctx) has a short deadline that would cancel
 	// waitPodReady, which can legitimately take 1–3 minutes for pod startup.
+	// Carry the teamID value forward so applyNamespace can label the namespace
+	// with instant.dev/owner-team (pentest 2026-05-16 fix).
 	provCtx, provCancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer provCancel()
+	if teamID, ok := ctx.Value(ctxkeys.TeamIDKey).(string); ok && teamID != "" {
+		provCtx = context.WithValue(provCtx, ctxkeys.TeamIDKey, teamID)
+	}
 
 	sz := sizingForTier(tier)
 
@@ -439,18 +452,26 @@ func (b *K8sBackend) Regrade(ctx context.Context, token, providerResourceID stri
 // --- private resource creators ---
 
 func (b *K8sBackend) applyNamespace(ctx context.Context, ns string) error {
+	labels := map[string]string{
+		k8sRoleLabel: k8sRoleValue,
+		// PodSecurityStandard "baseline": blocks privileged containers + hostPath mounts.
+		// Postgres 16 official image runs entrypoint as root then drops to uid 999 via gosu,
+		// so "restricted" (which requires runAsNonRoot) would block it.
+		// Use bitnami/postgresql image to enable "restricted" if required.
+		"pod-security.kubernetes.io/enforce": "baseline",
+		"pod-security.kubernetes.io/warn":    "restricted",
+	}
+	// SECURITY FIX (pentest 2026-05-16): label the namespace with the owning
+	// team UUID when provided. The deploy-side NetworkPolicy combines this label
+	// with role=customer-resource to scope DB-port egress per-team, preventing
+	// cross-tenant network access.
+	if teamID, ok := ctx.Value(ctxkeys.TeamIDKey).(string); ok && teamID != "" {
+		labels[k8sOwnerTeamLabel] = teamID
+	}
 	nsObj := &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: ns,
-			Labels: map[string]string{
-				k8sRoleLabel: k8sRoleValue,
-				// PodSecurityStandard "baseline": blocks privileged containers + hostPath mounts.
-				// Postgres 16 official image runs entrypoint as root then drops to uid 999 via gosu,
-				// so "restricted" (which requires runAsNonRoot) would block it.
-				// Use bitnami/postgresql image to enable "restricted" if required.
-				"pod-security.kubernetes.io/enforce": "baseline",
-				"pod-security.kubernetes.io/warn":    "restricted",
-			},
+			Name:   ns,
+			Labels: labels,
 		},
 	}
 	_, err := b.cs.CoreV1().Namespaces().Create(ctx, nsObj, metav1.CreateOptions{})

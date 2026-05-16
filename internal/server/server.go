@@ -11,6 +11,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	"instant.dev/common/plans"
@@ -23,8 +24,30 @@ import (
 	"instant.dev/provisioner/internal/backend/redis"
 	"instant.dev/provisioner/internal/backend/storage"
 	"instant.dev/provisioner/internal/config"
+	"instant.dev/provisioner/internal/ctxkeys"
 	"instant.dev/provisioner/internal/pool"
 )
+
+// teamIDMetaKey is the gRPC metadata key used to pass the owning team UUID
+// from the API to the provisioner. The provisioner uses this value to label
+// dedicated (k8s-backed) namespaces with instant.dev/owner-team so the
+// deploy-side NetworkPolicy can scope DB-port egress per-team.
+// Lowercase: gRPC metadata keys are canonically lowercase.
+const teamIDMetaKey = "x-instant-team-id"
+
+// teamIDFromContext extracts the team ID transmitted via gRPC metadata.
+// Returns empty string when the key is absent (anonymous provisions).
+func teamIDFromContext(ctx context.Context) string {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return ""
+	}
+	vals := md.Get(teamIDMetaKey)
+	if len(vals) == 0 {
+		return ""
+	}
+	return vals[0]
+}
 
 // Server implements ProvisionerServiceServer.
 type Server struct {
@@ -157,6 +180,14 @@ func (s *Server) PostgresBackend() postgres.Backend {
 func (s *Server) ProvisionResource(ctx context.Context, req *provisionerv1.ProvisionRequest) (*provisionerv1.ProvisionResponse, error) {
 	if req.Token == "" {
 		return nil, status.Error(codes.InvalidArgument, "token is required")
+	}
+
+	// Extract the owning team ID from gRPC metadata and inject it into the
+	// context so the k8s backends can label the namespace with
+	// instant.dev/owner-team. This closes the cross-tenant network-isolation
+	// gap confirmed by pentest on 2026-05-16.
+	if teamID := teamIDFromContext(ctx); teamID != "" {
+		ctx = context.WithValue(ctx, ctxkeys.TeamIDKey, teamID)
 	}
 
 	ctx, span := otel.Tracer("instant.dev/provisioner").Start(ctx, "ProvisionResource",

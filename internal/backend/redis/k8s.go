@@ -71,7 +71,7 @@ const (
 // so Redis behaves as a cache (evicts old keys) rather than returning write errors
 // when full. Values mirror plans.yaml redis_memory_mb:
 //
-//	anonymous: 5 MB, hobby: 50 MB, pro: 512 MB, team/growth: unlimited (-1)
+//	anonymous: 5 MB, hobby: 50 MB, pro: 512 MB, growth: 1024 MB, team: unlimited (-1)
 type tierSizing struct {
 	cpuReq, memReq string
 	cpuLim, memLim string
@@ -123,7 +123,7 @@ func sizingForTier(tier string) tierSizing {
 			maxClients:  200,
 			maxmemoryMB: 512, // plans.yaml: pro redis_memory_mb = 512
 		}
-	case "team", "growth":
+	case "growth":
 		return tierSizing{
 			cpuReq: "500m", memReq: "1Gi",
 			cpuLim: "4", memLim: "4Gi",
@@ -131,7 +131,17 @@ func sizingForTier(tier string) tierSizing {
 			qCPURequests: "1", qMemRequests: "2Gi",
 			qCPULimits: "8", qMemLimits: "8Gi",
 			maxClients:  1000,
-			maxmemoryMB: -1, // unlimited — team/growth dedicated pods have no memory cap
+			maxmemoryMB: 1024, // plans.yaml: growth redis_memory_mb = 1024
+		}
+	case "team":
+		return tierSizing{
+			cpuReq: "500m", memReq: "1Gi",
+			cpuLim: "4", memLim: "4Gi",
+			pvcMi:        51200, // 50Gi
+			qCPURequests: "1", qMemRequests: "2Gi",
+			qCPULimits: "8", qMemLimits: "8Gi",
+			maxClients:  1000,
+			maxmemoryMB: -1, // unlimited — team dedicated pods have no memory cap
 		}
 	default:
 		// Unknown tier → conservative hobby-equivalent sizing.

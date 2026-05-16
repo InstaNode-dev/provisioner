@@ -50,6 +50,8 @@ import (
 	"k8s.io/client-go/tools/remotecommand"
 
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+
+	"instant.dev/provisioner/internal/ctxkeys"
 )
 
 // PodExecor is an abstraction over the k8s pod exec transport, injected into
@@ -65,11 +67,16 @@ type PodExecor interface {
 }
 
 const (
-	redisK8sNsPrefix  = "instant-customer-"
-	redisK8sRoleLabel = "instant.dev/role"
-	redisK8sRoleValue = "customer-resource"
-	redisK8sReadyTO   = 3 * time.Minute
-	redisK8sReadyPoll = 3 * time.Second
+	redisK8sNsPrefix     = "instant-customer-"
+	redisK8sRoleLabel    = "instant.dev/role"
+	redisK8sRoleValue    = "customer-resource"
+	redisK8sReadyTO      = 3 * time.Minute
+	redisK8sReadyPoll    = 3 * time.Second
+
+	// redisK8sOwnerTeamLabel is applied to dedicated customer namespaces.
+	// Mirrors the constant in postgres/k8s.go — must stay in sync.
+	// Pentest fix: 2026-05-16.
+	redisK8sOwnerTeamLabel = "instant.dev/owner-team"
 )
 
 // tierSizing maps a billing tier to k8s resource sizing for the provisioned Redis pod.
@@ -335,8 +342,13 @@ func (b *K8sBackend) Provision(ctx context.Context, token, tier string) (*Creden
 
 	// Use a fresh background context — pod startup can take minutes, far exceeding
 	// any gRPC request deadline on the incoming ctx.
+	// Carry the teamID value forward so applyNamespace can label the namespace
+	// with instant.dev/owner-team (pentest 2026-05-16 fix).
 	provCtx, provCancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer provCancel()
+	if teamID, ok := ctx.Value(ctxkeys.TeamIDKey).(string); ok && teamID != "" {
+		provCtx = context.WithValue(provCtx, ctxkeys.TeamIDKey, teamID)
+	}
 
 	sz := sizingForTier(tier)
 
@@ -790,14 +802,21 @@ func parseConfigGetMaxmemory(output string) int64 {
 // --- private resource creators ---
 
 func (b *K8sBackend) applyNamespace(ctx context.Context, ns string) error {
+	labels := map[string]string{
+		redisK8sRoleLabel:                    redisK8sRoleValue,
+		"pod-security.kubernetes.io/enforce": "baseline",
+		"pod-security.kubernetes.io/warn":    "restricted",
+	}
+	// SECURITY FIX (pentest 2026-05-16): label the namespace with the owning
+	// team UUID when provided. The deploy-side NetworkPolicy combines this label
+	// with role=customer-resource to scope DB-port egress per-team.
+	if teamID, ok := ctx.Value(ctxkeys.TeamIDKey).(string); ok && teamID != "" {
+		labels[redisK8sOwnerTeamLabel] = teamID
+	}
 	nsObj := &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: ns,
-			Labels: map[string]string{
-				redisK8sRoleLabel:                    redisK8sRoleValue,
-				"pod-security.kubernetes.io/enforce": "baseline",
-				"pod-security.kubernetes.io/warn":    "restricted",
-			},
+			Name:   ns,
+			Labels: labels,
 		},
 	}
 	_, err := b.cs.CoreV1().Namespaces().Create(ctx, nsObj, metav1.CreateOptions{})

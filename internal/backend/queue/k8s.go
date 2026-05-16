@@ -43,14 +43,16 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	"instant.dev/provisioner/internal/ctxkeys"
 )
 
 const (
-	natsK8sNsPrefix  = "instant-customer-"
-	natsK8sRoleLabel = "instant.dev/role"
-	natsK8sRoleValue = "customer-resource"
-	natsK8sReadyTO   = 3 * time.Minute
-	natsK8sReadyPoll = 3 * time.Second
+	natsK8sNsPrefix       = "instant-customer-"
+	natsK8sRoleLabel      = "instant.dev/role"
+	natsK8sRoleValue      = "customer-resource"
+	natsK8sOwnerTeamLabel = "instant.dev/owner-team"
+	natsK8sReadyTO        = 3 * time.Minute
+	natsK8sReadyPoll      = 3 * time.Second
 )
 
 // tierSizing maps a billing tier to k8s resource sizing for the provisioned NATS pod.
@@ -209,8 +211,13 @@ func (b *K8sBackend) Provision(ctx context.Context, token, tier string) (*Creden
 
 	// Use a fresh background context — pod startup can take minutes, far exceeding
 	// any gRPC request deadline on the incoming ctx.
+	// Carry the teamID value forward so applyNamespace can label the namespace
+	// with instant.dev/owner-team (pentest 2026-05-16 fix).
 	provCtx, provCancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer provCancel()
+	if teamID, ok := ctx.Value(ctxkeys.TeamIDKey).(string); ok && teamID != "" {
+		provCtx = context.WithValue(provCtx, ctxkeys.TeamIDKey, teamID)
+	}
 
 	sz := sizingForTier(tier)
 
@@ -315,14 +322,22 @@ func (b *K8sBackend) Deprovision(ctx context.Context, token, providerResourceID 
 // --- private resource creators ---
 
 func (b *K8sBackend) applyNamespace(ctx context.Context, ns string) error {
+	labels := map[string]string{
+		natsK8sRoleLabel:                     natsK8sRoleValue,
+		"pod-security.kubernetes.io/enforce": "baseline",
+		"pod-security.kubernetes.io/warn":    "restricted",
+	}
+	// SECURITY FIX (pentest 2026-05-16): label the namespace with the owning
+	// team ID so that the deploy-side NetworkPolicy can scope DB-port egress
+	// to this team's namespaces only (matchLabels on both role + owner-team),
+	// preventing cross-tenant database access.
+	if teamID, ok := ctx.Value(ctxkeys.TeamIDKey).(string); ok && teamID != "" {
+		labels[natsK8sOwnerTeamLabel] = teamID
+	}
 	nsObj := &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: ns,
-			Labels: map[string]string{
-				natsK8sRoleLabel:                     natsK8sRoleValue,
-				"pod-security.kubernetes.io/enforce": "baseline",
-				"pod-security.kubernetes.io/warn":    "restricted",
-			},
+			Name:   ns,
+			Labels: labels,
 		},
 	}
 	_, err := b.cs.CoreV1().Namespaces().Create(ctx, nsObj, metav1.CreateOptions{})

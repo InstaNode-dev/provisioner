@@ -22,15 +22,15 @@ import (
 // --- mock backends ---
 
 type mockPostgresBackend struct {
-	provision    func(ctx context.Context, token, tier string) (*postgres.Credentials, error)
+	provision    func(ctx context.Context, token, tier string, connLimit int) (*postgres.Credentials, error)
 	storageBytes func(ctx context.Context, token, providerResourceID string) (int64, error)
 	deprovision  func(ctx context.Context, token, providerResourceID string) error
 	regrade      func(ctx context.Context, token, providerResourceID string, connLimit int) (postgres.RegradeResult, error)
 }
 
-func (m *mockPostgresBackend) Provision(ctx context.Context, token, tier string) (*postgres.Credentials, error) {
+func (m *mockPostgresBackend) Provision(ctx context.Context, token, tier string, connLimit int) (*postgres.Credentials, error) {
 	if m.provision != nil {
-		return m.provision(ctx, token, tier)
+		return m.provision(ctx, token, tier, connLimit)
 	}
 	return &postgres.Credentials{
 		URL:          "postgres://usr_tok:pass@host/db_tok",
@@ -215,7 +215,7 @@ func TestProvisionResource_BackendConnectError_ReturnsUnavailable(t *testing.T) 
 	srv := server.NewWithBackends(
 		&config.Config{},
 		&mockPostgresBackend{
-			provision: func(_ context.Context, _, _ string) (*postgres.Credentials, error) {
+			provision: func(_ context.Context, _, _ string, _ int) (*postgres.Credentials, error) {
 				return nil, errors.New("connection refused: cannot reach postgres")
 			},
 		},
@@ -236,7 +236,7 @@ func TestProvisionResource_AlreadyExists_ReturnsAlreadyExists(t *testing.T) {
 	srv := server.NewWithBackends(
 		&config.Config{},
 		&mockPostgresBackend{
-			provision: func(_ context.Context, _, _ string) (*postgres.Credentials, error) {
+			provision: func(_ context.Context, _, _ string, _ int) (*postgres.Credentials, error) {
 				return nil, errors.New("already exists: database already exists")
 			},
 		},

@@ -64,6 +64,14 @@ const (
 // maxclients <N>). Per-user ACL maxconn would be cleaner but our connection URL uses
 // the default user (no ACL), so pod-level is the natural lever. Since each pod is
 // dedicated to one customer this is functionally a per-customer cap.
+//
+// maxmemoryMB is the Redis --maxmemory flag value in MB. A value of -1 means
+// unlimited (the flag is omitted entirely). This enforces the per-resource memory
+// limit advertised in plans.yaml at the Redis level. allkeys-lru eviction is used
+// so Redis behaves as a cache (evicts old keys) rather than returning write errors
+// when full. Values mirror plans.yaml redis_memory_mb:
+//
+//	anonymous: 5 MB, hobby: 50 MB, pro: 512 MB, team/growth: unlimited (-1)
 type tierSizing struct {
 	cpuReq, memReq string
 	cpuLim, memLim string
@@ -74,6 +82,10 @@ type tierSizing struct {
 	// maxClients is the Redis-level maxclients config applied via --maxclients flag.
 	// Bounds total simultaneous TCP clients connected to this pod.
 	maxClients int
+	// maxmemoryMB is the Redis --maxmemory limit in MB applied at pod start.
+	// -1 means unlimited (flag omitted). Mirrors plans.yaml redis_memory_mb.
+	// allkeys-lru eviction policy is applied alongside this limit.
+	maxmemoryMB int
 }
 
 func sizingForTier(tier string) tierSizing {
@@ -88,7 +100,8 @@ func sizingForTier(tier string) tierSizing {
 			pvcMi:        0,
 			qCPURequests: "100m", qMemRequests: "128Mi",
 			qCPULimits: "400m", qMemLimits: "256Mi",
-			maxClients: 10,
+			maxClients:  10,
+			maxmemoryMB: 5, // plans.yaml: anonymous redis_memory_mb = 5
 		}
 	case "hobby":
 		return tierSizing{
@@ -97,7 +110,8 @@ func sizingForTier(tier string) tierSizing {
 			pvcMi:        1024, // 1Gi
 			qCPURequests: "200m", qMemRequests: "256Mi",
 			qCPULimits: "1", qMemLimits: "1Gi",
-			maxClients: 50,
+			maxClients:  50,
+			maxmemoryMB: 50, // plans.yaml: hobby redis_memory_mb = 50
 		}
 	case "pro":
 		return tierSizing{
@@ -106,7 +120,8 @@ func sizingForTier(tier string) tierSizing {
 			pvcMi:        10240, // 10Gi
 			qCPURequests: "500m", qMemRequests: "1Gi",
 			qCPULimits: "4", qMemLimits: "4Gi",
-			maxClients: 200,
+			maxClients:  200,
+			maxmemoryMB: 512, // plans.yaml: pro redis_memory_mb = 512
 		}
 	case "team", "growth":
 		return tierSizing{
@@ -115,7 +130,8 @@ func sizingForTier(tier string) tierSizing {
 			pvcMi:        51200, // 50Gi
 			qCPURequests: "1", qMemRequests: "2Gi",
 			qCPULimits: "8", qMemLimits: "8Gi",
-			maxClients: 1000,
+			maxClients:  1000,
+			maxmemoryMB: -1, // unlimited — team/growth dedicated pods have no memory cap
 		}
 	default:
 		// Unknown tier → conservative hobby-equivalent sizing.
@@ -532,16 +548,32 @@ func (b *K8sBackend) applyDeployment(ctx context.Context, ns string, sz tierSizi
 					Containers: []corev1.Container{{
 						Name:  "redis",
 						Image: b.image,
-						// Tier-specific maxclients passed at start. redis-server respects
-						// --maxclients which takes effect before any client can connect,
-						// so this enforces the cap without needing a post-start CONFIG SET.
-						Command: []string{
-							"redis-server",
-							"--requirepass", "$(REDIS_PASSWORD)",
-							"--appendonly", "yes",
-							"--dir", "/data",
-							"--maxclients", fmt.Sprintf("%d", sz.maxClients),
-						},
+						// Tier-specific maxclients and maxmemory passed at start.
+						// redis-server respects these flags before any client can connect,
+						// so they enforce the caps without needing a post-start CONFIG SET.
+						// allkeys-lru eviction means Redis behaves as a cache (evicts old
+						// keys) rather than returning write errors when full — appropriate
+						// because this platform positions Redis as a cache service.
+						Command: func() []string {
+							cmd := []string{
+								"redis-server",
+								"--requirepass", "$(REDIS_PASSWORD)",
+								"--appendonly", "yes",
+								"--dir", "/data",
+								"--maxclients", fmt.Sprintf("%d", sz.maxClients),
+							}
+							// Only add --maxmemory when the tier has a defined cap.
+							// -1 means unlimited (team/growth) — omit the flag so Redis
+							// uses its default (no cap). This matches plans.yaml semantics
+							// where -1 = unlimited.
+							if sz.maxmemoryMB > 0 {
+								cmd = append(cmd,
+									"--maxmemory", fmt.Sprintf("%dmb", sz.maxmemoryMB),
+									"--maxmemory-policy", "allkeys-lru",
+								)
+							}
+							return cmd
+						}(),
 						Env: []corev1.EnvVar{{
 							Name: "REDIS_PASSWORD",
 							ValueFrom: &corev1.EnvVarSource{

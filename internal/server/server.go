@@ -198,10 +198,16 @@ func isDedicatedTier(tier string) bool {
 }
 
 func (s *Server) provisionPostgres(ctx context.Context, req *provisionerv1.ProvisionRequest) (*provisionerv1.ProvisionResponse, error) {
+	// Resolve the connection limit for this tier from the shared plans registry.
+	// -1 = unlimited (team/growth); > 0 = enforced cap at the Postgres role level.
+	// The provisioner owns the plans registry so the cap stays consistent with
+	// what RegradeResource applies on plan upgrades.
+	connLimit := regradeConnLimits.ConnectionsLimit(req.Tier, "postgres")
+
 	// Pro and team tiers with a configured dedicated backend skip the shared pool entirely.
 	if isDedicatedTier(req.Tier) && s.dedicatedPostgresBackend != nil {
 		slog.Info("server.provisionPostgres: using dedicated backend", "token", req.Token, "tier", req.Tier)
-		creds, err := s.dedicatedPostgresBackend.Provision(ctx, req.Token, req.Tier)
+		creds, err := s.dedicatedPostgresBackend.Provision(ctx, req.Token, req.Tier, connLimit)
 		if err != nil {
 			return nil, mapError("ProvisionResource.postgres.dedicated", err)
 		}
@@ -230,8 +236,8 @@ func (s *Server) provisionPostgres(ctx context.Context, req *provisionerv1.Provi
 	}
 
 	// Pool miss — live provision.
-	slog.Info("server.provisionPostgres: pool miss, provisioning live", "token", req.Token)
-	creds, err := s.postgresBackend.Provision(ctx, req.Token, req.Tier)
+	slog.Info("server.provisionPostgres: pool miss, provisioning live", "token", req.Token, "conn_limit", connLimit)
+	creds, err := s.postgresBackend.Provision(ctx, req.Token, req.Tier, connLimit)
 	if err != nil {
 		return nil, mapError("ProvisionResource.postgres", err)
 	}
@@ -596,24 +602,11 @@ func (s *Server) RegradeResource(ctx context.Context, req *provisionerv1.Regrade
 		backend = s.dedicatedPostgresBackend
 	}
 
-	// Only the k8s backend applies a per-role CONNECTION LIMIT at provision
-	// time. Every other backend would return the same skip via Regrade, but
-	// checking here keeps the contract explicit and avoids a needless k8s/DB
-	// round-trip.
-	if _, ok := backend.(*postgres.K8sBackend); !ok {
-		slog.Info("server.RegradeResource",
-			"token", req.Token, "tier", req.Tier,
-			"applied", false, "skip_reason", "backend has no per-role connection cap",
-			"request_id", req.RequestId)
-		return &provisionerv1.RegradeResponse{
-			Applied:    false,
-			SkipReason: "backend has no per-role connection cap",
-		}, nil
-	}
-
 	// Connection cap comes from the shared plans registry, keeping it
-	// consistent with the cap the agent API reports and the k8s backend
-	// applies at provision time. -1 = unlimited; passed through verbatim.
+	// consistent with the cap applied at provision time. -1 = unlimited; passed
+	// through verbatim. Both the local (shared cluster) and k8s (dedicated pod)
+	// backends implement Regrade — the local backend issues ALTER ROLE, the k8s
+	// backend does the same against the pod-local Postgres.
 	connLimit := regradeConnLimits.ConnectionsLimit(req.Tier, "postgres")
 
 	result, err := backend.Regrade(ctx, req.Token, req.ProviderResourceId, connLimit)

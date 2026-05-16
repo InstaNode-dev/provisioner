@@ -34,7 +34,11 @@ func k8sEnvInt(key string, fallback int) int {
 
 // Backend is the interface every Postgres provisioning backend must implement.
 type Backend interface {
-	Provision(ctx context.Context, token, tier string) (*Credentials, error)
+	// Provision creates the database and role for the given token.
+	// connLimit is the CONNECTION LIMIT to apply to the role (-1 = unlimited,
+	// 0 = unlimited). The caller (provisioner server) computes this from the
+	// shared plans.Registry so the provisioner stays a dumb executor.
+	Provision(ctx context.Context, token, tier string, connLimit int) (*Credentials, error)
 	StorageBytes(ctx context.Context, token, providerResourceID string) (int64, error)
 	Deprovision(ctx context.Context, token, providerResourceID string) error
 	// Regrade re-applies the tier's per-role CONNECTION LIMIT to an already

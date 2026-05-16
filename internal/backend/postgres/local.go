@@ -73,7 +73,10 @@ func generatePassword(n int) (string, error) {
 }
 
 // Provision creates a Postgres database and user for the given token.
-func (b *LocalBackend) Provision(ctx context.Context, token, tier string) (*Credentials, error) {
+// connLimit is the CONNECTION LIMIT to apply to the role; -1 means unlimited
+// (omits the clause). This value comes from the API handler via plans.Registry
+// so the provisioner stays a dumb executor and the API remains the policy owner.
+func (b *LocalBackend) Provision(ctx context.Context, token, tier string, connLimit int) (*Credentials, error) {
 	dbName := "db_" + token
 	username := "usr_" + token
 
@@ -104,8 +107,14 @@ func (b *LocalBackend) Provision(ctx context.Context, token, tier string) (*Cred
 		return nil, fmt.Errorf("db.local.Provision: CREATE DATABASE: %w", err)
 	}
 
-	// CREATE USER with password.
-	if _, err := conn.Exec(ctx, fmt.Sprintf("CREATE USER %q WITH PASSWORD '%s'", username, pass)); err != nil {
+	// CREATE USER with password and optional CONNECTION LIMIT.
+	// connLimit <= 0 means unlimited — omit the clause so Postgres uses its
+	// default of -1 (unlimited). We only apply the cap when connLimit > 0.
+	connLimitClause := ""
+	if connLimit > 0 {
+		connLimitClause = fmt.Sprintf(" CONNECTION LIMIT %d", connLimit)
+	}
+	if _, err := conn.Exec(ctx, fmt.Sprintf("CREATE USER %q WITH PASSWORD '%s'%s", username, pass, connLimitClause)); err != nil {
 		return nil, fmt.Errorf("db.local.Provision: CREATE USER: %w", err)
 	}
 
@@ -217,11 +226,40 @@ func (b *LocalBackend) Deprovision(ctx context.Context, token, providerResourceI
 	return nil
 }
 
-// Regrade is a no-op for the shared local backend: Provision sets no per-role
-// CONNECTION LIMIT on the shared cluster, so there is no cap to re-apply on a
-// plan upgrade. Returns a skip result without error.
+// Regrade re-applies the tier's per-role CONNECTION LIMIT to an already-provisioned
+// user on the shared local Postgres cluster. This is called by the entitlement
+// reconciler on plan upgrades/downgrades to ensure the role cap matches the new tier.
+//
+// connLimit <= 0 means unlimited (pass -1 from plans.Registry). Postgres uses -1
+// internally for "no limit"; ALTER ROLE with CONNECTION LIMIT -1 removes any cap.
 func (b *LocalBackend) Regrade(ctx context.Context, token, providerResourceID string, connLimit int) (RegradeResult, error) {
-	return RegradeResult{Applied: false, SkipReason: "backend has no per-role connection cap"}, nil
+	username := "usr_" + token
+
+	adminURL := b.router.AdminURLForResource(providerResourceID)
+	conn, err := pgx.Connect(ctx, adminURL)
+	if err != nil {
+		return RegradeResult{Applied: false}, fmt.Errorf("db.local.Regrade: connect: %w", err)
+	}
+	defer func() {
+		if discErr := conn.Close(ctx); discErr != nil {
+			slog.Error("db.local.Regrade: disconnect", "error", discErr)
+		}
+	}()
+
+	// connLimit of -1 means unlimited; apply as-is so Postgres removes any cap.
+	// connLimit of 0 is treated as unlimited (plans.Registry returns 0 for
+	// tiers with no connection limit field set — safer than blocking all connections).
+	applyLimit := connLimit
+	if applyLimit == 0 {
+		applyLimit = -1
+	}
+
+	if _, err := conn.Exec(ctx, fmt.Sprintf("ALTER ROLE %q CONNECTION LIMIT %d", username, applyLimit)); err != nil {
+		return RegradeResult{Applied: false}, fmt.Errorf("db.local.Regrade: ALTER ROLE: %w", err)
+	}
+
+	slog.Info("db.local.Regrade: applied", "token", token, "conn_limit", applyLimit)
+	return RegradeResult{Applied: true, AppliedConnLimit: applyLimit}, nil
 }
 
 // buildDBURL constructs the user-facing connection URL for the provisioned database.

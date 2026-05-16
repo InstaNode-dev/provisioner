@@ -199,7 +199,11 @@ func (b *K8sBackend) EnableRouteRegistry(rdb *goredis.Client, prefix string) {
 // Provision creates a dedicated Postgres instance for the given token.
 // Returns connection URL using externalHost:nodePort for both in-cluster and external clients.
 // ProviderResourceID is set to the namespace name for use by Deprovision.
-func (b *K8sBackend) Provision(ctx context.Context, token, tier string) (*Credentials, error) {
+// connLimit is accepted but not used here — the k8s backend applies CONNECTION LIMIT
+// via ALTER ROLE in the Regrade() path so existing resources can be updated on plan
+// changes without re-provisioning. New provisions also have Regrade called immediately
+// by the entitlement reconciler on the next tick.
+func (b *K8sBackend) Provision(ctx context.Context, token, tier string, connLimit int) (*Credentials, error) {
 	ns := k8sNsPrefix + token
 	dbName := "db_" + k8sShort(token)
 	adminUser := "pgadmin"

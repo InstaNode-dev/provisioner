@@ -38,8 +38,11 @@ func newNeonBackend(apiKey, regionID string) *NeonBackend {
 }
 
 // Provision creates a new Neon project for the given token.
+// connLimit is accepted but not applied — Neon projects are fully isolated and
+// do not share a Postgres role with other tenants, so there is no shared role
+// to cap. Neon enforces compute quotas at the project level via the Neon API.
 // POST https://console.neon.tech/api/v2/projects
-func (b *NeonBackend) Provision(ctx context.Context, token, tier string) (*Credentials, error) {
+func (b *NeonBackend) Provision(ctx context.Context, token, tier string, connLimit int) (*Credentials, error) {
 	body := map[string]any{
 		"project": map[string]any{
 			"name":       "instant-" + token,

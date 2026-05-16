@@ -18,6 +18,44 @@ import (
 
 const defaultRedisAddr = "localhost:6379"
 
+// aclAllowlist is the safe command allowlist applied to every provisioned ACL
+// user on the shared Redis backend. It replaces "+@all" which would grant
+// dangerous cross-tenant commands such as FLUSHDB, MONITOR, and CONFIG SET.
+//
+// Design rationale (§3 of DESIGN-P1-A-tier-enforcement.md):
+//   - "+@all" on a shared pod allows FLUSHDB (wipes ALL tenants' data),
+//     MONITOR (leaks all tenant commands in real time), and CONFIG SET
+//     (removes pod-wide memory cap) — multi-tenant isolation failures.
+//   - The key-pattern restriction (~{token}:*) does NOT cover admin/dangerous
+//     commands; those operate at the server level, not the key level.
+//   - "+@scripting" is included so Lua scripts work; Lua calling FLUSHDB is
+//     mitigated by the explicit "-flushdb"/"-flushall" deny entries that Redis
+//     evaluates before command execution.
+//   - "-keys" removes the O(N) cross-tenant key scan; tenants should use SCAN.
+var aclAllowlist = []interface{}{
+	"+@read",        // GET, MGET, STRLEN, LRANGE, SMEMBERS, HGET, etc.
+	"+@write",       // SET, MSET, DEL, LPUSH, SADD, HSET, etc.
+	"+@string",      // Explicit string family (belt-and-suspenders with @read/@write)
+	"+@hash",        // HSET, HGET, HMSET, etc.
+	"+@list",        // LPUSH, LRANGE, etc.
+	"+@set",         // SADD, SMEMBERS, etc.
+	"+@sortedset",   // ZADD, ZRANGE, etc.
+	"+@stream",      // XADD, XREAD — needed for stream workloads
+	"+@hyperloglog", // PFADD, PFCOUNT
+	"+@geo",         // GEOADD, GEODIST
+	"+@pubsub",      // SUBSCRIBE, PUBLISH — needed for pub/sub workloads
+	"+@scripting",   // EVAL, EVALSHA — Lua scripting; explicit denies below guard FLUSHDB via Lua
+	"-@admin",       // FLUSHALL, DEBUG, SAVE, BGSAVE, CONFIG, etc.
+	"-@dangerous",   // MONITOR, KEYS, OBJECT, SORT with STORE, MIGRATE
+	"-config",       // CONFIG GET/SET/RESETSTAT — explicit deny even if @admin missed
+	"-debug",        // DEBUG SLEEP, DEBUG JMAP
+	"-monitor",      // MONITOR — explicit deny (cross-tenant command stream)
+	"-flushdb",      // FLUSHDB — explicit deny (wipes ALL tenant data on shared pod)
+	"-flushall",     // FLUSHALL — explicit deny
+	"-acl",          // ACL SETUSER/DELUSER — prevents ACL self-escalation
+	"-keys",         // KEYS — O(N) cross-tenant key scan; tenants must use SCAN
+}
+
 // LocalBackend provisions Redis namespaces on a shared Redis instance.
 type LocalBackend struct {
 	rdb       *goredis.Client // admin connection
@@ -56,13 +94,13 @@ func (b *LocalBackend) Provision(ctx context.Context, token, tier string) (*Cred
 	password := hex.EncodeToString(pwBytes)
 
 	// Try ACL SETUSER (Redis 6+).
-	// Pattern: <token>:* allows access to all keys in this token's namespace.
-	aclCmd := b.rdb.Do(ctx, "ACL", "SETUSER", username,
-		"on",
-		">"+password,
-		"~"+keyPrefix+"*",
-		"+@all",
-	)
+	// Pattern: <token>:* restricts key access to this token's namespace.
+	// aclAllowlist replaces "+@all": on a shared pod, "+@all" grants
+	// FLUSHDB/MONITOR/CONFIG which are multi-tenant isolation failures.
+	// See aclAllowlist declaration for full rationale.
+	aclArgs := []interface{}{"ACL", "SETUSER", username, "on", ">" + password, "~" + keyPrefix + "*"}
+	aclArgs = append(aclArgs, aclAllowlist...)
+	aclCmd := b.rdb.Do(ctx, aclArgs...)
 	// userHost is what we embed in the URL returned to clients.
 	// Falls back to the cluster-internal redisHost when no public host is configured.
 	userHost := publicHostPort()

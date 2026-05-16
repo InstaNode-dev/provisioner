@@ -47,9 +47,11 @@ func NewDedicatedProvider(adminDSN, neonAPIKey string) *DedicatedProvider {
 }
 
 // Provision creates a dedicated database instance.
+// connLimit is accepted but not applied — dedicated providers create isolated
+// instances (Neon project or separate admin DSN) where the role is not shared.
 // If neonAPIKey is set: calls Neon API POST /projects.
 // Otherwise: creates a new database + role on adminDSN (local dedicated simulation).
-func (p *DedicatedProvider) Provision(ctx context.Context, token, tier string) (*Credentials, error) {
+func (p *DedicatedProvider) Provision(ctx context.Context, token, tier string, connLimit int) (*Credentials, error) {
 	if p.neonAPIKey != "" {
 		return p.provisionNeon(ctx, token, tier)
 	}

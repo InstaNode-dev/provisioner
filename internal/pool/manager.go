@@ -252,7 +252,11 @@ func (m *Manager) provisionOneItem(ctx context.Context, resourceType string) err
 
 	switch resourceType {
 	case "postgres":
-		creds, err := m.postgresB.Provision(ctx, poolToken, "anonymous")
+		// Pool items are always provisioned at anonymous tier (24h TTL, smallest
+		// footprint). connLimit for anonymous is 2 (from plans.yaml); pass -1 to
+		// let the backend use the tier default — the pool item will be re-graded
+		// by the entitlement reconciler when it is assigned to a real team.
+		creds, err := m.postgresB.Provision(ctx, poolToken, "anonymous", -1)
 		if err != nil {
 			return fmt.Errorf("provision postgres: %w", err)
 		}

@@ -650,27 +650,55 @@ func (s *Server) regradePostgres(ctx context.Context, req *provisionerv1.Regrade
 
 // regradeRedis re-applies maxmemory on a dedicated k8s Redis pod.
 //
-// Safety: only k8s-backed dedicated pods (provider_resource_id prefix
-// "instant-customer-") are touched. Shared-backend resources (provider_resource_id
-// empty or not starting with "instant-customer-") are skipped with a descriptive
-// reason — the shared redis-provision pod has a single pod-wide maxmemory that
-// must never be narrowed per-tenant.
+// Identifier resolution (fix/a4-redis-rekey-on-token):
+//   - If ProviderResourceId already has the "instant-customer-" prefix → use it as the
+//     k8s namespace name directly (legacy rows that did have prid set, or callers that
+//     pass the full namespace).
+//   - If ProviderResourceId does NOT have the prefix but is non-empty → treat it as a
+//     bare token and construct "instant-customer-<ProviderResourceId>". This is the new
+//     path: the worker now passes the token as the identifier because prod rows have
+//     provider_resource_id = NULL.
+//   - If ProviderResourceId is empty → also construct from req.Token. This mirrors the
+//     K8sBackend.Regrade fallback (ns = redisK8sNsPrefix + token when providerResourceID=="").
 //
-// Team/growth tiers (memory limit = -1 in plans.yaml) set maxmemory=0 (Redis
-// "unlimited") so existing pods are never accidentally capped.
+// Safety: only k8s-backed dedicated pods are touched. Shared-backend environments (where
+// redisBackend does not implement redis.Regrader) return {applied:false} gracefully so
+// the shared redis-provision pod is never accidentally capped.
+//
+// Team/growth tiers (memory limit = -1 in plans.yaml) set maxmemory=0 (Redis "unlimited")
+// so existing pods are never accidentally capped.
 func (s *Server) regradeRedis(ctx context.Context, req *provisionerv1.RegradeRequest) (*provisionerv1.RegradeResponse, error) {
-	// Only k8s-backed dedicated pods have a per-tenant maxmemory lever.
-	// k8s namespaces always have the "instant-customer-" prefix.
-	if !strings.HasPrefix(req.ProviderResourceId, redisK8sProviderIDPrefix) {
-		slog.Info("server.RegradeResource.redis: skip shared/non-k8s backend",
-			"token", req.Token, "tier", req.Tier,
-			"provider_resource_id", req.ProviderResourceId,
-			"request_id", req.RequestId)
-		return &provisionerv1.RegradeResponse{
-			Applied:    false,
-			SkipReason: "shared backend — no per-tenant maxmemory lever",
-		}, nil
+	// Resolve the effective provider ID (k8s namespace).
+	//   Case 1: prid is already "instant-customer-<something>" → use as-is.
+	//   Case 2: prid is a bare token (no prefix, non-empty) → construct namespace.
+	//   Case 3: prid is empty → fall back to req.Token to construct namespace.
+	// After this block, effectivePRID is either a full "instant-customer-*" namespace
+	// or empty (which K8sBackend.Regrade handles by constructing from token).
+	effectivePRID := req.ProviderResourceId
+	if !strings.HasPrefix(effectivePRID, redisK8sProviderIDPrefix) {
+		// Either empty or a bare token. Construct the namespace.
+		bareToken := effectivePRID
+		if bareToken == "" {
+			bareToken = req.Token
+		}
+		if bareToken != "" {
+			effectivePRID = redisK8sProviderIDPrefix + bareToken
+		}
+		// If both prid and token are empty the guard below (token required) already
+		// rejected the request, so effectivePRID="" is reachable only in tests.
 	}
+
+	// A non-k8s identifier after resolution means we have no namespace to target —
+	// the caller did not provide enough information to locate a dedicated pod.
+	// This can happen for truly shared-backend resources (no k8s pod exists).
+	// We pass effectivePRID (which now has the prefix) down to the backend; if the
+	// namespace does not exist the backend returns a soft skip.
+	//
+	// The original guard ("skip if no instant-customer- prefix") is preserved in
+	// spirit: after the block above, effectivePRID ALWAYS has the prefix when there
+	// is any token to work with. An empty effectivePRID here means both prid and
+	// token were empty — that cannot happen because RegradeResource already validated
+	// req.Token != "" before dispatching here.
 
 	// Resolve the backend that owns this resource. For k8s-style IDs the
 	// regular redisBackend holds the route-registry connection; use it here
@@ -679,12 +707,20 @@ func (s *Server) regradeRedis(ctx context.Context, req *provisionerv1.RegradeReq
 	if !ok {
 		// redisBackend is not a k8s backend (e.g. local/dedicated in a test env).
 		slog.Warn("server.RegradeResource.redis: active redis backend does not support Regrade — skipping",
-			"token", req.Token, "tier", req.Tier, "request_id", req.RequestId)
+			"token", req.Token, "tier", req.Tier,
+			"effective_prid", effectivePRID,
+			"request_id", req.RequestId)
 		return &provisionerv1.RegradeResponse{
 			Applied:    false,
 			SkipReason: "backend does not support redis regrade",
 		}, nil
 	}
+
+	slog.Info("server.RegradeResource.redis: resolved namespace",
+		"token", req.Token, "tier", req.Tier,
+		"original_prid", req.ProviderResourceId,
+		"effective_prid", effectivePRID,
+		"request_id", req.RequestId)
 
 	// Memory cap comes from the shared plans registry.
 	// StorageLimitMB("redis") returns plans.yaml redis_memory_mb:
@@ -697,7 +733,7 @@ func (s *Server) regradeRedis(ctx context.Context, req *provisionerv1.RegradeReq
 		targetMaxmemoryMB = 0
 	}
 
-	result, err := regrader.Regrade(ctx, req.Token, req.ProviderResourceId, targetMaxmemoryMB)
+	result, err := regrader.Regrade(ctx, req.Token, effectivePRID, targetMaxmemoryMB)
 	if err != nil {
 		return nil, mapError("RegradeResource.redis", err)
 	}
@@ -707,6 +743,7 @@ func (s *Server) regradeRedis(ctx context.Context, req *provisionerv1.RegradeReq
 		"applied", result.Applied,
 		"applied_maxmemory_bytes", result.AppliedMaxmemory,
 		"target_maxmemory_mb", targetMaxmemoryMB,
+		"effective_prid", effectivePRID,
 		"skip_reason", result.SkipReason,
 		"request_id", req.RequestId)
 

@@ -395,25 +395,77 @@ func TestRegradeResource_UnsupportedType_SkipsWithReason(t *testing.T) {
 	}
 }
 
-// TestRegradeResource_Redis_SharedBackend_Skipped verifies that a Redis resource
-// without the "instant-customer-" provider_resource_id prefix (i.e. shared/local
-// backend) is skipped with the correct reason — we must never cap the shared pod.
-func TestRegradeResource_Redis_SharedBackend_Skipped(t *testing.T) {
-	srv := newTestServer()
+// TestRegradeResource_Redis_EmptyPRID_NonRegraderBackend_Skipped verifies that a Redis
+// resource with empty provider_resource_id (prid) on a non-k8s backend is skipped
+// gracefully. After the fix the server resolves the namespace from the token, but the
+// backend must not implement Regrader for this test to exercise the skip path.
+//
+// Note: the old skip reason "shared backend — no per-tenant maxmemory lever" no longer
+// applies because the server now always tries to resolve a k8s namespace from the token.
+// The skip now comes from "backend does not support redis regrade" when the active
+// backend does not implement redis.Regrader.
+func TestRegradeResource_Redis_EmptyPRID_NonRegraderBackend_Skipped(t *testing.T) {
+	srv := newTestServer() // mockRedisBackend does NOT implement Regrader
 	resp, err := srv.RegradeResource(context.Background(), &provisionerv1.RegradeRequest{
 		Token:              "tok-shared",
 		ResourceType:       commonv1.ResourceType_RESOURCE_TYPE_REDIS,
 		Tier:               "hobby",
-		ProviderResourceId: "", // empty = shared backend (no k8s namespace)
+		ProviderResourceId: "", // empty prid — server will derive from token
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if resp.Applied {
-		t.Fatal("expected applied=false for shared backend Redis resource")
+		t.Fatal("expected applied=false when backend does not implement Regrader")
 	}
-	if resp.SkipReason != "shared backend — no per-tenant maxmemory lever" {
+	if resp.SkipReason != "backend does not support redis regrade" {
 		t.Fatalf("unexpected skip_reason: %q", resp.SkipReason)
+	}
+}
+
+// TestRegradeResource_Redis_BareToken_ConstructsNamespace verifies that when
+// ProviderResourceId is a bare token (no "instant-customer-" prefix) the server
+// constructs the k8s namespace correctly and calls Regrade with the full namespace.
+// This is the fix/a4-redis-rekey-on-token path: the worker now passes the bare
+// token as the prid because prod rows have provider_resource_id = NULL.
+func TestRegradeResource_Redis_BareToken_ConstructsNamespace(t *testing.T) {
+	const tok = "d986dbc6-59bd-4459-9db9-2d66751f78f5"
+
+	var capturedPRID string
+	regraderBackend := &mockRegraderRedisBackend{
+		regrade: func(_ context.Context, _, id string, _ int) (redis.RegradeResult, error) {
+			capturedPRID = id
+			return redis.RegradeResult{Applied: true, AppliedMaxmemory: 512 * 1024 * 1024}, nil
+		},
+	}
+	srv := server.NewWithBackends(
+		&config.Config{},
+		&mockPostgresBackend{},
+		regraderBackend,
+		&mockMongoBackend{},
+		&mockQueueBackend{},
+		nil, nil, nil, nil, nil,
+		nil,
+	)
+
+	// Pass the bare token as ProviderResourceId (no "instant-customer-" prefix).
+	resp, err := srv.RegradeResource(context.Background(), &provisionerv1.RegradeRequest{
+		Token:              tok,
+		ResourceType:       commonv1.ResourceType_RESOURCE_TYPE_REDIS,
+		Tier:               "pro",
+		ProviderResourceId: tok, // bare token — server must prepend "instant-customer-"
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !resp.Applied {
+		t.Fatalf("expected Applied=true, got Applied=false (skip_reason=%q)", resp.SkipReason)
+	}
+
+	wantPRID := "instant-customer-" + tok
+	if capturedPRID != wantPRID {
+		t.Errorf("Regrade called with prid=%q, want %q (namespace must be constructed from bare token)",
+			capturedPRID, wantPRID)
 	}
 }
 

@@ -71,7 +71,7 @@ const (
 // so Redis behaves as a cache (evicts old keys) rather than returning write errors
 // when full. Values mirror plans.yaml redis_memory_mb:
 //
-//	anonymous: 5 MB, hobby: 50 MB, pro: 512 MB, team/growth: unlimited (-1)
+//	anonymous: 5 MB, hobby: 50 MB, pro: 512 MB, growth: 1024 MB, team: unlimited (-1)
 type tierSizing struct {
 	cpuReq, memReq string
 	cpuLim, memLim string
@@ -123,7 +123,7 @@ func sizingForTier(tier string) tierSizing {
 			maxClients:  200,
 			maxmemoryMB: 512, // plans.yaml: pro redis_memory_mb = 512
 		}
-	case "team", "growth":
+	case "growth":
 		return tierSizing{
 			cpuReq: "500m", memReq: "1Gi",
 			cpuLim: "4", memLim: "4Gi",
@@ -131,7 +131,17 @@ func sizingForTier(tier string) tierSizing {
 			qCPURequests: "1", qMemRequests: "2Gi",
 			qCPULimits: "8", qMemLimits: "8Gi",
 			maxClients:  1000,
-			maxmemoryMB: -1, // unlimited — team/growth dedicated pods have no memory cap
+			maxmemoryMB: 1024, // plans.yaml: growth redis_memory_mb = 1024
+		}
+	case "team":
+		return tierSizing{
+			cpuReq: "500m", memReq: "1Gi",
+			cpuLim: "4", memLim: "4Gi",
+			pvcMi:        51200, // 50Gi
+			qCPURequests: "1", qMemRequests: "2Gi",
+			qCPULimits: "8", qMemLimits: "8Gi",
+			maxClients:  1000,
+			maxmemoryMB: -1, // unlimited — team dedicated pods have no memory cap
 		}
 	default:
 		// Unknown tier → conservative hobby-equivalent sizing.
@@ -410,6 +420,133 @@ func (b *K8sBackend) Deprovision(ctx context.Context, token, providerResourceID 
 	}
 	slog.Info("k8s.redis.deprovisioned", "namespace", ns)
 	return nil
+}
+
+// RegradeResult is returned by Regrade to indicate what happened.
+type RegradeResult struct {
+	Applied          bool
+	AppliedMaxmemory int64  // actual maxmemory set in bytes (0 = unlimited); 0 when Applied=false
+	SkipReason       string // populated when Applied=false
+}
+
+// Regrade connects to the dedicated Redis pod for this resource and ensures
+// its maxmemory matches the tier cap encoded in targetMaxmemoryMB:
+//
+//   - targetMaxmemoryMB > 0  → set maxmemory to that many MB + allkeys-lru policy,
+//     then CONFIG REWRITE so the cap survives a pod restart.
+//   - targetMaxmemoryMB <= 0 → unlimited tier (team/growth): set maxmemory to 0
+//     (Redis "no cap") + CONFIG REWRITE so it explicitly overrides any leftover cap.
+//
+// Idempotent: reads CONFIG GET maxmemory first and short-circuits if the value
+// already matches, returning Applied=false + SkipReason="already correct".
+//
+// Only k8s-backed (dedicated) pods are supported. The caller must NOT pass
+// shared-backend resources here — they are identified by their provider_resource_id
+// prefix "instant-customer-". Shared pods (local backend) have no per-tenant cap
+// lever and are skipped by the server before this method is ever reached.
+func (b *K8sBackend) Regrade(ctx context.Context, token, providerResourceID string, targetMaxmemoryMB int) (RegradeResult, error) {
+	ns := providerResourceID
+	if ns == "" {
+		ns = redisK8sNsPrefix + token
+	}
+
+	// Read the password from the pod's auth Secret.
+	secret, err := b.cs.CoreV1().Secrets(ns).Get(ctx, "redis-auth", metav1.GetOptions{})
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			// Legacy resource without the redis-auth Secret (pre-standardisation).
+			// Can't connect → treat as a soft skip so the reconciler logs + moves on.
+			slog.Warn("k8s.redis.Regrade: redis-auth secret not found — skipping legacy resource",
+				"namespace", ns, "token", token)
+			return RegradeResult{Applied: false, SkipReason: "redis-auth secret not found (legacy resource)"}, nil
+		}
+		return RegradeResult{Applied: false}, fmt.Errorf("k8s redis.Regrade: get secret: %w", err)
+	}
+
+	svc, err := b.cs.CoreV1().Services(ns).Get(ctx, "redis", metav1.GetOptions{})
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			slog.Warn("k8s.redis.Regrade: redis service not found — skipping legacy resource",
+				"namespace", ns, "token", token)
+			return RegradeResult{Applied: false, SkipReason: "redis service not found (legacy resource)"}, nil
+		}
+		return RegradeResult{Applied: false}, fmt.Errorf("k8s redis.Regrade: get service: %w", err)
+	}
+
+	password := string(secret.Data["REDIS_PASSWORD"])
+	rdb := goredis.NewClient(&goredis.Options{
+		Addr:     fmt.Sprintf("%s:6379", svc.Spec.ClusterIP),
+		Password: password,
+	})
+	defer rdb.Close()
+
+	// Compute the target in bytes (what Redis uses internally).
+	// targetMaxmemoryMB <= 0 means unlimited → targetBytes = 0.
+	var targetBytes int64
+	if targetMaxmemoryMB > 0 {
+		targetBytes = int64(targetMaxmemoryMB) * 1024 * 1024
+	}
+
+	// Read current maxmemory to detect whether a CONFIG SET is needed.
+	vals, err := rdb.ConfigGet(ctx, "maxmemory").Result()
+	if err != nil {
+		return RegradeResult{Applied: false}, fmt.Errorf("k8s redis.Regrade: CONFIG GET maxmemory: %w", err)
+	}
+	var currentBytes int64
+	if v, ok := vals["maxmemory"]; ok {
+		fmt.Sscanf(v, "%d", &currentBytes)
+	}
+
+	if currentBytes == targetBytes {
+		slog.Debug("k8s.redis.Regrade: maxmemory already correct — no-op",
+			"namespace", ns, "token", token,
+			"maxmemory_bytes", currentBytes,
+			"target_bytes", targetBytes,
+		)
+		return RegradeResult{Applied: false, SkipReason: "already correct"}, nil
+	}
+
+	// Apply the new maxmemory. Use the Redis byte value directly for precision.
+	// Redis accepts "0" as "unlimited" (no cap). CONFIG SET maxmemory accepts
+	// an integer string (byte count). We avoid the "<N>mb" suffix so there is
+	// no rounding ambiguity.
+	maxmemStr := fmt.Sprintf("%d", targetBytes)
+	if err := rdb.ConfigSet(ctx, "maxmemory", maxmemStr).Err(); err != nil {
+		return RegradeResult{Applied: false}, fmt.Errorf("k8s redis.Regrade: CONFIG SET maxmemory: %w", err)
+	}
+
+	// Apply allkeys-lru policy for capped tiers so Redis evicts old keys
+	// gracefully instead of returning write errors when full. For unlimited
+	// tiers (targetBytes == 0) set the policy to noeviction (the Redis
+	// default) to avoid accidental eviction of important data.
+	policy := "noeviction"
+	if targetBytes > 0 {
+		policy = "allkeys-lru"
+	}
+	if err := rdb.ConfigSet(ctx, "maxmemory-policy", policy).Err(); err != nil {
+		// Non-fatal — the cap is applied; policy mismatch only affects eviction
+		// behaviour. Log and continue; the next reconciler tick will retry.
+		slog.Warn("k8s.redis.Regrade: CONFIG SET maxmemory-policy failed (non-fatal)",
+			"namespace", ns, "token", token, "policy", policy, "error", err)
+	}
+
+	// CONFIG REWRITE persists the change to the redis.conf file so the cap
+	// survives a pod restart. Fail-soft: if there is no config file (pod
+	// started without --save or no config mount), REWRITE errors but the
+	// in-memory cap is still enforced until the next restart.
+	if err := rdb.ConfigRewrite(ctx).Err(); err != nil {
+		slog.Warn("k8s.redis.Regrade: CONFIG REWRITE failed (non-fatal, in-memory cap is active)",
+			"namespace", ns, "token", token, "error", err)
+	}
+
+	slog.Info("k8s.redis.Regrade: applied",
+		"namespace", ns, "token", token,
+		"old_maxmemory_bytes", currentBytes,
+		"new_maxmemory_bytes", targetBytes,
+		"target_maxmemory_mb", targetMaxmemoryMB,
+		"policy", policy,
+	)
+	return RegradeResult{Applied: true, AppliedMaxmemory: targetBytes}, nil
 }
 
 // --- private resource creators ---

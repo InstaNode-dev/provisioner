@@ -38,6 +38,23 @@ type Backend interface {
 	Deprovision(ctx context.Context, token, providerResourceID string) error
 }
 
+// Regrader is implemented by backends that support post-provision maxmemory
+// adjustment. Only the k8s backend supports this — shared/local and
+// dedicated-upstash backends have no per-tenant maxmemory lever at the Redis
+// level and do not implement this interface.
+//
+// The server uses a type assertion (b.redisBackend.(redis.Regrader)) to check
+// whether the active backend supports regrade; when the assertion fails it
+// returns {applied:false, skip_reason:"backend does not support redis regrade"}
+// without error, and the reconciler leaves the row for the next sweep.
+type Regrader interface {
+	// Regrade connects to the dedicated Redis pod and adjusts maxmemory to
+	// match targetMaxmemoryMB. targetMaxmemoryMB <= 0 means unlimited (maxmemory 0).
+	// Returns RegradeResult.Applied=false + SkipReason when the pod is already
+	// correctly configured (idempotent no-op) or unreachable (soft skip).
+	Regrade(ctx context.Context, token, providerResourceID string, targetMaxmemoryMB int) (RegradeResult, error)
+}
+
 // Credentials holds the Redis connection details returned after provisioning.
 type Credentials struct {
 	// URL is the redis:// connection string the caller can use immediately.

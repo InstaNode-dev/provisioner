@@ -376,20 +376,188 @@ func TestRegradeResource_EmptyToken_ReturnsInvalidArgument(t *testing.T) {
 	assertCode(t, err, codes.InvalidArgument)
 }
 
-func TestRegradeResource_NonPostgres_SkipsWithReason(t *testing.T) {
+func TestRegradeResource_UnsupportedType_SkipsWithReason(t *testing.T) {
+	// Queue is not a supported regrade type.
 	srv := newTestServer()
 	resp, err := srv.RegradeResource(context.Background(), &provisionerv1.RegradeRequest{
 		Token:        "tok-123",
-		ResourceType: commonv1.ResourceType_RESOURCE_TYPE_REDIS,
+		ResourceType: commonv1.ResourceType_RESOURCE_TYPE_QUEUE,
 		Tier:         "pro",
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if resp.Applied {
-		t.Fatal("expected applied=false for non-postgres resource")
+		t.Fatal("expected applied=false for unsupported resource type")
 	}
 	if resp.SkipReason != "unsupported resource type for regrade" {
+		t.Fatalf("unexpected skip_reason: %q", resp.SkipReason)
+	}
+}
+
+// TestRegradeResource_Redis_SharedBackend_Skipped verifies that a Redis resource
+// without the "instant-customer-" provider_resource_id prefix (i.e. shared/local
+// backend) is skipped with the correct reason — we must never cap the shared pod.
+func TestRegradeResource_Redis_SharedBackend_Skipped(t *testing.T) {
+	srv := newTestServer()
+	resp, err := srv.RegradeResource(context.Background(), &provisionerv1.RegradeRequest{
+		Token:              "tok-shared",
+		ResourceType:       commonv1.ResourceType_RESOURCE_TYPE_REDIS,
+		Tier:               "hobby",
+		ProviderResourceId: "", // empty = shared backend (no k8s namespace)
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Applied {
+		t.Fatal("expected applied=false for shared backend Redis resource")
+	}
+	if resp.SkipReason != "shared backend — no per-tenant maxmemory lever" {
+		t.Fatalf("unexpected skip_reason: %q", resp.SkipReason)
+	}
+}
+
+// TestRegradeResource_Redis_K8sID_NonRegraderBackend_Skipped verifies that when
+// the provider_resource_id looks like a k8s namespace but the active redis backend
+// does not implement the Regrader interface (e.g. local backend in test), the server
+// skips gracefully without error.
+func TestRegradeResource_Redis_K8sID_NonRegraderBackend_Skipped(t *testing.T) {
+	srv := newTestServer() // uses mockRedisBackend which does NOT implement Regrader
+	resp, err := srv.RegradeResource(context.Background(), &provisionerv1.RegradeRequest{
+		Token:              "tok-k8s",
+		ResourceType:       commonv1.ResourceType_RESOURCE_TYPE_REDIS,
+		Tier:               "pro",
+		ProviderResourceId: "instant-customer-tok-k8s", // k8s namespace prefix
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Applied {
+		t.Fatal("expected applied=false when backend does not implement Regrader")
+	}
+	if resp.SkipReason != "backend does not support redis regrade" {
+		t.Fatalf("unexpected skip_reason: %q", resp.SkipReason)
+	}
+}
+
+// mockRegraderRedisBackend is a mockRedisBackend that also implements redis.Regrader.
+// Used to test the full regradeRedis path with a controllable Regrade outcome.
+type mockRegraderRedisBackend struct {
+	mockRedisBackend
+	regrade func(ctx context.Context, token, providerResourceID string, targetMaxmemoryMB int) (redis.RegradeResult, error)
+}
+
+func (m *mockRegraderRedisBackend) Regrade(ctx context.Context, token, id string, targetMB int) (redis.RegradeResult, error) {
+	if m.regrade != nil {
+		return m.regrade(ctx, token, id, targetMB)
+	}
+	return redis.RegradeResult{Applied: true, AppliedMaxmemory: int64(targetMB) * 1024 * 1024}, nil
+}
+
+// TestRegradeResource_Redis_ProTier_AppliesProCap verifies that a pro-tier Redis
+// resource backed by a k8s-style provider_resource_id has maxmemory set to the
+// pro cap (512 MB from plans.yaml). team/growth get maxmemory=0 (unlimited).
+func TestRegradeResource_Redis_ProTier_AppliesCap(t *testing.T) {
+	cases := []struct {
+		tier            string
+		wantApplied     bool
+		wantAppliedMB   int32 // AppliedConnLimit field repurposed for Redis maxmemory_mb
+		wantSkipReason  string
+	}{
+		{
+			tier:          "pro",
+			wantApplied:   true,
+			wantAppliedMB: 512, // plans.yaml pro redis_memory_mb = 512
+		},
+		{
+			tier:          "hobby",
+			wantApplied:   true,
+			wantAppliedMB: 50, // plans.yaml hobby redis_memory_mb = 50
+		},
+		{
+			// team tier: redis_memory_mb = -1 (unlimited) → targetMaxmemoryMB = 0
+			tier:          "team",
+			wantApplied:   true,
+			wantAppliedMB: 0, // unlimited — maxmemory 0
+		},
+		{
+			// growth tier: redis_memory_mb = 1024 (plans.yaml) → targetMaxmemoryMB = 1024
+			tier:          "growth",
+			wantApplied:   true,
+			wantAppliedMB: 1024, // plans.yaml growth redis_memory_mb = 1024
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.tier, func(t *testing.T) {
+			regraderBackend := &mockRegraderRedisBackend{
+				regrade: func(_ context.Context, _, _ string, targetMB int) (redis.RegradeResult, error) {
+					return redis.RegradeResult{
+						Applied:          true,
+						AppliedMaxmemory: int64(targetMB) * 1024 * 1024,
+					}, nil
+				},
+			}
+			srv := server.NewWithBackends(
+				&config.Config{},
+				&mockPostgresBackend{},
+				regraderBackend,
+				&mockMongoBackend{},
+				&mockQueueBackend{},
+				nil, nil, nil, nil, nil, // storage + dedicated backends
+				nil,                     // pool
+			)
+			resp, err := srv.RegradeResource(context.Background(), &provisionerv1.RegradeRequest{
+				Token:              "tok-" + tc.tier,
+				ResourceType:       commonv1.ResourceType_RESOURCE_TYPE_REDIS,
+				Tier:               tc.tier,
+				ProviderResourceId: "instant-customer-tok-" + tc.tier,
+			})
+			if err != nil {
+				t.Fatalf("tier %q: unexpected error: %v", tc.tier, err)
+			}
+			if resp.Applied != tc.wantApplied {
+				t.Errorf("tier %q: Applied=%v, want %v", tc.tier, resp.Applied, tc.wantApplied)
+			}
+			if tc.wantApplied && resp.AppliedConnLimit != tc.wantAppliedMB {
+				t.Errorf("tier %q: AppliedConnLimit (maxmemory_mb)=%d, want %d",
+					tc.tier, resp.AppliedConnLimit, tc.wantAppliedMB)
+			}
+		})
+	}
+}
+
+// TestRegradeResource_Redis_AlreadyCorrect_ReturnsSkip verifies that when the
+// Regrade call returns {Applied:false, SkipReason:"already correct"} the server
+// propagates it faithfully (idempotency guard).
+func TestRegradeResource_Redis_AlreadyCorrect_ReturnsSkip(t *testing.T) {
+	regraderBackend := &mockRegraderRedisBackend{
+		regrade: func(_ context.Context, _, _ string, _ int) (redis.RegradeResult, error) {
+			return redis.RegradeResult{Applied: false, SkipReason: "already correct"}, nil
+		},
+	}
+	srv := server.NewWithBackends(
+		&config.Config{},
+		&mockPostgresBackend{},
+		regraderBackend,
+		&mockMongoBackend{},
+		&mockQueueBackend{},
+		nil, nil, nil, nil, nil,
+		nil,
+	)
+	resp, err := srv.RegradeResource(context.Background(), &provisionerv1.RegradeRequest{
+		Token:              "tok-idempotent",
+		ResourceType:       commonv1.ResourceType_RESOURCE_TYPE_REDIS,
+		Tier:               "pro",
+		ProviderResourceId: "instant-customer-tok-idempotent",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Applied {
+		t.Fatal("expected Applied=false for already-correct pod")
+	}
+	if resp.SkipReason != "already correct" {
 		t.Fatalf("unexpected skip_reason: %q", resp.SkipReason)
 	}
 }

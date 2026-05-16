@@ -553,20 +553,32 @@ func (s *Server) GetStorageBytes(ctx context.Context, req *provisionerv1.Storage
 	}
 }
 
-// regradeConnLimits is the source of truth for per-tier Postgres connection
-// caps used by RegradeResource. It is the shared plans registry — the same
-// source the agent API uses via plans.Registry.ConnectionsLimit(tier,
-// "postgres") — so the cap re-applied here stays platform-consistent.
+// regradeConnLimits is the source of truth for per-tier caps used by
+// RegradeResource. It is the shared plans registry — the same source the
+// agent API uses — so caps re-applied here stay platform-consistent.
+// StorageLimitMB(tier, "redis") gives the Redis maxmemory cap in MB.
+// ConnectionsLimit(tier, "postgres") gives the Postgres CONNECTION LIMIT.
 var regradeConnLimits = plans.Default()
 
-// RegradeResource re-applies the tier's per-role connection cap to an
+// redisK8sProviderIDPrefix is the namespace prefix assigned to every k8s-backed
+// Redis resource. Shared-backend (local/dedicated) resources do not have this
+// prefix — their provider_resource_id is either empty or a non-k8s identifier.
+// Using a constant here (rather than importing the redis package's private const)
+// keeps the dependency clean; both values must stay in sync with k8s.go.
+const redisK8sProviderIDPrefix = "instant-customer-"
+
+// RegradeResource re-applies the tier's infrastructure cap to an
 // already-provisioned resource. It exists because a plan upgrade does not, on
-// its own, re-apply the higher CONNECTION LIMIT to the customer's Postgres
-// role — the role keeps the old (lower) cap until this RPC runs.
+// its own, re-apply the higher cap to the live infrastructure — the resource
+// keeps the old (lower) cap until this RPC runs.
 //
-// Phase 1 is Postgres-only. Non-Postgres resource types and backends with no
-// per-role connection cap (the shared local/dedicated/neon backends) return
-// {applied:false} with a skip reason rather than an error.
+// Supported resource types:
+//   - POSTGRES: re-applies CONNECTION LIMIT on the Postgres role.
+//   - REDIS (k8s-backed only): re-applies maxmemory + allkeys-lru policy via
+//     CONFIG SET. Shared-backend Redis (no per-tenant cap lever) returns
+//     {applied:false} with a descriptive skip_reason.
+//
+// All other resource types return {applied:false, skip_reason:"unsupported"}.
 func (s *Server) RegradeResource(ctx context.Context, req *provisionerv1.RegradeRequest) (*provisionerv1.RegradeResponse, error) {
 	if req.Token == "" {
 		return nil, status.Error(codes.InvalidArgument, "token is required")
@@ -581,10 +593,15 @@ func (s *Server) RegradeResource(ctx context.Context, req *provisionerv1.Regrade
 	)
 	defer span.End()
 
-	// Phase 1: Postgres only.
-	if req.ResourceType != commonv1.ResourceType_RESOURCE_TYPE_POSTGRES {
+	switch req.ResourceType {
+	case commonv1.ResourceType_RESOURCE_TYPE_POSTGRES:
+		return s.regradePostgres(ctx, req)
+	case commonv1.ResourceType_RESOURCE_TYPE_REDIS:
+		return s.regradeRedis(ctx, req)
+	default:
 		slog.Info("server.RegradeResource",
 			"token", req.Token, "tier", req.Tier,
+			"resource_type", req.ResourceType.String(),
 			"applied", false, "skip_reason", "unsupported resource type for regrade",
 			"request_id", req.RequestId)
 		return &provisionerv1.RegradeResponse{
@@ -592,7 +609,10 @@ func (s *Server) RegradeResource(ctx context.Context, req *provisionerv1.Regrade
 			SkipReason: "unsupported resource type for regrade",
 		}, nil
 	}
+}
 
+// regradePostgres re-applies the CONNECTION LIMIT on the customer's Postgres role.
+func (s *Server) regradePostgres(ctx context.Context, req *provisionerv1.RegradeRequest) (*provisionerv1.RegradeResponse, error) {
 	// Select the backend that actually owns this resource. k8s namespace IDs
 	// (prefix "instant-customer-") go through the regular postgresBackend,
 	// matching the routing DeprovisionResource uses.
@@ -614,7 +634,7 @@ func (s *Server) RegradeResource(ctx context.Context, req *provisionerv1.Regrade
 		return nil, mapError("RegradeResource.postgres", err)
 	}
 
-	slog.Info("server.RegradeResource",
+	slog.Info("server.RegradeResource.postgres",
 		"token", req.Token, "tier", req.Tier,
 		"applied", result.Applied,
 		"applied_conn_limit", result.AppliedConnLimit,
@@ -624,6 +644,83 @@ func (s *Server) RegradeResource(ctx context.Context, req *provisionerv1.Regrade
 	return &provisionerv1.RegradeResponse{
 		Applied:          result.Applied,
 		AppliedConnLimit: int32(result.AppliedConnLimit),
+		SkipReason:       result.SkipReason,
+	}, nil
+}
+
+// regradeRedis re-applies maxmemory on a dedicated k8s Redis pod.
+//
+// Safety: only k8s-backed dedicated pods (provider_resource_id prefix
+// "instant-customer-") are touched. Shared-backend resources (provider_resource_id
+// empty or not starting with "instant-customer-") are skipped with a descriptive
+// reason — the shared redis-provision pod has a single pod-wide maxmemory that
+// must never be narrowed per-tenant.
+//
+// Team/growth tiers (memory limit = -1 in plans.yaml) set maxmemory=0 (Redis
+// "unlimited") so existing pods are never accidentally capped.
+func (s *Server) regradeRedis(ctx context.Context, req *provisionerv1.RegradeRequest) (*provisionerv1.RegradeResponse, error) {
+	// Only k8s-backed dedicated pods have a per-tenant maxmemory lever.
+	// k8s namespaces always have the "instant-customer-" prefix.
+	if !strings.HasPrefix(req.ProviderResourceId, redisK8sProviderIDPrefix) {
+		slog.Info("server.RegradeResource.redis: skip shared/non-k8s backend",
+			"token", req.Token, "tier", req.Tier,
+			"provider_resource_id", req.ProviderResourceId,
+			"request_id", req.RequestId)
+		return &provisionerv1.RegradeResponse{
+			Applied:    false,
+			SkipReason: "shared backend — no per-tenant maxmemory lever",
+		}, nil
+	}
+
+	// Resolve the backend that owns this resource. For k8s-style IDs the
+	// regular redisBackend holds the route-registry connection; use it here
+	// too for consistency with Deprovision routing.
+	regrader, ok := s.redisBackend.(redis.Regrader)
+	if !ok {
+		// redisBackend is not a k8s backend (e.g. local/dedicated in a test env).
+		slog.Warn("server.RegradeResource.redis: active redis backend does not support Regrade — skipping",
+			"token", req.Token, "tier", req.Tier, "request_id", req.RequestId)
+		return &provisionerv1.RegradeResponse{
+			Applied:    false,
+			SkipReason: "backend does not support redis regrade",
+		}, nil
+	}
+
+	// Memory cap comes from the shared plans registry.
+	// StorageLimitMB("redis") returns plans.yaml redis_memory_mb:
+	//   anonymous=5, hobby=50, pro=512, team/growth=-1 (unlimited).
+	// -1 (unlimited) → targetMaxmemoryMB=0 → Regrade sets maxmemory=0 (no cap).
+	memLimitMB := regradeConnLimits.StorageLimitMB(req.Tier, "redis")
+	targetMaxmemoryMB := memLimitMB
+	if memLimitMB < 0 {
+		// Unlimited tier — explicitly clear any cap on the pod.
+		targetMaxmemoryMB = 0
+	}
+
+	result, err := regrader.Regrade(ctx, req.Token, req.ProviderResourceId, targetMaxmemoryMB)
+	if err != nil {
+		return nil, mapError("RegradeResource.redis", err)
+	}
+
+	slog.Info("server.RegradeResource.redis",
+		"token", req.Token, "tier", req.Tier,
+		"applied", result.Applied,
+		"applied_maxmemory_bytes", result.AppliedMaxmemory,
+		"target_maxmemory_mb", targetMaxmemoryMB,
+		"skip_reason", result.SkipReason,
+		"request_id", req.RequestId)
+
+	// AppliedConnLimit is Postgres-specific; for Redis we repurpose it to carry
+	// the applied maxmemory in MB so the worker can log it. The worker does not
+	// store this value in a DB column — the reconciler is designed to be
+	// stateless for Redis (it re-checks every tick, idempotently).
+	appliedMB := int32(0)
+	if result.Applied {
+		appliedMB = int32(targetMaxmemoryMB)
+	}
+	return &provisionerv1.RegradeResponse{
+		Applied:          result.Applied,
+		AppliedConnLimit: appliedMB, // repurposed: maxmemory_mb for Redis
 		SkipReason:       result.SkipReason,
 	}, nil
 }

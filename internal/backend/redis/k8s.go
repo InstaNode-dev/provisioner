@@ -4,13 +4,14 @@ package redis
 // Security model and architecture mirrors the postgres K8sBackend — see postgres/k8s.go.
 //
 // Configuration env vars:
-//   K8S_EXTERNAL_HOST       — legacy NodePort hostname (kept for back-compat / fallback URL)
-//   K8S_REDIS_PUBLIC_HOST   — hostname embedded in customer URLs when redis-proxy is fronting
-//                             the cluster (default "redis.instanode.dev")
-//   K8S_REDIS_IMAGE         — container image, default "redis:7-alpine"
-//   K8S_STORAGE_CLASS       — PVC storage class, default "gp3"
-//   K8S_REDIS_STORAGE_GI    — PVC size in GiB, default 10 (overridden by tier sizing)
-//   K8S_KUBECONFIG          — path to kubeconfig file; empty = in-cluster
+//
+//	K8S_EXTERNAL_HOST       — legacy NodePort hostname (kept for back-compat / fallback URL)
+//	K8S_REDIS_PUBLIC_HOST   — hostname embedded in customer URLs when redis-proxy is fronting
+//	                          the cluster (default "redis.instanode.dev")
+//	K8S_REDIS_IMAGE         — container image, default "redis:7-alpine"
+//	K8S_STORAGE_CLASS       — PVC storage class, default "gp3"
+//	K8S_REDIS_STORAGE_GI    — PVC size in GiB, default 10 (overridden by tier sizing)
+//	K8S_KUBECONFIG          — path to kubeconfig file; empty = in-cluster
 //
 // # External access model
 //
@@ -25,11 +26,13 @@ package redis
 // reachable in environments without the proxy.
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"strings"
 	"time"
 
@@ -41,11 +44,25 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/tools/remotecommand"
 
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 )
+
+// PodExecor is an abstraction over the k8s pod exec transport, injected into
+// K8sBackend so that Regrade's exec-fallback path can be exercised in unit
+// tests without a live cluster. The production implementation delegates to
+// client-go's SPDY remotecommand executor.
+//
+// ExecInPod runs the given command inside the named container of a pod, writing
+// stdout/stderr to the provided buffers. Returns an error if the exec transport
+// fails or the remote command exits non-zero.
+type PodExecor interface {
+	ExecInPod(ctx context.Context, namespace, podName, containerName string, cmd []string, stdout, stderr *bytes.Buffer) error
+}
 
 const (
 	redisK8sNsPrefix  = "instant-customer-"
@@ -151,12 +168,19 @@ func sizingForTier(tier string) tierSizing {
 
 // K8sBackend provisions a dedicated Redis pod per token.
 type K8sBackend struct {
-	cs            *kubernetes.Clientset
-	storageClass  string // K8S_STORAGE_CLASS
-	image         string // K8S_REDIS_IMAGE
-	externalHost  string // K8S_EXTERNAL_HOST (legacy NodePort host; kept for back-compat)
-	publicHost    string // K8S_REDIS_PUBLIC_HOST (e.g. redis.instanode.dev) — preferred URL host when set
-	storageSizeGi int    // K8S_REDIS_STORAGE_GI (legacy ceiling; tier sizing overrides per-resource)
+	cs            kubernetes.Interface  // kubernetes.Interface allows fake.Clientset in tests
+	restCfg       *rest.Config          // stored for pod-exec transport construction
+	storageClass  string       // K8S_STORAGE_CLASS
+	image         string       // K8S_REDIS_IMAGE
+	externalHost  string       // K8S_EXTERNAL_HOST (legacy NodePort host; kept for back-compat)
+	publicHost    string       // K8S_REDIS_PUBLIC_HOST (e.g. redis.instanode.dev) — preferred URL host when set
+	storageSizeGi int          // K8S_REDIS_STORAGE_GI (legacy ceiling; tier sizing overrides per-resource)
+
+	// execor is the pod-exec transport used by the Regrade legacy fallback path.
+	// nil at construction; replaced by spdyPodExecor in production and by a
+	// fakeExecor in tests. Populated lazily on first use so we don't open
+	// network connections during backend init.
+	execor PodExecor
 
 	// Route registry — written on every successful Provision so the Redis
 	// routing proxy (redis-proxy/) can demux. Two key families are written:
@@ -198,7 +222,14 @@ func newK8sBackend(kubeconfigPath, storageClass, image, externalHost string, sto
 	if storageSizeGi <= 0 {
 		storageSizeGi = 10
 	}
-	return &K8sBackend{cs: cs, storageClass: storageClass, image: image, externalHost: externalHost, storageSizeGi: storageSizeGi}, nil
+	return &K8sBackend{
+		cs:            cs,
+		restCfg:       rc,
+		storageClass:  storageClass,
+		image:         image,
+		externalHost:  externalHost,
+		storageSizeGi: storageSizeGi,
+	}, nil
 }
 
 // EnableRouteRegistry tells the K8sBackend to publish routing records to Redis
@@ -235,6 +266,56 @@ func (b *K8sBackend) SetPasswordRoutePrefix(prefix string) {
 // the redis-proxy is fronting the cluster. Empty value keeps the legacy
 // K8S_EXTERNAL_HOST + NodePort URL shape.
 func (b *K8sBackend) SetPublicHost(host string) { b.publicHost = host }
+
+// spdyPodExecor is the production PodExecor implementation. It uses client-go's
+// SPDY remotecommand executor to run a command inside a container via the k8s
+// API server. The rest.Config must have its TLS / auth already populated (i.e.
+// come from rest.InClusterConfig or clientcmd.BuildConfigFromFlags).
+type spdyPodExecor struct {
+	cs      kubernetes.Interface
+	restCfg *rest.Config
+}
+
+// ExecInPod implements PodExecor using the k8s SPDY exec sub-resource.
+// The command is run in the named container; stdout and stderr are written to
+// the supplied buffers. The pod's environment variables (including REDIS_PASSWORD)
+// are available to the command via the shell — we NEVER pass the password as
+// a literal argv string.
+func (e *spdyPodExecor) ExecInPod(ctx context.Context, namespace, podName, containerName string, cmd []string, stdout, stderr *bytes.Buffer) error {
+	req := e.cs.CoreV1().RESTClient().Post().
+		Resource("pods").
+		Name(podName).
+		Namespace(namespace).
+		SubResource("exec").
+		VersionedParams(&corev1.PodExecOptions{
+			Container: containerName,
+			Command:   cmd,
+			Stdout:    true,
+			Stderr:    true,
+			Stdin:     false,
+			TTY:       false,
+		}, scheme.ParameterCodec)
+
+	exec, err := remotecommand.NewSPDYExecutor(e.restCfg, http.MethodPost, req.URL())
+	if err != nil {
+		return fmt.Errorf("redis exec: build SPDY executor: %w", err)
+	}
+	return exec.StreamWithContext(ctx, remotecommand.StreamOptions{
+		Stdout: stdout,
+		Stderr: stderr,
+	})
+}
+
+// podExecor returns the PodExecor for this backend, constructing the
+// production spdyPodExecor on first call. Tests may replace b.execor before
+// calling Regrade to inject a fake.
+func (b *K8sBackend) podExecor() PodExecor {
+	if b.execor != nil {
+		return b.execor
+	}
+	b.execor = &spdyPodExecor{cs: b.cs, restCfg: b.restCfg}
+	return b.execor
+}
 
 // Provision creates a dedicated Redis instance. The pod is started with --requirepass
 // and --maxclients injected via the container command. No post-start init step needed
@@ -450,17 +531,31 @@ func (b *K8sBackend) Regrade(ctx context.Context, token, providerResourceID stri
 		ns = redisK8sNsPrefix + token
 	}
 
-	// Read the password from the pod's auth Secret.
+	// ── Secret-based path (modern resources) ──────────────────────────────────
+	//
+	// Modern resources (provisioned after the redis-auth Secret convention) store
+	// the password in a k8s Secret so we can open a direct Redis connection from
+	// the provisioner pod. This is the fast, low-latency path.
 	secret, err := b.cs.CoreV1().Secrets(ns).Get(ctx, "redis-auth", metav1.GetOptions{})
 	if err != nil {
-		if k8serrors.IsNotFound(err) {
-			// Legacy resource without the redis-auth Secret (pre-standardisation).
-			// Can't connect → treat as a soft skip so the reconciler logs + moves on.
-			slog.Warn("k8s.redis.Regrade: redis-auth secret not found — skipping legacy resource",
-				"namespace", ns, "token", token)
-			return RegradeResult{Applied: false, SkipReason: "redis-auth secret not found (legacy resource)"}, nil
+		if !k8serrors.IsNotFound(err) {
+			return RegradeResult{Applied: false}, fmt.Errorf("k8s redis.Regrade: get secret: %w", err)
 		}
-		return RegradeResult{Applied: false}, fmt.Errorf("k8s redis.Regrade: get secret: %w", err)
+
+		// ── Exec-based fallback (legacy resources) ─────────────────────────────
+		//
+		// Legacy pods (provisioned before the redis-auth Secret convention) don't
+		// have a k8s Secret, but the password still lives inside the pod as the
+		// REDIS_PASSWORD env var feeding --requirepass. We reach it via k8s pod
+		// exec, which never exposes the password in argv or logs — the shell
+		// interpolates $REDIS_PASSWORD inside the pod's own environment.
+		//
+		// RBAC requirement: provisioner ClusterRole must include
+		//   resources: ["pods/exec"]  verbs: ["create"]
+		// (infra/k8s/provisioner/rbac.yaml — added by this PR).
+		slog.Info("k8s.redis.Regrade: redis-auth secret absent — attempting exec-based legacy fallback",
+			"namespace", ns, "token", token)
+		return b.regradeViaExec(ctx, ns, token, targetMaxmemoryMB)
 	}
 
 	svc, err := b.cs.CoreV1().Services(ns).Get(ctx, "redis", metav1.GetOptions{})
@@ -547,6 +642,149 @@ func (b *K8sBackend) Regrade(ctx context.Context, token, providerResourceID stri
 		"policy", policy,
 	)
 	return RegradeResult{Applied: true, AppliedMaxmemory: targetBytes}, nil
+}
+
+// regradeViaExec is the exec-based fallback for Regrade when the redis-auth
+// Secret is absent (legacy pods). It:
+//  1. Lists pods in the namespace to find the running Redis pod.
+//  2. Execs into the pod and runs CONFIG GET maxmemory to check the current value.
+//  3. If an update is needed, execs CONFIG SET maxmemory + CONFIG SET maxmemory-policy
+//     + CONFIG REWRITE — each step using $REDIS_PASSWORD inside the pod's own
+//     environment so the secret never appears in argv or logs.
+//
+// Fail-soft: if the pod is absent, exec fails, or CONFIG SET fails, the error is
+// logged and a soft-skip result is returned so the reconciler sweep continues.
+// NEVER logs or prints the password value.
+func (b *K8sBackend) regradeViaExec(ctx context.Context, ns, token string, targetMaxmemoryMB int) (RegradeResult, error) {
+	// Find the running Redis pod in the namespace.
+	pods, err := b.cs.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{LabelSelector: "app=redis"})
+	if err != nil {
+		slog.Warn("k8s.redis.Regrade.exec: pod list failed — soft skip",
+			"namespace", ns, "token", token, "error", err)
+		return RegradeResult{Applied: false, SkipReason: "exec fallback: pod list failed"}, nil
+	}
+	if len(pods.Items) == 0 {
+		slog.Warn("k8s.redis.Regrade.exec: no Redis pod found — soft skip",
+			"namespace", ns, "token", token)
+		return RegradeResult{Applied: false, SkipReason: "exec fallback: no pod found"}, nil
+	}
+
+	// Use the first Running pod; skip non-Running ones (e.g. CrashLoopBackOff).
+	var podName string
+	for i := range pods.Items {
+		if pods.Items[i].Status.Phase == corev1.PodRunning {
+			podName = pods.Items[i].Name
+			break
+		}
+	}
+	if podName == "" {
+		slog.Warn("k8s.redis.Regrade.exec: no Running Redis pod — soft skip",
+			"namespace", ns, "token", token)
+		return RegradeResult{Applied: false, SkipReason: "exec fallback: no Running pod"}, nil
+	}
+
+	exec := b.podExecor()
+
+	// ── Step 1: read current maxmemory via CONFIG GET ──────────────────────
+	//
+	// We use 'sh -c' so $REDIS_PASSWORD is expanded by the pod's own shell,
+	// keeping the literal value out of the argv that the API server logs.
+	// The output format is "maxmemory\n<value>\n" (redis-cli --no-auth-warning
+	// suppresses the auth-warning line on stderr so we get clean stdout).
+	getCmd := []string{"sh", "-c",
+		`redis-cli --no-auth-warning -a "$REDIS_PASSWORD" CONFIG GET maxmemory`}
+	var getOut, getErr bytes.Buffer
+	if err := exec.ExecInPod(ctx, ns, podName, "redis", getCmd, &getOut, &getErr); err != nil {
+		slog.Warn("k8s.redis.Regrade.exec: CONFIG GET maxmemory failed — soft skip",
+			"namespace", ns, "token", token, "error", err)
+		return RegradeResult{Applied: false, SkipReason: "exec fallback: CONFIG GET failed"}, nil
+	}
+
+	currentBytes := parseConfigGetMaxmemory(getOut.String())
+
+	// Compute target bytes (0 = unlimited for team tier).
+	var targetBytes int64
+	if targetMaxmemoryMB > 0 {
+		targetBytes = int64(targetMaxmemoryMB) * 1024 * 1024
+	}
+
+	if currentBytes == targetBytes {
+		slog.Debug("k8s.redis.Regrade.exec: maxmemory already correct — no-op",
+			"namespace", ns, "token", token,
+			"maxmemory_bytes", currentBytes,
+			"target_bytes", targetBytes,
+		)
+		return RegradeResult{Applied: false, SkipReason: "already correct"}, nil
+	}
+
+	// ── Step 2: CONFIG SET maxmemory ──────────────────────────────────────
+	//
+	// targetBytes is a plain integer (never user-controlled string) so printf
+	// interpolation is safe. $REDIS_PASSWORD is expanded inside the pod's shell.
+	setMemCmd := []string{"sh", "-c",
+		fmt.Sprintf(`redis-cli --no-auth-warning -a "$REDIS_PASSWORD" CONFIG SET maxmemory %d`, targetBytes)}
+	var setMemOut, setMemErr bytes.Buffer
+	if err := exec.ExecInPod(ctx, ns, podName, "redis", setMemCmd, &setMemOut, &setMemErr); err != nil {
+		slog.Warn("k8s.redis.Regrade.exec: CONFIG SET maxmemory failed — soft skip",
+			"namespace", ns, "token", token, "error", err)
+		return RegradeResult{Applied: false, SkipReason: "exec fallback: CONFIG SET maxmemory failed"}, nil
+	}
+
+	// ── Step 3: CONFIG SET maxmemory-policy ──────────────────────────────
+	policy := "noeviction"
+	if targetBytes > 0 {
+		policy = "allkeys-lru"
+	}
+	// policy is one of two known constants, safe to interpolate.
+	setPolicyCmd := []string{"sh", "-c",
+		fmt.Sprintf(`redis-cli --no-auth-warning -a "$REDIS_PASSWORD" CONFIG SET maxmemory-policy %s`, policy)}
+	var setPolicyOut, setPolicyErr bytes.Buffer
+	if err := exec.ExecInPod(ctx, ns, podName, "redis", setPolicyCmd, &setPolicyOut, &setPolicyErr); err != nil {
+		// Non-fatal — the memory cap is applied; policy mismatch only affects
+		// eviction behaviour. Log and continue.
+		slog.Warn("k8s.redis.Regrade.exec: CONFIG SET maxmemory-policy failed (non-fatal)",
+			"namespace", ns, "token", token, "policy", policy, "error", err)
+	}
+
+	// ── Step 4: CONFIG REWRITE ────────────────────────────────────────────
+	// Persists the new cap to redis.conf so it survives a pod restart.
+	// Legacy pods may have been started without a config file — REWRITE will
+	// fail in that case. Non-fatal: the in-memory cap is still enforced.
+	rewriteCmd := []string{"sh", "-c",
+		`redis-cli --no-auth-warning -a "$REDIS_PASSWORD" CONFIG REWRITE`}
+	var rwOut, rwErr bytes.Buffer
+	if err := exec.ExecInPod(ctx, ns, podName, "redis", rewriteCmd, &rwOut, &rwErr); err != nil {
+		slog.Warn("k8s.redis.Regrade.exec: CONFIG REWRITE failed (non-fatal, in-memory cap is active)",
+			"namespace", ns, "token", token, "error", err)
+	}
+
+	slog.Info("k8s.redis.Regrade.exec: applied via pod exec",
+		"namespace", ns, "token", token,
+		"old_maxmemory_bytes", currentBytes,
+		"new_maxmemory_bytes", targetBytes,
+		"target_maxmemory_mb", targetMaxmemoryMB,
+		"policy", policy,
+	)
+	return RegradeResult{Applied: true, AppliedMaxmemory: targetBytes}, nil
+}
+
+// parseConfigGetMaxmemory extracts the maxmemory value in bytes from the output
+// of `redis-cli CONFIG GET maxmemory`. The output format is:
+//
+//	maxmemory
+//	<integer>
+//
+// Returns 0 if the output cannot be parsed (treated as "unlimited").
+func parseConfigGetMaxmemory(output string) int64 {
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	for i, line := range lines {
+		if strings.TrimSpace(line) == "maxmemory" && i+1 < len(lines) {
+			var v int64
+			fmt.Sscanf(strings.TrimSpace(lines[i+1]), "%d", &v)
+			return v
+		}
+	}
+	return 0
 }
 
 // --- private resource creators ---

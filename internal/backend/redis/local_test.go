@@ -1,6 +1,10 @@
 package redis
 
-import "testing"
+import (
+	"testing"
+
+	"instant.dev/provisioner/internal/poolident"
+)
 
 // TestACLUsername_FullToken verifies P1-D: the canonical ACL username is
 // derived from the FULL token, so two tokens that share an 8-char prefix can
@@ -66,5 +70,36 @@ func TestDeprovisionUsernameCandidates(t *testing.T) {
 	}
 	if candidates[0] == candidates[1] {
 		t.Error("canonical and legacy candidates must differ for a long token")
+	}
+}
+
+// TestPoolClaimedRedisNamesDeriveFromPoolToken is the P0-2 regression guard for
+// the shared Redis backend: a pool-claimed cache's ACL user and keyspace are
+// named from the pool token. Deprovision/StorageBytes resolve the canonical
+// naming token from provider_resource_id (carrying a poolident marker) — if
+// they fell back to the request token, DELUSER/SCAN would target a name that
+// was never created and the real usr_pool-<uuid>/keyspace would leak.
+func TestPoolClaimedRedisNamesDeriveFromPoolToken(t *testing.T) {
+	const (
+		realToken = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+		poolToken = "pool-12345678-90ab-cdef-1234-567890abcdef"
+	)
+	prid := poolident.Encode("", poolToken)
+
+	// Exact expressions Deprovision / StorageBytes use.
+	gotUser := aclUsername(poolident.NamingToken(realToken, prid))
+	gotKeyspace := poolident.NamingToken(realToken, prid) + ":*"
+
+	if want := aclUsername(poolToken); gotUser != want {
+		t.Errorf("pool-claimed ACL user = %q, want %q (would leak otherwise)", gotUser, want)
+	}
+	if want := poolToken + ":*"; gotKeyspace != want {
+		t.Errorf("pool-claimed keyspace = %q, want %q", gotKeyspace, want)
+	}
+
+	// A live (non-pool) provision (empty provider_resource_id) keeps deriving
+	// from the request token — the normal path must be unchanged.
+	if got := aclUsername(poolident.NamingToken(realToken, "")); got != aclUsername(realToken) {
+		t.Errorf("live ACL user = %q, want %q (non-pool path must be unchanged)", got, aclUsername(realToken))
 	}
 }

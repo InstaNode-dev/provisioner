@@ -19,6 +19,8 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
+
+	"instant.dev/provisioner/internal/poolident"
 )
 
 // connectTimeout is the maximum time to wait for a MongoDB server to be found.
@@ -129,11 +131,17 @@ func (b *LocalBackend) StorageBytes(ctx context.Context, token, providerResource
 		}
 	}()
 
+	// P0-2: a pool-claimed database is named from the pool token (db_pool-<uuid>),
+	// not the request token. poolident.NamingToken resolves the canonical naming
+	// token from provider_resource_id so quota is measured against the real
+	// database; without it dbStats would miss and silently report 0 bytes.
+	namingToken := poolident.NamingToken(token, providerResourceID)
+
 	// Try the canonical name first, then every legacy scheme. A database
 	// provisioned before the P0-5 naming fix lives under a legacy name; if we
 	// only probed the canonical name we would read 0 bytes and silently
 	// un-enforce its quota. The first DB whose dbStats succeeds wins.
-	for _, dbName := range legacyMongoDBNames(token) {
+	for _, dbName := range legacyMongoDBNames(namingToken) {
 		var result bson.M
 		err = client.Database(dbName).RunCommand(ctx, bson.D{{Key: "dbStats", Value: 1}}).Decode(&result)
 		if err != nil {
@@ -170,12 +178,18 @@ func (b *LocalBackend) Deprovision(ctx context.Context, token, providerResourceI
 		}
 	}()
 
+	// P0-2: a pool-claimed database/user are named from the pool token, not
+	// the request token. Resolve the canonical naming token from
+	// provider_resource_id so dropUser/dropDatabase target the real infra
+	// instead of no-op'ing on db_<real-token>, which would leak it forever.
+	namingToken := poolident.NamingToken(token, providerResourceID)
+
 	// Drop every candidate user. The resource was provisioned under exactly
 	// one scheme, but we cannot know which without a stored name, so we drop
 	// the canonical name and every legacy form. dropUser on a non-existent
 	// user is harmless (logged, non-fatal).
 	adminDB := client.Database("admin")
-	for _, username := range legacyMongoUserNames(token) {
+	for _, username := range legacyMongoUserNames(namingToken) {
 		if r := adminDB.RunCommand(ctx, bson.D{{Key: "dropUser", Value: username}}); r.Err() != nil {
 			slog.Debug("nosql.Deprovision: dropUser miss (continuing)", "token", token, "user", username, "error", r.Err())
 		}
@@ -184,8 +198,8 @@ func (b *LocalBackend) Deprovision(ctx context.Context, token, providerResourceI
 	// Drop every candidate database. Dropping a non-existent database is a
 	// MongoDB no-op, so iterating all schemes is safe; a real drop error on
 	// the canonical name still propagates.
-	canonicalDB := mongoDBName(token)
-	for _, dbName := range legacyMongoDBNames(token) {
+	canonicalDB := mongoDBName(namingToken)
+	for _, dbName := range legacyMongoDBNames(namingToken) {
 		if dropErr := client.Database(dbName).Drop(ctx); dropErr != nil {
 			if dbName == canonicalDB {
 				return fmt.Errorf("nosql.Deprovision: drop database %s: %w", dbName, dropErr)

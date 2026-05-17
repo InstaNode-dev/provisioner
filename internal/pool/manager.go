@@ -35,6 +35,14 @@ type Item struct {
 	DatabaseName       string
 	Username           string
 	KeyPrefix          string
+
+	// PoolToken is the synthetic "pool-<uuid>" token the backing infrastructure
+	// was actually provisioned under. The shared backends derive every infra
+	// name (db_/usr_/keyspace) from it, so it — not the claiming caller's real
+	// token — is the canonical naming token for this resource's lifecycle.
+	// See internal/poolident for how it is threaded onto provider_resource_id
+	// and resolved by Deprovision / StorageBytes / Regrade (P0-2).
+	PoolToken string
 }
 
 // Config holds pool sizing parameters per resource type. Zero disables that
@@ -118,7 +126,7 @@ func (m *Manager) Claim(ctx context.Context, resourceType string) (*Item, error)
 			LIMIT  1
 			FOR    UPDATE SKIP LOCKED
 		)
-		RETURNING id, connection_url, provider_resource_id, database_name, username, key_prefix
+		RETURNING id, connection_url, provider_resource_id, database_name, username, key_prefix, pool_token
 	`, resourceType)
 
 	var (
@@ -126,7 +134,7 @@ func (m *Manager) Claim(ctx context.Context, resourceType string) (*Item, error)
 		encURL string
 	)
 	err := row.Scan(&item.ID, &encURL, &item.ProviderResourceID,
-		&item.DatabaseName, &item.Username, &item.KeyPrefix)
+		&item.DatabaseName, &item.Username, &item.KeyPrefix, &item.PoolToken)
 	if err == pgx.ErrNoRows {
 		return nil, nil // pool empty — caller falls back to live provisioning
 	}
@@ -313,9 +321,9 @@ func (m *Manager) provisionOneItem(ctx context.Context, resourceType string) err
 
 	if _, err := m.db.Exec(ctx, `
 		INSERT INTO pool_items
-			(resource_type, connection_url, provider_resource_id, database_name, username, key_prefix)
-		VALUES ($1, $2, $3, $4, $5, $6)
-	`, resourceType, encURL, providerResourceID, databaseName, username, keyPrefix); err != nil {
+			(resource_type, connection_url, provider_resource_id, database_name, username, key_prefix, pool_token)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+	`, resourceType, encURL, providerResourceID, databaseName, username, keyPrefix, poolToken); err != nil {
 		return fmt.Errorf("insert pool item: %w", err)
 	}
 
@@ -324,6 +332,13 @@ func (m *Manager) provisionOneItem(ctx context.Context, resourceType string) err
 }
 
 func (m *Manager) migrate(ctx context.Context) error {
+	// pool_token records the synthetic "pool-<uuid>" token the backing infra was
+	// provisioned under. It is the canonical naming token for the resource's
+	// whole lifecycle (P0-2); the ALTER below adds it to clusters created before
+	// this column existed. Pre-existing rows backfill to '' — those pool items
+	// were already provisioned and, once claimed, would still leak; the column
+	// only guarantees correctness for items provisioned from now on. Stale
+	// pre-fix ready items are best drained/recycled by an operator.
 	_, err := m.db.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS pool_items (
 			id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -333,10 +348,12 @@ func (m *Manager) migrate(ctx context.Context) error {
 			database_name        TEXT        NOT NULL DEFAULT '',
 			username             TEXT        NOT NULL DEFAULT '',
 			key_prefix           TEXT        NOT NULL DEFAULT '',
+			pool_token           TEXT        NOT NULL DEFAULT '',
 			status               TEXT        NOT NULL DEFAULT 'ready',
 			created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
 			assigned_at          TIMESTAMPTZ
 		);
+		ALTER TABLE pool_items ADD COLUMN IF NOT EXISTS pool_token TEXT NOT NULL DEFAULT '';
 		CREATE INDEX IF NOT EXISTS idx_pool_ready
 			ON pool_items (resource_type, created_at)
 			WHERE status = 'ready';

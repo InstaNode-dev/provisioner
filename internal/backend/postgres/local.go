@@ -18,6 +18,15 @@ import (
 	"os"
 
 	"github.com/jackc/pgx/v5"
+
+	"instant.dev/provisioner/internal/poolident"
+)
+
+const (
+	// dbNamePrefix / userNamePrefix are the fixed prefixes for a customer
+	// database and its scoped role on the shared cluster.
+	dbNamePrefix   = "db_"
+	userNamePrefix = "usr_"
 )
 
 const defaultCustomersURL = "postgres://instant_cust:instant_cust@postgres-customers:5432/instant_customers?sslmode=disable"
@@ -81,8 +90,8 @@ func generatePassword(n int) (string, error) {
 // (omits the clause). This value comes from the API handler via plans.Registry
 // so the provisioner stays a dumb executor and the API remains the policy owner.
 func (b *LocalBackend) Provision(ctx context.Context, token, tier string, connLimit int) (*Credentials, error) {
-	dbName := "db_" + token
-	username := "usr_" + token
+	dbName := dbNamePrefix + token
+	username := userNamePrefix + token
 
 	pass, err := generatePassword(16)
 	if err != nil {
@@ -185,8 +194,13 @@ func (b *LocalBackend) Provision(ctx context.Context, token, tier string, connLi
 }
 
 // StorageBytes returns the size of db_{token} in bytes using pg_database_size.
+//
+// P0-2: when this resource was claimed from the hot pool, the database is named
+// from the pool token (db_pool-<uuid>), not the request token. poolident
+// resolves the canonical naming token from provider_resource_id; the cluster
+// segment is stripped before the router parses it.
 func (b *LocalBackend) StorageBytes(ctx context.Context, token, providerResourceID string) (int64, error) {
-	adminURL := b.router.AdminURLForResource(providerResourceID)
+	adminURL := b.router.AdminURLForResource(poolident.BasePRID(providerResourceID))
 	conn, err := pgx.Connect(ctx, adminURL)
 	if err != nil {
 		return 0, fmt.Errorf("db.local.StorageBytes: connect: %w", err)
@@ -197,7 +211,7 @@ func (b *LocalBackend) StorageBytes(ctx context.Context, token, providerResource
 		}
 	}()
 
-	dbName := "db_" + token
+	dbName := dbNamePrefix + poolident.NamingToken(token, providerResourceID)
 	var size int64
 	if err := conn.QueryRow(ctx, "SELECT pg_database_size($1)", dbName).Scan(&size); err != nil {
 		return 0, fmt.Errorf("db.local.StorageBytes: pg_database_size: %w", err)
@@ -206,11 +220,17 @@ func (b *LocalBackend) StorageBytes(ctx context.Context, token, providerResource
 }
 
 // Deprovision terminates active connections, drops the database and user for the token.
+//
+// P0-2: a pool-claimed resource's database/user are named from the pool token,
+// not the request token; poolident.NamingToken resolves the correct name from
+// provider_resource_id so DROP DATABASE actually destroys the backing infra
+// rather than no-op'ing on a db_<real-token> that was never created.
 func (b *LocalBackend) Deprovision(ctx context.Context, token, providerResourceID string) error {
-	dbName := "db_" + token
-	username := "usr_" + token
+	namingToken := poolident.NamingToken(token, providerResourceID)
+	dbName := dbNamePrefix + namingToken
+	username := userNamePrefix + namingToken
 
-	adminURL := b.router.AdminURLForResource(providerResourceID)
+	adminURL := b.router.AdminURLForResource(poolident.BasePRID(providerResourceID))
 	conn, err := pgx.Connect(ctx, adminURL)
 	if err != nil {
 		return fmt.Errorf("db.local.Deprovision: connect: %w", err)
@@ -251,9 +271,11 @@ func (b *LocalBackend) Deprovision(ctx context.Context, token, providerResourceI
 // connLimit <= 0 means unlimited (pass -1 from plans.Registry). Postgres uses -1
 // internally for "no limit"; ALTER ROLE with CONNECTION LIMIT -1 removes any cap.
 func (b *LocalBackend) Regrade(ctx context.Context, token, providerResourceID string, connLimit int) (RegradeResult, error) {
-	username := "usr_" + token
+	// P0-2: a pool-claimed role is named from the pool token; resolve it from
+	// provider_resource_id so ALTER ROLE targets the role that actually exists.
+	username := userNamePrefix + poolident.NamingToken(token, providerResourceID)
 
-	adminURL := b.router.AdminURLForResource(providerResourceID)
+	adminURL := b.router.AdminURLForResource(poolident.BasePRID(providerResourceID))
 	conn, err := pgx.Connect(ctx, adminURL)
 	if err != nil {
 		return RegradeResult{Applied: false}, fmt.Errorf("db.local.Regrade: connect: %w", err)

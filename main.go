@@ -183,6 +183,18 @@ func main() {
 
 	cfg := config.Load()
 
+	// P1-M: fail closed on a missing/empty PROVISIONER_SECRET. An
+	// unauthenticated provisioner is a remote create/destroy-database surface;
+	// it must refuse to start rather than silently disable auth. The k8s
+	// deployment supplies PROVISIONER_SECRET from the instant-infra-secrets
+	// Secret; for local `make run` the operator must export it explicitly.
+	if err := interceptor.ValidateSecret(cfg.ProvisionerSecret); err != nil {
+		slog.Error("provisioner.auth_misconfigured",
+			"error", err,
+			"remediation", "set PROVISIONER_SECRET (k8s: instant-infra-secrets; local: export PROVISIONER_SECRET=$(openssl rand -hex 32))")
+		os.Exit(1)
+	}
+
 	// --- optional hot-pool ---
 	var poolMgr *pool.Manager
 	if cfg.ProvisionerDatabaseURL != "" && cfg.AESKey != "" {

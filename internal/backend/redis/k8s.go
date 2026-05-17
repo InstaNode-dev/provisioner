@@ -88,20 +88,44 @@ const (
 	// Pentest fix: 2026-05-16.
 	redisK8sOwnerTeamLabel = "instant.dev/owner-team"
 
-	// routeKeyTTL is the expiry applied to the redis-proxy route-registry keys
-	// (<routePrefix><token> and <passwordPrefix><password>). Deprovision deletes
-	// these explicitly, but that delete is best-effort — if the redis-auth Secret
-	// read fails, the password-route key would otherwise leak forever. A TTL lets
-	// orphans self-heal.
+	// anonRouteKeyTTL is the expiry applied to the redis-proxy route-registry
+	// keys (<routePrefix><token> and <passwordPrefix><password>) for ANONYMOUS
+	// resources only. Deprovision deletes these explicitly, but that delete is
+	// best-effort — if the redis-auth Secret read fails, the password-route key
+	// would otherwise leak forever. A TTL lets orphans self-heal.
 	//
-	// 365 days is deliberately far longer than any expected resource lifetime
-	// (anonymous resources are 24h; paid resources are long-lived but always
-	// have Deprovision delete the key on teardown). Crucially the key is re-Set
-	// on every Provision, so a live resource that is somehow re-provisioned
-	// refreshes the TTL — an in-use route is never expired out from under a
-	// running pod.
-	routeKeyTTL = 365 * 24 * time.Hour
+	// 365 days is deliberately far longer than the 24h anonymous resource
+	// lifetime, so an in-use anonymous route is never expired out from under a
+	// running pod before its own 24h teardown.
+	//
+	// P1-A fix (2026-05-17): paid/permanent resources MUST NOT carry this TTL.
+	// They are long-lived and are only ever re-Set on Provision; a paid resource
+	// that is never re-provisioned would silently lose its proxy route at 1 year
+	// and become unreachable. routeKeyTTLForTier returns persistRouteKey (no
+	// expiry) for every non-anonymous tier — matching the postgres and queue
+	// backends, which already write their route keys with TTL 0.
+	anonRouteKeyTTL = 365 * 24 * time.Hour
+
+	// persistRouteKey is the TTL value (go-redis: 0 == no expiry) used for
+	// paid/permanent resources so their proxy route never expires while the
+	// resource is alive. Deprovision still explicitly deletes the key.
+	persistRouteKey = time.Duration(0)
+
+	// anonymousTier is the billing tier string for 24h-TTL trial resources.
+	anonymousTier = "anonymous"
 )
+
+// routeKeyTTLForTier returns the route-registry key TTL for a given billing
+// tier. Anonymous resources get a long self-healing TTL (anonRouteKeyTTL);
+// every paid/permanent tier gets persistRouteKey (no expiry) so a long-lived
+// resource can never lose its proxy route. An empty/unknown tier is treated
+// as paid (persistent) — failing safe toward "never lose a live route".
+func routeKeyTTLForTier(tier string) time.Duration {
+	if tier == anonymousTier {
+		return anonRouteKeyTTL
+	}
+	return persistRouteKey
+}
 
 // tierSizing maps a billing tier to k8s resource sizing for the provisioned Redis pod.
 // Anonymous (24h trial) gets the smallest viable pod — still a real, dedicated Redis,
@@ -427,16 +451,18 @@ func (b *K8sBackend) Provision(ctx context.Context, token, tier string) (*Creden
 	if b.rdb != nil {
 		serviceFQDN := fmt.Sprintf("redis.%s.svc.cluster.local:6379", ns)
 		regCtx, regCancel := context.WithTimeout(context.Background(), 3*time.Second)
-		// routeKeyTTL is set so a route key orphaned by a failed Deprovision
-		// self-heals; it is re-Set (TTL refreshed) on every Provision.
-		if err := b.rdb.Set(regCtx, b.routePrefix+token, serviceFQDN, routeKeyTTL).Err(); err != nil {
+		// P1-A: anonymous resources get a long self-healing TTL; paid/permanent
+		// resources get persistRouteKey (no expiry) so a long-lived resource
+		// that is never re-provisioned cannot lose its proxy route.
+		routeTTL := routeKeyTTLForTier(tier)
+		if err := b.rdb.Set(regCtx, b.routePrefix+token, serviceFQDN, routeTTL).Err(); err != nil {
 			slog.Warn("k8s.redis.route_register_failed", "token", token, "error", err)
 		} else {
 			slog.Info("k8s.redis.route_registered", "token", token, "backend", serviceFQDN)
 		}
 		// The proxy consumes THIS key — it's the one that actually matters for
 		// external connectivity through redis.instanode.dev.
-		if err := b.rdb.Set(regCtx, b.passwordPrefix+password, serviceFQDN, routeKeyTTL).Err(); err != nil {
+		if err := b.rdb.Set(regCtx, b.passwordPrefix+password, serviceFQDN, routeTTL).Err(); err != nil {
 			slog.Warn("k8s.redis.password_route_register_failed", "token", token, "error", err)
 		} else {
 			slog.Info("k8s.redis.password_route_registered", "token", token, "backend", serviceFQDN)

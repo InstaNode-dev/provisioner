@@ -25,6 +25,10 @@ const defaultCustomersURL = "postgres://instant_cust:instant_cust@postgres-custo
 // alphanumChars is the charset for generated passwords.
 const alphanumChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
+// sqlCreateExtensionVector installs pgvector on a freshly provisioned database.
+// Applied unconditionally — see the call site in Provision for the rationale.
+const sqlCreateExtensionVector = "CREATE EXTENSION IF NOT EXISTS vector"
+
 // LocalBackend provisions databases on one or more shared postgres-customers instances.
 // When multiple admin URLs are provided, the ClusterRouter distributes provisions
 // across them based on available capacity.
@@ -145,8 +149,22 @@ func (b *LocalBackend) Provision(ctx context.Context, token, tier string, connLi
 		if _, err := adminNewDB.Exec(ctx, fmt.Sprintf("GRANT ALL ON SCHEMA public TO %q", username)); err != nil {
 			slog.Error("db.local.Provision: GRANT SCHEMA (non-fatal)", "token", token, "error", err)
 		}
-		// Install pgvector so users can create vector columns immediately.
-		if _, err := adminNewDB.Exec(ctx, "CREATE EXTENSION IF NOT EXISTS vector"); err != nil {
+		// Install pgvector unconditionally on every provisioned database.
+		//
+		// This is intentional, not request-driven. The gRPC ProvisionRequest
+		// proto carries no extensions field, so the provisioner cannot know
+		// which extensions a caller asked for — and `vector` is the *only*
+		// extension the platform allows anyway (see the API's ValidateExtensions
+		// allowlist). Installing it for everyone means an agent can create
+		// vector columns immediately without a second round-trip, at the cost
+		// of one always-present extension.
+		//
+		// Consequence: the API-side ValidateExtensions allowlist is effectively
+		// cosmetic on this (production gRPC) path — it only gated the retired
+		// API-local backend. If extension selection ever needs to be
+		// caller-driven, add an `extensions` field to the proto ProvisionRequest
+		// and route it through here; do NOT widen this hardcoded call.
+		if _, err := adminNewDB.Exec(ctx, sqlCreateExtensionVector); err != nil {
 			slog.Error("db.local.Provision: CREATE EXTENSION vector (non-fatal)", "token", token, "error", err)
 		}
 	}

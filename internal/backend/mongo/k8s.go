@@ -65,6 +65,20 @@ const (
 	// Mirrors the constant in postgres/k8s.go — must stay in sync.
 	// Pentest fix: 2026-05-16.
 	mongoK8sOwnerTeamLabel = "instant.dev/owner-team"
+
+	// routeKeyTTL is the expiry applied to the mongo-proxy route-registry keys
+	// (<routePrefix><dbName> and <userPrefix><appUser>). Deprovision deletes
+	// these explicitly, but that delete is best-effort — if the admin Secret
+	// read fails, the user-route key would otherwise leak forever. A TTL lets
+	// orphans self-heal.
+	//
+	// 365 days is deliberately far longer than any expected resource lifetime
+	// (anonymous resources are 24h; paid resources are long-lived but always
+	// have Deprovision delete the key on teardown). Crucially the key is re-Set
+	// on every Provision, so a live resource that is somehow re-provisioned
+	// refreshes the TTL — an in-use route is never expired out from under a
+	// running pod.
+	routeKeyTTL = 365 * 24 * time.Hour
 )
 
 // tierSizing maps a billing tier to k8s resource sizing for the provisioned Mongo pod.
@@ -323,14 +337,16 @@ func (b *K8sBackend) Provision(ctx context.Context, token, tier string) (*Creden
 	if b.rdb != nil {
 		serviceFQDN := fmt.Sprintf("mongodb.%s.svc.cluster.local:27017", ns)
 		regCtx, regCancel := context.WithTimeout(context.Background(), 3*time.Second)
-		if err := b.rdb.Set(regCtx, b.routePrefix+dbName, serviceFQDN, 0).Err(); err != nil {
+		// routeKeyTTL is set so a route key orphaned by a failed Deprovision
+		// self-heals; it is re-Set (TTL refreshed) on every Provision.
+		if err := b.rdb.Set(regCtx, b.routePrefix+dbName, serviceFQDN, routeKeyTTL).Err(); err != nil {
 			slog.Warn("k8s.mongo.route_register_failed", "db", dbName, "error", err)
 		} else {
 			slog.Info("k8s.mongo.route_registered", "db", dbName, "backend", serviceFQDN)
 		}
 		// The proxy consumes THIS key — it's the one that actually matters
 		// for external connectivity through mongo.instanode.dev.
-		if err := b.rdb.Set(regCtx, b.userPrefix+appUser, serviceFQDN, 0).Err(); err != nil {
+		if err := b.rdb.Set(regCtx, b.userPrefix+appUser, serviceFQDN, routeKeyTTL).Err(); err != nil {
 			slog.Warn("k8s.mongo.user_route_register_failed", "user", appUser, "error", err)
 		} else {
 			slog.Info("k8s.mongo.user_route_registered", "user", appUser, "backend", serviceFQDN)

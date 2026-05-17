@@ -87,6 +87,20 @@ const (
 	// Mirrors the constant in postgres/k8s.go — must stay in sync.
 	// Pentest fix: 2026-05-16.
 	redisK8sOwnerTeamLabel = "instant.dev/owner-team"
+
+	// routeKeyTTL is the expiry applied to the redis-proxy route-registry keys
+	// (<routePrefix><token> and <passwordPrefix><password>). Deprovision deletes
+	// these explicitly, but that delete is best-effort — if the redis-auth Secret
+	// read fails, the password-route key would otherwise leak forever. A TTL lets
+	// orphans self-heal.
+	//
+	// 365 days is deliberately far longer than any expected resource lifetime
+	// (anonymous resources are 24h; paid resources are long-lived but always
+	// have Deprovision delete the key on teardown). Crucially the key is re-Set
+	// on every Provision, so a live resource that is somehow re-provisioned
+	// refreshes the TTL — an in-use route is never expired out from under a
+	// running pod.
+	routeKeyTTL = 365 * 24 * time.Hour
 )
 
 // tierSizing maps a billing tier to k8s resource sizing for the provisioned Redis pod.
@@ -413,14 +427,16 @@ func (b *K8sBackend) Provision(ctx context.Context, token, tier string) (*Creden
 	if b.rdb != nil {
 		serviceFQDN := fmt.Sprintf("redis.%s.svc.cluster.local:6379", ns)
 		regCtx, regCancel := context.WithTimeout(context.Background(), 3*time.Second)
-		if err := b.rdb.Set(regCtx, b.routePrefix+token, serviceFQDN, 0).Err(); err != nil {
+		// routeKeyTTL is set so a route key orphaned by a failed Deprovision
+		// self-heals; it is re-Set (TTL refreshed) on every Provision.
+		if err := b.rdb.Set(regCtx, b.routePrefix+token, serviceFQDN, routeKeyTTL).Err(); err != nil {
 			slog.Warn("k8s.redis.route_register_failed", "token", token, "error", err)
 		} else {
 			slog.Info("k8s.redis.route_registered", "token", token, "backend", serviceFQDN)
 		}
 		// The proxy consumes THIS key — it's the one that actually matters for
 		// external connectivity through redis.instanode.dev.
-		if err := b.rdb.Set(regCtx, b.passwordPrefix+password, serviceFQDN, 0).Err(); err != nil {
+		if err := b.rdb.Set(regCtx, b.passwordPrefix+password, serviceFQDN, routeKeyTTL).Err(); err != nil {
 			slog.Warn("k8s.redis.password_route_register_failed", "token", token, "error", err)
 		} else {
 			slog.Info("k8s.redis.password_route_registered", "token", token, "backend", serviceFQDN)

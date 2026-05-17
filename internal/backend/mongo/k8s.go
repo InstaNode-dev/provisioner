@@ -228,12 +228,15 @@ func (b *K8sBackend) SetPublicHost(host string) { b.publicHost = host }
 // Provision creates a dedicated MongoDB instance with a restricted app user.
 func (b *K8sBackend) Provision(ctx context.Context, token, tier string) (*Credentials, error) {
 	ns := mongoK8sNsPrefix + token
-	dbName := "db_" + mongoK8sShort(token)
+	// Canonical, collision-free names (see naming.go). The pre-fix scheme used
+	// mongoK8sShort, which truncated the token to 12 chars — any two tokens
+	// sharing the first 12 hex digits collided onto the same DB and user.
+	dbName := mongoDBName(token)
 	adminPass, err := mongoK8sRandHex(16)
 	if err != nil {
 		return nil, fmt.Errorf("k8s mongo: rand admin pass: %w", err)
 	}
-	appUser := "usr_" + mongoK8sShort(token)
+	appUser := mongoUserName(token)
 	appPass, err := mongoK8sRandHex(16)
 	if err != nil {
 		return nil, fmt.Errorf("k8s mongo: rand app pass: %w", err)
@@ -345,7 +348,6 @@ func (b *K8sBackend) StorageBytes(ctx context.Context, token, providerResourceID
 	if ns == "" {
 		ns = mongoK8sNsPrefix + token
 	}
-	dbName := "db_" + mongoK8sShort(token)
 
 	// Fail-soft when the customer namespace exists but is missing the
 	// modern mongo-admin Secret or mongodb Service — these are legacy
@@ -380,19 +382,32 @@ func (b *K8sBackend) StorageBytes(ctx context.Context, token, providerResourceID
 	}
 	defer client.Disconnect(ctx)
 
-	var result bson.M
-	if err := client.Database(dbName).RunCommand(ctx, bson.D{{Key: "dbStats", Value: 1}}).Decode(&result); err != nil {
-		return 0, fmt.Errorf("k8s mongo.StorageBytes: dbStats: %w", err)
-	}
-	if v, ok := result["storageSize"]; ok {
-		switch n := v.(type) {
-		case int32:
-			return int64(n), nil
-		case int64:
-			return n, nil
-		case float64:
-			return int64(n), nil
+	// Try the canonical DB name first, then every legacy scheme. A pod
+	// provisioned before the P0-5 naming fix holds its data under the legacy
+	// 12-char-truncated name; probing only the canonical name would read 0
+	// bytes and silently un-enforce the customer's Mongo quota.
+	var lastErr error
+	for _, dbName := range legacyMongoDBNames(token) {
+		var result bson.M
+		if err := client.Database(dbName).RunCommand(ctx, bson.D{{Key: "dbStats", Value: 1}}).Decode(&result); err != nil {
+			lastErr = err
+			slog.Debug("k8s mongo.StorageBytes: dbStats miss for candidate", "namespace", ns, "db", dbName, "error", err)
+			continue
 		}
+		if v, ok := result["storageSize"]; ok {
+			switch n := v.(type) {
+			case int32:
+				return int64(n), nil
+			case int64:
+				return n, nil
+			case float64:
+				return int64(n), nil
+			}
+		}
+		return 0, nil
+	}
+	if lastErr != nil {
+		return 0, fmt.Errorf("k8s mongo.StorageBytes: dbStats (all candidates): %w", lastErr)
 	}
 	return 0, nil
 }
@@ -413,15 +428,21 @@ func (b *K8sBackend) Deprovision(ctx context.Context, token, providerResourceID 
 		slog.Info("k8s.mongo.deprovision.namespace_already_gone", "namespace", ns)
 	}
 	if b.rdb != nil {
-		dbName := "db_" + mongoK8sShort(token)
-		appUser := "usr_" + mongoK8sShort(token)
+		// Delete route keys for the canonical name AND every legacy scheme —
+		// the pod was registered under whichever scheme was current when it
+		// was provisioned, and a stale route key would leave the mongo-proxy
+		// forwarding to a deleted pod.
 		delCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
-		if err := b.rdb.Del(delCtx, b.routePrefix+dbName).Err(); err != nil {
-			slog.Warn("k8s.mongo.route_unregister_failed", "db", dbName, "error", err)
+		for _, dbName := range legacyMongoDBNames(token) {
+			if err := b.rdb.Del(delCtx, b.routePrefix+dbName).Err(); err != nil {
+				slog.Warn("k8s.mongo.route_unregister_failed", "db", dbName, "error", err)
+			}
 		}
-		if err := b.rdb.Del(delCtx, b.userPrefix+appUser).Err(); err != nil {
-			slog.Warn("k8s.mongo.user_route_unregister_failed", "user", appUser, "error", err)
+		for _, appUser := range legacyMongoUserNames(token) {
+			if err := b.rdb.Del(delCtx, b.userPrefix+appUser).Err(); err != nil {
+				slog.Warn("k8s.mongo.user_route_unregister_failed", "user", appUser, "error", err)
+			}
 		}
 	}
 	slog.Info("k8s.mongo.deprovisioned", "namespace", ns)
@@ -738,13 +759,9 @@ func (b *K8sBackend) tryInitMongo(ctx context.Context, adminURI, dbName, appUser
 	return nil
 }
 
-func mongoK8sShort(token string) string {
-	s := strings.ReplaceAll(token, "-", "")
-	if len(s) > 12 {
-		return s[:12]
-	}
-	return s
-}
+// NOTE: the former mongoK8sShort helper (truncate dash-stripped token to 12
+// chars) was removed in the P0-5 fix. It was collision-prone — see naming.go,
+// which now owns all DB/user name derivation for both backends.
 
 func mongoK8sRandHex(n int) (string, error) {
 	b := make([]byte, n)

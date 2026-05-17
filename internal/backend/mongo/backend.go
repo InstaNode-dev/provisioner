@@ -41,6 +41,8 @@ type Backend interface {
 type Credentials struct {
 	// URL is the mongodb:// connection string the caller can use immediately.
 	// Format: mongodb://usr_{token}:{password}@{host}/db_{token}
+	// where {token} is the full provisioning token with dashes stripped
+	// (the canonical, collision-free scheme — see naming.go).
 	URL string
 
 	// DatabaseName is the name of the provisioned database.

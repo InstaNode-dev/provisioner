@@ -2,8 +2,11 @@ package mongo
 
 // Package mongo handles MongoDB database provisioning.
 // Supports local MongoDB instances running in the k8s cluster.
-// Each provisioned token gets its own database (db_{token}) and
-// a dedicated user (usr_{token}) with readWrite access scoped to that DB only.
+// Each provisioned token gets its own database and a dedicated user with
+// readWrite access scoped to that DB only. DB/user names are derived from the
+// token by naming.go — the canonical scheme is db_{token}/usr_{token} with the
+// token's dashes stripped (collision-free; see naming.go for the full rationale
+// and the legacy-scheme backward-compatibility fallback).
 
 import (
 	"context"
@@ -62,8 +65,11 @@ func (b *LocalBackend) Provision(ctx context.Context, token, tier string) (*Cred
 	}
 	password := hex.EncodeToString(pwBytes)
 
-	dbName := "db_" + token
-	username := "usr_" + token
+	// Canonical, collision-free names (see naming.go). New provisions ALWAYS
+	// use the canonical scheme; lookup paths below additionally tolerate the
+	// legacy schemes for databases provisioned before this fix.
+	dbName := mongoDBName(token)
+	username := mongoUserName(token)
 
 	// Create the user in the admin database with readWrite role scoped to the token DB.
 	adminDB := client.Database("admin")
@@ -123,24 +129,30 @@ func (b *LocalBackend) StorageBytes(ctx context.Context, token, providerResource
 		}
 	}()
 
-	dbName := "db_" + token
-	var result bson.M
-	err = client.Database(dbName).RunCommand(ctx, bson.D{{Key: "dbStats", Value: 1}}).Decode(&result)
-	if err != nil {
-		// Database may not exist yet — fail open.
-		slog.Error("nosql.StorageBytes: dbStats failed", "token", token, "db", dbName, "error", err)
+	// Try the canonical name first, then every legacy scheme. A database
+	// provisioned before the P0-5 naming fix lives under a legacy name; if we
+	// only probed the canonical name we would read 0 bytes and silently
+	// un-enforce its quota. The first DB whose dbStats succeeds wins.
+	for _, dbName := range legacyMongoDBNames(token) {
+		var result bson.M
+		err = client.Database(dbName).RunCommand(ctx, bson.D{{Key: "dbStats", Value: 1}}).Decode(&result)
+		if err != nil {
+			slog.Debug("nosql.StorageBytes: dbStats miss for candidate", "token", token, "db", dbName, "error", err)
+			continue
+		}
+		switch v := result["storageSize"].(type) {
+		case int32:
+			return int64(v), nil
+		case int64:
+			return v, nil
+		case float64:
+			return int64(v), nil
+		}
 		return 0, nil
 	}
 
-	switch v := result["storageSize"].(type) {
-	case int32:
-		return int64(v), nil
-	case int64:
-		return v, nil
-	case float64:
-		return int64(v), nil
-	}
-
+	// No candidate database exists yet — fail open.
+	slog.Error("nosql.StorageBytes: dbStats failed for all name candidates", "token", token)
 	return 0, nil
 }
 
@@ -158,21 +170,30 @@ func (b *LocalBackend) Deprovision(ctx context.Context, token, providerResourceI
 		}
 	}()
 
-	dbName := "db_" + token
-	username := "usr_" + token
-
-	// Drop the user from the admin database.
+	// Drop every candidate user. The resource was provisioned under exactly
+	// one scheme, but we cannot know which without a stored name, so we drop
+	// the canonical name and every legacy form. dropUser on a non-existent
+	// user is harmless (logged, non-fatal).
 	adminDB := client.Database("admin")
-	dropUserResult := adminDB.RunCommand(ctx, bson.D{{Key: "dropUser", Value: username}})
-	if dropUserResult.Err() != nil {
-		slog.Error("nosql.Deprovision: dropUser failed (continuing)", "token", token, "error", dropUserResult.Err())
+	for _, username := range legacyMongoUserNames(token) {
+		if r := adminDB.RunCommand(ctx, bson.D{{Key: "dropUser", Value: username}}); r.Err() != nil {
+			slog.Debug("nosql.Deprovision: dropUser miss (continuing)", "token", token, "user", username, "error", r.Err())
+		}
 	}
 
-	// Drop the database.
-	if dropErr := client.Database(dbName).Drop(ctx); dropErr != nil {
-		return fmt.Errorf("nosql.Deprovision: drop database %s: %w", dbName, dropErr)
+	// Drop every candidate database. Dropping a non-existent database is a
+	// MongoDB no-op, so iterating all schemes is safe; a real drop error on
+	// the canonical name still propagates.
+	canonicalDB := mongoDBName(token)
+	for _, dbName := range legacyMongoDBNames(token) {
+		if dropErr := client.Database(dbName).Drop(ctx); dropErr != nil {
+			if dbName == canonicalDB {
+				return fmt.Errorf("nosql.Deprovision: drop database %s: %w", dbName, dropErr)
+			}
+			slog.Debug("nosql.Deprovision: legacy drop miss (continuing)", "token", token, "db", dbName, "error", dropErr)
+		}
 	}
 
-	slog.Info("nosql.Deprovision: deprovisioned", "token", token, "db", dbName, "user", username)
+	slog.Info("nosql.Deprovision: deprovisioned", "token", token, "db", canonicalDB)
 	return nil
 }

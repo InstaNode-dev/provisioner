@@ -18,6 +18,36 @@ import (
 
 const defaultRedisAddr = "localhost:6379"
 
+// aclUserPrefix is the prefix for every ACL username provisioned on the shared
+// Redis backend. The username is aclUserPrefix + the FULL token (matching the
+// key-prefix which also uses the full token). Using the full token avoids the
+// cross-tenant collision that an 8-char truncation caused: two tokens sharing
+// their first 8 hex chars would map to the same ACL user, so an ACL SETUSER
+// upsert silently overwrote tenant A's credentials and a later ACL DELUSER
+// revoked the survivor. See P1-D.
+const aclUserPrefix = "usr_"
+
+// legacyACLUserShortLen is the truncation length used by the pre-P1-D username
+// scheme (aclUserPrefix + token[:8]). Deprovision still probes this form so
+// ACL users created before the fix are cleaned up. New provisions never use it.
+const legacyACLUserShortLen = 8
+
+// aclUsername returns the canonical ACL username for a token: the full token,
+// not a truncated prefix, so two tokens can never collide on the same user.
+func aclUsername(token string) string {
+	return aclUserPrefix + token
+}
+
+// legacyACLUsername returns the pre-P1-D 8-char-prefix username for a token,
+// or "" when the token is too short to have been truncated (in which case the
+// canonical name already equals the legacy name and no extra probe is needed).
+func legacyACLUsername(token string) string {
+	if len(token) <= legacyACLUserShortLen {
+		return ""
+	}
+	return aclUserPrefix + token[:legacyACLUserShortLen]
+}
+
 // aclAllowlist is the safe command allowlist applied to every provisioned ACL
 // user on the shared Redis backend. It replaces "+@all" which would grant
 // dangerous cross-tenant commands such as FLUSHDB, MONITOR, and CONFIG SET.
@@ -79,11 +109,9 @@ func newLocalBackend(redisHost string) *LocalBackend {
 // Tries Redis ACL (Redis 6+) first. Falls back to key-namespace isolation
 // if ACL is unavailable or disabled.
 func (b *LocalBackend) Provision(ctx context.Context, token, tier string) (*Credentials, error) {
-	short := token
-	if len(short) > 8 {
-		short = short[:8]
-	}
-	username := fmt.Sprintf("usr_%s", short)
+	// Username is derived from the FULL token (matching keyPrefix). Truncating
+	// to 8 chars let two tokens collide on the same ACL user — see P1-D.
+	username := aclUsername(token)
 	keyPrefix := fmt.Sprintf("%s:", token)
 
 	// Generate a random password for the ACL user.
@@ -197,15 +225,22 @@ func (b *LocalBackend) StorageBytes(ctx context.Context, token, providerResource
 }
 
 // Deprovision removes all keys in the token's namespace and the ACL user if it exists.
+//
+// Backward-compat (P1-D): new provisions name the ACL user from the full token
+// (aclUsername), but resources provisioned before the fix used the truncated
+// 8-char form (legacyACLUsername). Deprovision deletes BOTH candidate names —
+// canonical first, legacy second — so pre-fix users are still cleaned up. The
+// candidates are de-duplicated because, for short tokens, the two names are
+// identical (legacyACLUsername returns "" in that case).
 func (b *LocalBackend) Deprovision(ctx context.Context, token, providerResourceID string) error {
-	// Delete ACL user if it exists.
-	short := token
-	if len(short) > 8 {
-		short = short[:8]
+	// Delete ACL user if it exists. Best-effort — ignore errors (user may not
+	// exist or ACL may be disabled).
+	for _, username := range []string{aclUsername(token), legacyACLUsername(token)} {
+		if username == "" {
+			continue
+		}
+		b.rdb.Do(ctx, "ACL", "DELUSER", username)
 	}
-	username := fmt.Sprintf("usr_%s", short)
-	// Best-effort ACL delete — ignore errors (user may not exist or ACL may be disabled).
-	b.rdb.Do(ctx, "ACL", "DELUSER", username)
 
 	// Flush all keys in the token's namespace using SCAN + DEL.
 	prefix := token + ":*"

@@ -98,7 +98,7 @@ func TestSizingForTier_MaxmemoryFlag_InCommand(t *testing.T) {
 		if sz.maxmemoryMB > 0 {
 			cmd = append(cmd,
 				"--maxmemory", fmt.Sprintf("%dmb", sz.maxmemoryMB),
-				"--maxmemory-policy", "allkeys-lru",
+				"--maxmemory-policy", redisMaxmemoryPolicyCapped,
 			)
 		}
 		return cmd
@@ -113,6 +113,16 @@ func TestSizingForTier_MaxmemoryFlag_InCommand(t *testing.T) {
 		return false
 	}
 
+	// flagValue returns the argument immediately after flag, or "".
+	flagValue := func(cmd []string, flag string) string {
+		for i, arg := range cmd {
+			if arg == flag && i+1 < len(cmd) {
+				return cmd[i+1]
+			}
+		}
+		return ""
+	}
+
 	limitedTiers := []string{"anonymous", "hobby", "pro", "growth"}
 	for _, tier := range limitedTiers {
 		t.Run("limited/"+tier, func(t *testing.T) {
@@ -123,6 +133,11 @@ func TestSizingForTier_MaxmemoryFlag_InCommand(t *testing.T) {
 			}
 			if !containsFlag(cmd, "--maxmemory-policy") {
 				t.Errorf("tier %q: --maxmemory-policy flag missing from Redis command", tier)
+			}
+			// P1-C: capped tiers must use noeviction so writes fail loudly at
+			// the cap rather than silently evicting customer keys.
+			if got := flagValue(cmd, "--maxmemory-policy"); got != "noeviction" {
+				t.Errorf("tier %q: --maxmemory-policy = %q, want noeviction (P1-C)", tier, got)
 			}
 		})
 	}
@@ -234,7 +249,8 @@ func (f *fakeExecor) ExecInPod(_ context.Context, namespace, podName, containerN
 //  1. $REDIS_PASSWORD is a shell variable reference, NEVER an interpolated literal.
 //  2. The CONFIG SET maxmemory value matches sizingForTier(tier).maxmemoryMB * 1024 * 1024.
 //  3. team tier → maxmemory=0, policy=noeviction.
-//  4. Limited tiers → maxmemory>0, policy=allkeys-lru.
+//  4. Limited tiers → maxmemory>0, policy=noeviction (P1-C: writes fail loudly
+//     at the cap instead of silently evicting customer keys).
 func TestExecCommandConstruction(t *testing.T) {
 	cases := []struct {
 		tier           string
@@ -243,10 +259,10 @@ func TestExecCommandConstruction(t *testing.T) {
 		wantPolicy     string
 		wantMaxmem     string // expected substring in the CONFIG SET maxmemory command
 	}{
-		{"anonymous", 5, 5 * 1024 * 1024, "allkeys-lru", "5242880"},
-		{"hobby", 50, 50 * 1024 * 1024, "allkeys-lru", "52428800"},
-		{"pro", 512, 512 * 1024 * 1024, "allkeys-lru", "536870912"},
-		{"growth", 1024, 1024 * 1024 * 1024, "allkeys-lru", "1073741824"},
+		{"anonymous", 5, 5 * 1024 * 1024, "noeviction", "5242880"},
+		{"hobby", 50, 50 * 1024 * 1024, "noeviction", "52428800"},
+		{"pro", 512, 512 * 1024 * 1024, "noeviction", "536870912"},
+		{"growth", 1024, 1024 * 1024 * 1024, "noeviction", "1073741824"},
 		{"team", -1, 0, "noeviction", "maxmemory 0"},  // unlimited — check full "maxmemory 0" substring
 	}
 

@@ -210,14 +210,19 @@ func (b *LocalBackend) StorageBytes(ctx context.Context, token, providerResource
 			totalKeys++
 
 			// MEMORY USAGE returns bytes used by the key including metadata.
-			// Err is non-nil if the key doesn't exist (just deleted).
 			mem, err := b.rdb.MemoryUsage(ctx, key).Result()
 			if err != nil {
-				// Key was deleted between SCAN and MEMORY USAGE — skip it.
-				if strings.Contains(err.Error(), "ERR") || err == goredis.Nil {
+				// goredis.Nil / "ERR" => the key was deleted between SCAN and
+				// MEMORY USAGE — a benign race, skip just that key.
+				if err == goredis.Nil || strings.Contains(err.Error(), "ERR") {
 					continue
 				}
-				continue
+				// Any other error (conn drop, timeout, ctx-cancel) means the
+				// remaining keys are unmeasured — a partial sum would be a
+				// corrupt total reported as authoritative. Fail open (the
+				// quota convention: the worker skips this tick) rather than
+				// continuing with an under-count.
+				return 0, fmt.Errorf("cache.StorageBytes memory usage: %w", err)
 			}
 			totalBytes += mem
 		}

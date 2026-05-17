@@ -205,9 +205,10 @@ func TestRouteKeyTTLForTier_PaidTiersNeverExpire(t *testing.T) {
 
 func TestParseConfigGetMaxmemory(t *testing.T) {
 	cases := []struct {
-		name   string
-		input  string
-		wantMB int64 // expected bytes (direct)
+		name    string
+		input   string
+		wantMB  int64 // expected bytes (direct); ignored when wantErr
+		wantErr bool  // a parse failure must surface, NOT silently return 0
 	}{
 		{
 			name:   "standard redis-cli output",
@@ -230,21 +231,69 @@ func TestParseConfigGetMaxmemory(t *testing.T) {
 			wantMB: 5242880, // 5 MB
 		},
 		{
-			name:   "empty output returns 0",
-			input:  "",
-			wantMB: 0,
+			name:    "empty output errors (must not read as 0 = unlimited)",
+			input:   "",
+			wantErr: true,
 		},
 		{
-			name:   "no maxmemory line returns 0",
-			input:  "somekey\n123\n",
-			wantMB: 0,
+			name:    "no maxmemory line errors",
+			input:   "somekey\n123\n",
+			wantErr: true,
+		},
+		{
+			name:    "non-integer maxmemory value errors",
+			input:   "maxmemory\nNaN\n",
+			wantErr: true,
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := parseConfigGetMaxmemory(tc.input)
+			got, err := parseConfigGetMaxmemory(tc.input)
+			if tc.wantErr {
+				if err == nil {
+					t.Errorf("parseConfigGetMaxmemory(%q) = (%d, nil); want an error", tc.input, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("parseConfigGetMaxmemory(%q) unexpected error: %v", tc.input, err)
+			}
 			if got != tc.wantMB {
 				t.Errorf("parseConfigGetMaxmemory(%q) = %d; want %d", tc.input, got, tc.wantMB)
+			}
+		})
+	}
+}
+
+// TestParseUsedMemory — a malformed INFO body must surface an error rather than
+// be reported as 0 bytes (which would silently under-report quota usage).
+func TestParseUsedMemory(t *testing.T) {
+	cases := []struct {
+		name    string
+		input   string
+		want    int64
+		wantErr bool
+	}{
+		{name: "standard INFO memory", input: "# Memory\r\nused_memory:1048576\r\nused_memory_human:1.00M\r\n", want: 1048576},
+		{name: "no trailing CR", input: "used_memory:524288\n", want: 524288},
+		{name: "missing used_memory line errors", input: "# Memory\r\nmaxmemory:0\r\n", wantErr: true},
+		{name: "empty input errors", input: "", wantErr: true},
+		{name: "non-integer value errors", input: "used_memory:notanumber\n", wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseUsedMemory(tc.input)
+			if tc.wantErr {
+				if err == nil {
+					t.Errorf("parseUsedMemory(%q) = (%d, nil); want an error", tc.input, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("parseUsedMemory(%q) unexpected error: %v", tc.input, err)
+			}
+			if got != tc.want {
+				t.Errorf("parseUsedMemory(%q) = %d; want %d", tc.input, got, tc.want)
 			}
 		})
 	}

@@ -267,10 +267,13 @@ func (s *Server) provisionPostgres(ctx context.Context, req *provisionerv1.Provi
 			// here via the same ALTER ROLE path RegradeResource uses, so we do
 			// not rely on the async entitlement reconciler catching up later.
 			//
-			// The pool item's role name is "usr_<pool-token>"; postgres.Regrade
-			// reconstructs the role from the token, so we recover the token by
-			// stripping the well-known prefix.
-			if poolToken := strings.TrimPrefix(item.Username, poolPostgresUserPrefix); poolToken != item.Username {
+			// postgres.Regrade reconstructs the db_/usr_ names from the pool
+			// naming token. item.PoolToken is the authoritative value the pool
+			// manager stamped at pre-provision time (also used 2 lines below in
+			// poolident.Encode); use it directly rather than re-deriving the
+			// token by stripping a prefix off item.Username, which drifts the
+			// moment the username scheme changes.
+			if poolToken := item.PoolToken; poolToken != "" {
 				res, rerr := s.postgresBackend.Regrade(ctx, poolToken, item.ProviderResourceID, connLimit)
 				if rerr != nil {
 					// Fail closed: a pool item we cannot cap must not be handed
@@ -296,10 +299,10 @@ func (s *Server) provisionPostgres(ctx context.Context, req *provisionerv1.Provi
 					}, nil
 				}
 			} else {
-				// Username did not carry the expected prefix — we cannot derive
-				// the token to target the ALTER ROLE. Fall back to live provision
-				// rather than hand out an uncapped role.
-				slog.Warn("server.provisionPostgres: pool item username missing expected prefix — cannot apply connection limit, falling back to live",
+				// Pool item carries no naming token — we cannot derive the
+				// db_/usr_ names to target the ALTER ROLE. Fall back to live
+				// provision rather than hand out an uncapped role.
+				slog.Warn("server.provisionPostgres: pool item missing PoolToken — cannot apply connection limit, falling back to live",
 					"pool_id", item.ID, "username", item.Username)
 			}
 		}
@@ -646,13 +649,6 @@ var regradeConnLimits = plans.Default()
 // Using a constant here (rather than importing the redis package's private const)
 // keeps the dependency clean; both values must stay in sync with k8s.go.
 const redisK8sProviderIDPrefix = "instant-customer-"
-
-// poolPostgresUserPrefix is the role-name prefix the shared Postgres backend
-// applies on Provision ("usr_" + token). The pool stores the role name as
-// Item.Username; provisionPostgres strips this prefix to recover the pool
-// token so it can target the per-tier ALTER ROLE CONNECTION LIMIT (P1-A).
-// Must stay in sync with postgres/local.go's `username := "usr_" + token`.
-const poolPostgresUserPrefix = "usr_"
 
 // RegradeResource re-applies the tier's infrastructure cap to an
 // already-provisioned resource. It exists because a plan upgrade does not, on

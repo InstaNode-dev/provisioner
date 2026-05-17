@@ -261,10 +261,12 @@ func (b *K8sBackend) Provision(ctx context.Context, token, tier string) (*Creden
 		connURL = fmt.Sprintf("nats://%s:%d", b.externalHost, nodePort)
 	}
 
-	prefix := token
-	if len(prefix) > 8 {
-		prefix = prefix[:8]
-	}
+	// Derive the SubjectPrefix from the FULL token — see subjident.go. The
+	// dedicated pod is the real isolation boundary here, but the pre-fix
+	// token[:8] truncation was the same token-truncation bug class, so it is
+	// fixed identically. The prefix is deterministic from the token, so the
+	// canonical derivation also resolves it for any future lifecycle lookup.
+	prefix := canonicalSubjectPrefix(token)
 
 	// Route records consumed by nats-proxy. Failure here does NOT fail the
 	// provision — the pod is functional over its NodePort, and customers using
@@ -291,7 +293,7 @@ func (b *K8sBackend) Provision(ctx context.Context, token, tier string) (*Creden
 	slog.Info("k8s.nats.provisioned", "namespace", ns, "node_port", nodePort, "tier", tier, "pvc_mi", sz.pvcMi, "public_host", b.publicHost)
 	return &Credentials{
 		URL:                connURL,
-		SubjectPrefix:      prefix + ".",
+		SubjectPrefix:      prefix,
 		ProviderResourceID: ns,
 	}, nil
 }

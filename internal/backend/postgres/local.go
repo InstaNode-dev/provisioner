@@ -54,8 +54,14 @@ func newLocalBackend(customersURL string) *LocalBackend {
 }
 
 // newLocalBackendMulti creates a LocalBackend that distributes provisions across
-// multiple shared Postgres clusters. adminURLs must be non-empty.
+// multiple shared Postgres clusters. An empty adminURLs slice would leave the
+// ClusterRouter with no clusters — every Pick / AdminURLForResource would then
+// have to fail soft — so it falls back to the single default customers URL,
+// matching newLocalBackend's behaviour.
 func newLocalBackendMulti(adminURLs []string) *LocalBackend {
+	if len(adminURLs) == 0 {
+		adminURLs = []string{defaultCustomersURL}
+	}
 	return &LocalBackend{router: newClusterRouter(adminURLs, 0)}
 }
 

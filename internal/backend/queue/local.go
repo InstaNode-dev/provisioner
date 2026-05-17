@@ -47,15 +47,17 @@ func (b *LocalBackend) Provision(ctx context.Context, token, tier string) (*Cred
 		return nil, fmt.Errorf("queue.local.Provision: NATS unhealthy (HTTP %d from %s)", resp.StatusCode, monitorURL)
 	}
 
-	prefix := token
-	if len(prefix) > 8 {
-		prefix = prefix[:8]
-	}
+	// SubjectPrefix is the ONLY tenant-isolation boundary on the shared NATS
+	// backend (NATS runs unauthenticated). Derive it from the FULL token — see
+	// subjident.go — so two tokens sharing an 8-hex-char prefix can never share
+	// a subject namespace. Pre-fix queues keep their token[:8] prefix; the
+	// legacy resolver in subjident.go covers them.
+	prefix := canonicalSubjectPrefix(token)
 
-	slog.Info("queue.local.provisioned", "token", token, "subject_prefix", prefix+".")
+	slog.Info("queue.local.provisioned", "token", token, "subject_prefix", prefix)
 	return &Credentials{
 		URL:           fmt.Sprintf("nats://%s:4222", b.natsHost),
-		SubjectPrefix: prefix + ".",
+		SubjectPrefix: prefix,
 	}, nil
 }
 

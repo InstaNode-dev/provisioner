@@ -522,7 +522,14 @@ func (b *K8sBackend) StorageBytes(ctx context.Context, token, providerResourceID
 	if err != nil {
 		return 0, fmt.Errorf("k8s redis.StorageBytes: INFO memory: %w", err)
 	}
-	return parseUsedMemory(info), nil
+	used, err := parseUsedMemory(info)
+	if err != nil {
+		// A malformed INFO body must not be reported as 0 bytes — that would
+		// silently under-report quota usage. Surface the error so the worker
+		// skips the tick (fail-open quota convention).
+		return 0, fmt.Errorf("k8s redis.StorageBytes: %w", err)
+	}
+	return used, nil
 }
 
 // Deprovision deletes the customer namespace (cascading GC of all resources).
@@ -655,7 +662,15 @@ func (b *K8sBackend) Regrade(ctx context.Context, token, providerResourceID stri
 	}
 	var currentBytes int64
 	if v, ok := vals["maxmemory"]; ok {
-		fmt.Sscanf(v, "%d", &currentBytes)
+		n, perr := fmt.Sscanf(v, "%d", &currentBytes)
+		if n != 1 || perr != nil {
+			// A non-integer maxmemory means we cannot tell whether the cap is
+			// already correct. Soft-skip rather than risk a spurious CONFIG SET
+			// (or, worse, treating it as 0 = unlimited).
+			slog.Warn("k8s.redis.Regrade: CONFIG GET maxmemory returned non-integer — soft skip",
+				"namespace", ns, "token", token, "raw_value", v, "error", perr)
+			return RegradeResult{Applied: false, SkipReason: "maxmemory value unparseable"}, nil
+		}
 	}
 
 	if currentBytes == targetBytes {
@@ -767,7 +782,14 @@ func (b *K8sBackend) regradeViaExec(ctx context.Context, ns, token string, targe
 		return RegradeResult{Applied: false, SkipReason: "exec fallback: CONFIG GET failed"}, nil
 	}
 
-	currentBytes := parseConfigGetMaxmemory(getOut.String())
+	currentBytes, err := parseConfigGetMaxmemory(getOut.String())
+	if err != nil {
+		// An unparseable CONFIG GET body must not be read as 0 = "unlimited" —
+		// that would silently skip the tier cap. Soft-skip this Regrade.
+		slog.Warn("k8s.redis.Regrade.exec: CONFIG GET maxmemory output unparseable — soft skip",
+			"namespace", ns, "token", token, "error", err)
+		return RegradeResult{Applied: false, SkipReason: "exec fallback: CONFIG GET output unparseable"}, nil
+	}
 
 	// Compute target bytes (0 = unlimited for team tier).
 	var targetBytes int64
@@ -843,17 +865,24 @@ func (b *K8sBackend) regradeViaExec(ctx context.Context, ns, token string, targe
 //	maxmemory
 //	<integer>
 //
-// Returns 0 if the output cannot be parsed (treated as "unlimited").
-func parseConfigGetMaxmemory(output string) int64 {
+// It returns an error when the "maxmemory" line is absent or its value does not
+// parse as an integer. A silent 0 here would read as "unlimited" and silently
+// skip the tier cap, so the caller must distinguish a genuine 0 from a parse
+// failure rather than guessing.
+func parseConfigGetMaxmemory(output string) (int64, error) {
 	lines := strings.Split(strings.TrimSpace(output), "\n")
 	for i, line := range lines {
 		if strings.TrimSpace(line) == "maxmemory" && i+1 < len(lines) {
+			raw := strings.TrimSpace(lines[i+1])
 			var v int64
-			fmt.Sscanf(strings.TrimSpace(lines[i+1]), "%d", &v)
-			return v
+			n, err := fmt.Sscanf(raw, "%d", &v)
+			if n != 1 || err != nil {
+				return 0, fmt.Errorf("parseConfigGetMaxmemory: maxmemory value %q is not an integer: %w", raw, err)
+			}
+			return v, nil
 		}
 	}
-	return 0
+	return 0, fmt.Errorf("parseConfigGetMaxmemory: no maxmemory line in output")
 }
 
 // --- private resource creators ---
@@ -1110,16 +1139,23 @@ func (b *K8sBackend) waitPodReady(ctx context.Context, ns, labelSelector string)
 	return fmt.Errorf("redis pod not ready after %s", redisK8sReadyTO)
 }
 
-// parseUsedMemory extracts used_memory from Redis INFO memory output.
-func parseUsedMemory(info string) int64 {
+// parseUsedMemory extracts used_memory from Redis INFO memory output. It
+// returns an error when the "used_memory:" line is absent or its value does not
+// parse as an integer — a silent 0 would under-report quota usage, so the
+// caller must not be left guessing whether 0 is genuine.
+func parseUsedMemory(info string) (int64, error) {
 	for _, line := range strings.Split(info, "\n") {
 		if strings.HasPrefix(line, "used_memory:") {
+			raw := strings.TrimSpace(strings.TrimPrefix(line, "used_memory:"))
 			var n int64
-			fmt.Sscanf(strings.TrimPrefix(line, "used_memory:"), "%d", &n)
-			return n
+			cnt, err := fmt.Sscanf(raw, "%d", &n)
+			if cnt != 1 || err != nil {
+				return 0, fmt.Errorf("parseUsedMemory: used_memory value %q is not an integer: %w", raw, err)
+			}
+			return n, nil
 		}
 	}
-	return 0
+	return 0, fmt.Errorf("parseUsedMemory: no used_memory line in INFO output")
 }
 
 func redisK8sRandHex(n int) (string, error) {

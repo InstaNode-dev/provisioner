@@ -111,6 +111,14 @@ func (r *ClusterRouter) Pick() (int, string, error) {
 // providerResourceID (format: "local:{index}"). Falls back to cluster 0 for
 // legacy resources that have an empty providerResourceID.
 func (r *ClusterRouter) AdminURLForResource(providerResourceID string) string {
+	// Guard the slice indexing — Pick() guards len==0 the same way. An empty
+	// adminURLs slice should be impossible (newLocalBackendMulti falls back to
+	// the default customers URL), but a panic here would crash every lifecycle
+	// RPC, so fail soft with "".
+	if len(r.adminURLs) == 0 {
+		slog.Error("cluster_router.AdminURLForResource: no clusters configured")
+		return ""
+	}
 	if providerResourceID == "" {
 		return r.adminURLs[0]
 	}

@@ -1,8 +1,11 @@
 package redis
 
 import (
+	"context"
 	"testing"
+	"time"
 
+	goredis "github.com/redis/go-redis/v9"
 	"instant.dev/provisioner/internal/poolident"
 )
 
@@ -101,5 +104,34 @@ func TestPoolClaimedRedisNamesDeriveFromPoolToken(t *testing.T) {
 	// from the request token — the normal path must be unchanged.
 	if got := aclUsername(poolident.NamingToken(realToken, "")); got != aclUsername(realToken) {
 		t.Errorf("live ACL user = %q, want %q (non-pool path must be unchanged)", got, aclUsername(realToken))
+	}
+}
+
+// TestStorageBytes_FailsOnConnError is the P2 regression guard: StorageBytes
+// used to swallow every MEMORY USAGE error with `continue`, so a connection
+// drop mid-scan produced a corrupt partial total reported as authoritative
+// storage. A Redis error must now surface as (0, err) — the quota fail-open
+// convention (the worker skips the tick) — never a silent partial sum.
+//
+// The client points at an unreachable address so every Redis op errors; the
+// function must return a non-nil error and 0 bytes, not (someNumber, nil).
+func TestStorageBytes_FailsOnConnError(t *testing.T) {
+	rdb := goredis.NewClient(&goredis.Options{
+		Addr:        "127.0.0.1:1", // nothing listens here
+		DialTimeout: 200 * time.Millisecond,
+		MaxRetries:  -1,
+	})
+	defer rdb.Close()
+	b := &LocalBackend{rdb: rdb}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	got, err := b.StorageBytes(ctx, "sometoken", "")
+	if err == nil {
+		t.Fatalf("StorageBytes against an unreachable Redis = (%d, nil); want a non-nil error", got)
+	}
+	if got != 0 {
+		t.Errorf("StorageBytes on error = %d bytes; want 0 (no corrupt partial total)", got)
 	}
 }

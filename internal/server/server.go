@@ -26,6 +26,7 @@ import (
 	"instant.dev/provisioner/internal/config"
 	"instant.dev/provisioner/internal/ctxkeys"
 	"instant.dev/provisioner/internal/pool"
+	"instant.dev/provisioner/internal/poolident"
 )
 
 // teamIDMetaKey is the gRPC metadata key used to pass the owning team UUID
@@ -282,9 +283,14 @@ func (s *Server) provisionPostgres(ctx context.Context, req *provisionerv1.Provi
 						"pool_id", item.ID, "tier", req.Tier,
 						"conn_limit", connLimit, "applied", res.Applied,
 						"applied_conn_limit", res.AppliedConnLimit)
+					// P0-2: the backing db_/usr_ are named from the pool token,
+					// not req.Token. Encode the pool token into provider_resource_id
+					// (alongside the existing "local:<N>" cluster segment) so
+					// Deprovision / StorageBytes / Regrade re-derive the real
+					// db_pool-<uuid> / usr_pool-<uuid> names and do not leak it.
 					return &provisionerv1.ProvisionResponse{
 						ConnectionUrl:      item.ConnectionURL,
-						ProviderResourceId: item.ProviderResourceID,
+						ProviderResourceId: poolident.Encode(item.ProviderResourceID, item.PoolToken),
 						DatabaseName:       item.DatabaseName,
 						Username:           item.Username,
 					}, nil
@@ -334,9 +340,14 @@ func (s *Server) provisionRedis(ctx context.Context, req *provisionerv1.Provisio
 			slog.Warn("server.provisionRedis: pool claim error (falling back to live)", "error", err)
 		} else if item != nil {
 			slog.Info("server.provisionRedis: pool hit", "pool_id", item.ID)
+			// P0-2: the ACL user (usr_pool-<uuid>) and keyspace (pool-<uuid>:*)
+			// are named from the pool token, not req.Token. Encode the pool token
+			// into provider_resource_id so Deprovision / StorageBytes re-derive
+			// the real names instead of no-op'ing on usr_<real-token>.
 			return &provisionerv1.ProvisionResponse{
-				ConnectionUrl: item.ConnectionURL,
-				KeyPrefix:     item.KeyPrefix,
+				ConnectionUrl:      item.ConnectionURL,
+				KeyPrefix:          item.KeyPrefix,
+				ProviderResourceId: poolident.Encode(item.ProviderResourceID, item.PoolToken),
 			}, nil
 		}
 	}
@@ -373,9 +384,14 @@ func (s *Server) provisionMongo(ctx context.Context, req *provisionerv1.Provisio
 			slog.Warn("server.provisionMongo: pool claim error (falling back to live)", "error", err)
 		} else if item != nil {
 			slog.Info("server.provisionMongo: pool hit", "pool_id", item.ID)
+			// P0-2: db_pool-<uuid> / usr_pool-<uuid> are named from the pool
+			// token, not req.Token. Encode the pool token into
+			// provider_resource_id so Deprovision / StorageBytes re-derive the
+			// real names instead of no-op'ing on db_<real-token>.
 			return &provisionerv1.ProvisionResponse{
-				ConnectionUrl: item.ConnectionURL,
-				DatabaseName:  item.DatabaseName,
+				ConnectionUrl:      item.ConnectionURL,
+				DatabaseName:       item.DatabaseName,
+				ProviderResourceId: poolident.Encode(item.ProviderResourceID, item.PoolToken),
 			}, nil
 		}
 	}
@@ -745,7 +761,12 @@ func (s *Server) regradeRedis(ctx context.Context, req *provisionerv1.RegradeReq
 	//   Case 3: prid is empty → fall back to req.Token to construct namespace.
 	// After this block, effectivePRID is either a full "instant-customer-*" namespace
 	// or empty (which K8sBackend.Regrade handles by constructing from token).
-	effectivePRID := req.ProviderResourceId
+	// P0-2: strip any pool-token marker first. A pool-claimed shared-Redis
+	// resource carries provider_resource_id="pooltok:pool-<uuid>"; without this
+	// the namespace construction below would treat the whole marker as a bare
+	// token. BasePRID leaves a genuine "instant-customer-*" namespace or
+	// "local:<N>" untouched.
+	effectivePRID := poolident.BasePRID(req.ProviderResourceId)
 	if !strings.HasPrefix(effectivePRID, redisK8sProviderIDPrefix) {
 		// Either empty or a bare token. Construct the namespace.
 		bareToken := effectivePRID

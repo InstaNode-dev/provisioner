@@ -3,6 +3,8 @@ package mongo
 import (
 	"strings"
 	"testing"
+
+	"instant.dev/provisioner/internal/poolident"
 )
 
 // TestMongoDBName_CanonicalStripsDashesNoTruncation is the core P0-5 regression
@@ -85,5 +87,34 @@ func TestLegacyMongoUserNames_MirrorsDBNames(t *testing.T) {
 		if !strings.HasPrefix(n, mongoUserPrefix) {
 			t.Fatalf("user name %q missing %q prefix", n, mongoUserPrefix)
 		}
+	}
+}
+
+// TestPoolClaimedMongoNamesDeriveFromPoolToken is the P0-2 regression guard for
+// the shared Mongo backend: a pool-claimed database/user are named from the
+// pool token. Deprovision/StorageBytes resolve the canonical naming token from
+// provider_resource_id (carrying a poolident marker); falling back to the
+// request token would drop/measure a db_<real-token> that was never created
+// and leak the real db_pool-<uuid> forever.
+func TestPoolClaimedMongoNamesDeriveFromPoolToken(t *testing.T) {
+	const (
+		realToken = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+		poolToken = "pool-12345678-90ab-cdef-1234-567890abcdef"
+	)
+	prid := poolident.Encode("", poolToken)
+
+	gotDB := mongoDBName(poolident.NamingToken(realToken, prid))
+	gotUser := mongoUserName(poolident.NamingToken(realToken, prid))
+
+	if want := mongoDBName(poolToken); gotDB != want {
+		t.Errorf("pool-claimed db name = %q, want %q (would leak otherwise)", gotDB, want)
+	}
+	if want := mongoUserName(poolToken); gotUser != want {
+		t.Errorf("pool-claimed user name = %q, want %q", gotUser, want)
+	}
+
+	// A live (non-pool) provision keeps deriving from the request token.
+	if got := mongoDBName(poolident.NamingToken(realToken, "")); got != mongoDBName(realToken) {
+		t.Errorf("live db name = %q, want %q (non-pool path must be unchanged)", got, mongoDBName(realToken))
 	}
 }

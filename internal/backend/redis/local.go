@@ -14,6 +14,8 @@ import (
 	"strings"
 
 	goredis "github.com/redis/go-redis/v9"
+
+	"instant.dev/provisioner/internal/poolident"
 )
 
 const defaultRedisAddr = "localhost:6379"
@@ -180,8 +182,13 @@ func publicHostPort() string {
 // StorageBytes returns the estimated memory used by keys with the token prefix.
 // Iterates with SCAN MATCH "{token}:*" COUNT 100, sums MEMORY USAGE for each key.
 // Capped at 1000 keys to avoid blocking the Redis event loop.
+//
+// P0-2: a pool-claimed cache's keyspace is "pool-<uuid>:*", not "<real-token>:*".
+// poolident.NamingToken resolves the canonical naming token from
+// provider_resource_id so quota is measured against the real keyspace instead
+// of silently reporting 0 bytes.
 func (b *LocalBackend) StorageBytes(ctx context.Context, token, providerResourceID string) (int64, error) {
-	prefix := token + ":*"
+	prefix := poolident.NamingToken(token, providerResourceID) + ":*"
 	const maxKeys = 1000
 
 	var (
@@ -233,9 +240,16 @@ func (b *LocalBackend) StorageBytes(ctx context.Context, token, providerResource
 // candidates are de-duplicated because, for short tokens, the two names are
 // identical (legacyACLUsername returns "" in that case).
 func (b *LocalBackend) Deprovision(ctx context.Context, token, providerResourceID string) error {
+	// P0-2: a pool-claimed cache's ACL user is "usr_pool-<uuid>" and its
+	// keyspace "pool-<uuid>:*" — both named from the pool token, not the
+	// request token. Resolve the canonical naming token from
+	// provider_resource_id so DELUSER/SCAN target the real infra and it does
+	// not leak forever.
+	namingToken := poolident.NamingToken(token, providerResourceID)
+
 	// Delete ACL user if it exists. Best-effort — ignore errors (user may not
 	// exist or ACL may be disabled).
-	for _, username := range []string{aclUsername(token), legacyACLUsername(token)} {
+	for _, username := range []string{aclUsername(namingToken), legacyACLUsername(namingToken)} {
 		if username == "" {
 			continue
 		}
@@ -243,7 +257,7 @@ func (b *LocalBackend) Deprovision(ctx context.Context, token, providerResourceI
 	}
 
 	// Flush all keys in the token's namespace using SCAN + DEL.
-	prefix := token + ":*"
+	prefix := namingToken + ":*"
 	var cursor uint64
 	for {
 		keys, nextCursor, err := b.rdb.Scan(ctx, cursor, prefix, 100).Result()

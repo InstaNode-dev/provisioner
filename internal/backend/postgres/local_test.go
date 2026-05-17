@@ -7,6 +7,8 @@ package postgres
 import (
 	"fmt"
 	"testing"
+
+	"instant.dev/provisioner/internal/poolident"
 )
 
 // TestConnLimitClause_Positive verifies the CONNECTION LIMIT clause is
@@ -75,4 +77,39 @@ func normalizeRegradeConnLimit(connLimit int) int {
 		return -1
 	}
 	return connLimit
+}
+
+// TestPoolClaimedNamesDeriveFromPoolToken is the P0-2 regression guard for the
+// shared Postgres backend: when a resource was claimed from the hot pool, its
+// database/role are named from the pool token, and provider_resource_id carries
+// a poolident marker. Deprovision/StorageBytes/Regrade MUST derive the name
+// from that marker, not from the request token — otherwise db_<real-token> is a
+// no-op and the real db_pool-<uuid> leaks forever.
+func TestPoolClaimedNamesDeriveFromPoolToken(t *testing.T) {
+	const (
+		realToken = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+		poolToken = "pool-12345678-90ab-cdef-1234-567890abcdef"
+	)
+	prid := poolident.Encode("local:0", poolToken)
+
+	// This is the exact expression Deprovision / StorageBytes / Regrade use.
+	gotDB := dbNamePrefix + poolident.NamingToken(realToken, prid)
+	gotUser := userNamePrefix + poolident.NamingToken(realToken, prid)
+
+	if wantDB := dbNamePrefix + poolToken; gotDB != wantDB {
+		t.Errorf("pool-claimed db name = %q, want %q (would leak otherwise)", gotDB, wantDB)
+	}
+	if wantUser := userNamePrefix + poolToken; gotUser != wantUser {
+		t.Errorf("pool-claimed user name = %q, want %q", gotUser, wantUser)
+	}
+	// The router must still see only the cluster segment.
+	if base := poolident.BasePRID(prid); base != "local:0" {
+		t.Errorf("BasePRID(%q) = %q, want local:0 — cluster routing would break", prid, base)
+	}
+
+	// A live (non-pool) provision keeps deriving from the request token.
+	liveDB := dbNamePrefix + poolident.NamingToken(realToken, "local:0")
+	if want := dbNamePrefix + realToken; liveDB != want {
+		t.Errorf("live db name = %q, want %q (non-pool path must be unchanged)", liveDB, want)
+	}
 }

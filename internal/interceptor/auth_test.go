@@ -83,21 +83,50 @@ func TestUnaryAuthInterceptor_NoMetadata(t *testing.T) {
 	assertUnauthenticated(t, err, called)
 }
 
+// TestUnaryAuthInterceptor_EmptySecret_AlwaysRejects is the P1-M fail-closed
+// regression guard. An interceptor constructed with an empty secret MUST reject
+// EVERY RPC — an empty configured secret must never be interpreted as "auth
+// disabled". Before this fix an empty token (vals[0] == "") matched an empty
+// secret ("") via `==` and the RPC was served unauthenticated.
 func TestUnaryAuthInterceptor_EmptySecret_AlwaysRejects(t *testing.T) {
-	// When configured with an empty secret, even matching empty strings should reject
-	// (defense against misconfigured deployments).
 	inter := interceptor.UnaryAuthInterceptor("")
-	md := metadata.Pairs("x-instant-provisioner-token", "")
-	ctx := metadata.NewIncomingContext(context.Background(), md)
 
-	var called bool
-	_, err := inter(ctx, nil, nil, fakeHandler(&called))
-	// An empty token sent with an empty configured secret would match — this is
-	// technically valid but let's verify the behaviour is consistent.
-	// If it passes, the handler is called; if not, it's unauthenticated. Either
-	// is acceptable — what matters is the test documents the actual behaviour.
-	_ = err
-	_ = called
+	// Case 1: the old bypass — empty token vs empty secret.
+	t.Run("empty token does not bypass", func(t *testing.T) {
+		md := metadata.Pairs("x-instant-provisioner-token", "")
+		ctx := metadata.NewIncomingContext(context.Background(), md)
+		var called bool
+		_, err := inter(ctx, nil, nil, fakeHandler(&called))
+		assertUnauthenticated(t, err, called)
+	})
+
+	// Case 2: any token at all is rejected when the server is misconfigured.
+	t.Run("non-empty token still rejected", func(t *testing.T) {
+		md := metadata.Pairs("x-instant-provisioner-token", "anything")
+		ctx := metadata.NewIncomingContext(context.Background(), md)
+		var called bool
+		_, err := inter(ctx, nil, nil, fakeHandler(&called))
+		assertUnauthenticated(t, err, called)
+	})
+
+	// Case 3: no metadata at all is rejected when the server is misconfigured.
+	t.Run("no metadata still rejected", func(t *testing.T) {
+		var called bool
+		_, err := inter(context.Background(), nil, nil, fakeHandler(&called))
+		assertUnauthenticated(t, err, called)
+	})
+}
+
+// TestValidateSecret is the P1-M startup fail-closed guard. main.go calls
+// ValidateSecret and aborts on a non-nil error so the provisioner refuses to
+// boot with auth disabled.
+func TestValidateSecret(t *testing.T) {
+	if err := interceptor.ValidateSecret(""); err == nil {
+		t.Fatal("ValidateSecret(\"\") must return an error — empty PROVISIONER_SECRET must fail closed")
+	}
+	if err := interceptor.ValidateSecret("super-secret-token"); err != nil {
+		t.Fatalf("ValidateSecret with a non-empty secret should succeed, got %v", err)
+	}
 }
 
 func assertUnauthenticated(t *testing.T, err error, handlerCalled bool) {

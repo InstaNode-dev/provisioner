@@ -257,12 +257,45 @@ func (s *Server) provisionPostgres(ctx context.Context, req *provisionerv1.Provi
 			slog.Warn("server.provisionPostgres: pool claim error (falling back to live)", "error", err)
 		} else if item != nil {
 			slog.Info("server.provisionPostgres: pool hit", "pool_id", item.ID)
-			return &provisionerv1.ProvisionResponse{
-				ConnectionUrl:      item.ConnectionURL,
-				ProviderResourceId: item.ProviderResourceID,
-				DatabaseName:       item.DatabaseName,
-				Username:           item.Username,
-			}, nil
+
+			// P1-A: pool items are pre-provisioned with connLimit=-1 (unlimited).
+			// The pool-claim path used to return the item verbatim, so every
+			// anonymous (and any pool-hit paid-tier) Postgres role had NO
+			// connection cap — the advertised `connections` limit was a false
+			// promise. Apply the claiming tier's CONNECTION LIMIT synchronously
+			// here via the same ALTER ROLE path RegradeResource uses, so we do
+			// not rely on the async entitlement reconciler catching up later.
+			//
+			// The pool item's role name is "usr_<pool-token>"; postgres.Regrade
+			// reconstructs the role from the token, so we recover the token by
+			// stripping the well-known prefix.
+			if poolToken := strings.TrimPrefix(item.Username, poolPostgresUserPrefix); poolToken != item.Username {
+				res, rerr := s.postgresBackend.Regrade(ctx, poolToken, item.ProviderResourceID, connLimit)
+				if rerr != nil {
+					// Fail closed: a pool item we cannot cap must not be handed
+					// out as if it were capped. Fall through to live provisioning,
+					// which applies the cap at CREATE USER time.
+					slog.Warn("server.provisionPostgres: pool item connection-limit regrade failed (falling back to live)",
+						"pool_id", item.ID, "tier", req.Tier, "conn_limit", connLimit, "error", rerr)
+				} else {
+					slog.Info("server.provisionPostgres: pool item connection limit applied",
+						"pool_id", item.ID, "tier", req.Tier,
+						"conn_limit", connLimit, "applied", res.Applied,
+						"applied_conn_limit", res.AppliedConnLimit)
+					return &provisionerv1.ProvisionResponse{
+						ConnectionUrl:      item.ConnectionURL,
+						ProviderResourceId: item.ProviderResourceID,
+						DatabaseName:       item.DatabaseName,
+						Username:           item.Username,
+					}, nil
+				}
+			} else {
+				// Username did not carry the expected prefix — we cannot derive
+				// the token to target the ALTER ROLE. Fall back to live provision
+				// rather than hand out an uncapped role.
+				slog.Warn("server.provisionPostgres: pool item username missing expected prefix — cannot apply connection limit, falling back to live",
+					"pool_id", item.ID, "username", item.Username)
+			}
 		}
 	}
 
@@ -598,6 +631,13 @@ var regradeConnLimits = plans.Default()
 // keeps the dependency clean; both values must stay in sync with k8s.go.
 const redisK8sProviderIDPrefix = "instant-customer-"
 
+// poolPostgresUserPrefix is the role-name prefix the shared Postgres backend
+// applies on Provision ("usr_" + token). The pool stores the role name as
+// Item.Username; provisionPostgres strips this prefix to recover the pool
+// token so it can target the per-tier ALTER ROLE CONNECTION LIMIT (P1-A).
+// Must stay in sync with postgres/local.go's `username := "usr_" + token`.
+const poolPostgresUserPrefix = "usr_"
+
 // RegradeResource re-applies the tier's infrastructure cap to an
 // already-provisioned resource. It exists because a plan upgrade does not, on
 // its own, re-apply the higher cap to the live infrastructure — the resource
@@ -605,7 +645,7 @@ const redisK8sProviderIDPrefix = "instant-customer-"
 //
 // Supported resource types:
 //   - POSTGRES: re-applies CONNECTION LIMIT on the Postgres role.
-//   - REDIS (k8s-backed only): re-applies maxmemory + allkeys-lru policy via
+//   - REDIS (k8s-backed only): re-applies maxmemory + noeviction policy via
 //     CONFIG SET. Shared-backend Redis (no per-tenant cap lever) returns
 //     {applied:false} with a descriptive skip_reason.
 //

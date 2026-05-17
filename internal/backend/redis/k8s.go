@@ -73,6 +73,16 @@ const (
 	redisK8sReadyTO      = 3 * time.Minute
 	redisK8sReadyPoll    = 3 * time.Second
 
+	// redisMaxmemoryPolicyCapped is the maxmemory-policy for capped (non-unlimited)
+	// dedicated Redis tiers. "noeviction" makes writes fail loudly with an OOM
+	// error at the memory cap so the agent/customer sees it and can upgrade —
+	// instead of "allkeys-lru" silently evicting the customer's oldest keys.
+	// Silent eviction also contradicts --appendonly yes (durability). See P1-C.
+	redisMaxmemoryPolicyCapped = "noeviction"
+	// redisMaxmemoryPolicyUnlimited is the policy for unlimited tiers (team):
+	// no cap, so eviction never triggers; "noeviction" is Redis's default.
+	redisMaxmemoryPolicyUnlimited = "noeviction"
+
 	// redisK8sOwnerTeamLabel is applied to dedicated customer namespaces.
 	// Mirrors the constant in postgres/k8s.go — must stay in sync.
 	// Pentest fix: 2026-05-16.
@@ -91,9 +101,10 @@ const (
 //
 // maxmemoryMB is the Redis --maxmemory flag value in MB. A value of -1 means
 // unlimited (the flag is omitted entirely). This enforces the per-resource memory
-// limit advertised in plans.yaml at the Redis level. allkeys-lru eviction is used
-// so Redis behaves as a cache (evicts old keys) rather than returning write errors
-// when full. Values mirror plans.yaml redis_memory_mb:
+// limit advertised in plans.yaml at the Redis level. The noeviction policy is used
+// (see redisMaxmemoryPolicyCapped) so writes fail loudly with an OOM error at the
+// cap rather than silently evicting customer data. Values mirror plans.yaml
+// redis_memory_mb:
 //
 //	anonymous: 5 MB, hobby: 50 MB, pro: 512 MB, growth: 1024 MB, team: unlimited (-1)
 type tierSizing struct {
@@ -108,7 +119,7 @@ type tierSizing struct {
 	maxClients int
 	// maxmemoryMB is the Redis --maxmemory limit in MB applied at pod start.
 	// -1 means unlimited (flag omitted). Mirrors plans.yaml redis_memory_mb.
-	// allkeys-lru eviction policy is applied alongside this limit.
+	// The noeviction maxmemory-policy is applied alongside this limit (P1-C).
 	maxmemoryMB int
 }
 
@@ -525,8 +536,9 @@ type RegradeResult struct {
 // Regrade connects to the dedicated Redis pod for this resource and ensures
 // its maxmemory matches the tier cap encoded in targetMaxmemoryMB:
 //
-//   - targetMaxmemoryMB > 0  → set maxmemory to that many MB + allkeys-lru policy,
-//     then CONFIG REWRITE so the cap survives a pod restart.
+//   - targetMaxmemoryMB > 0  → set maxmemory to that many MB + noeviction policy
+//     (P1-C: writes fail loudly at the cap, no silent eviction), then CONFIG
+//     REWRITE so the cap survives a pod restart.
 //   - targetMaxmemoryMB <= 0 → unlimited tier (team/growth): set maxmemory to 0
 //     (Redis "no cap") + CONFIG REWRITE so it explicitly overrides any leftover cap.
 //
@@ -622,13 +634,14 @@ func (b *K8sBackend) Regrade(ctx context.Context, token, providerResourceID stri
 		return RegradeResult{Applied: false}, fmt.Errorf("k8s redis.Regrade: CONFIG SET maxmemory: %w", err)
 	}
 
-	// Apply allkeys-lru policy for capped tiers so Redis evicts old keys
-	// gracefully instead of returning write errors when full. For unlimited
-	// tiers (targetBytes == 0) set the policy to noeviction (the Redis
-	// default) to avoid accidental eviction of important data.
-	policy := "noeviction"
+	// Apply noeviction policy for capped tiers so writes fail loudly with an OOM
+	// error at the cap (the customer sees it and can upgrade) instead of
+	// allkeys-lru silently evicting their oldest keys. Unlimited tiers
+	// (targetBytes == 0) also use noeviction — with no cap, eviction never
+	// triggers anyway. See P1-C.
+	policy := redisMaxmemoryPolicyUnlimited
 	if targetBytes > 0 {
-		policy = "allkeys-lru"
+		policy = redisMaxmemoryPolicyCapped
 	}
 	if err := rdb.ConfigSet(ctx, "maxmemory-policy", policy).Err(); err != nil {
 		// Non-fatal — the cap is applied; policy mismatch only affects eviction
@@ -743,9 +756,11 @@ func (b *K8sBackend) regradeViaExec(ctx context.Context, ns, token string, targe
 	}
 
 	// ── Step 3: CONFIG SET maxmemory-policy ──────────────────────────────
-	policy := "noeviction"
+	// Capped tiers use noeviction so writes fail loudly at the cap rather than
+	// silently evicting customer keys (see P1-C).
+	policy := redisMaxmemoryPolicyUnlimited
 	if targetBytes > 0 {
-		policy = "allkeys-lru"
+		policy = redisMaxmemoryPolicyCapped
 	}
 	// policy is one of two known constants, safe to interpolate.
 	setPolicyCmd := []string{"sh", "-c",
@@ -945,9 +960,11 @@ func (b *K8sBackend) applyDeployment(ctx context.Context, ns string, sz tierSizi
 						// Tier-specific maxclients and maxmemory passed at start.
 						// redis-server respects these flags before any client can connect,
 						// so they enforce the caps without needing a post-start CONFIG SET.
-						// allkeys-lru eviction means Redis behaves as a cache (evicts old
-						// keys) rather than returning write errors when full — appropriate
-						// because this platform positions Redis as a cache service.
+						// Capped tiers use noeviction (redisMaxmemoryPolicyCapped): at the
+						// memory cap, writes fail loudly with an OOM error so the customer
+						// sees it and can upgrade — rather than allkeys-lru silently
+						// evicting their oldest keys (which also contradicts --appendonly
+						// yes durability). See P1-C.
 						Command: func() []string {
 							cmd := []string{
 								"redis-server",
@@ -963,7 +980,7 @@ func (b *K8sBackend) applyDeployment(ctx context.Context, ns string, sz tierSizi
 							if sz.maxmemoryMB > 0 {
 								cmd = append(cmd,
 									"--maxmemory", fmt.Sprintf("%dmb", sz.maxmemoryMB),
-									"--maxmemory-policy", "allkeys-lru",
+									"--maxmemory-policy", redisMaxmemoryPolicyCapped,
 								)
 							}
 							return cmd

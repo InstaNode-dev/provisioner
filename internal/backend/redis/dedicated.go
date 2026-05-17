@@ -102,9 +102,14 @@ func (p *DedicatedProvider) deprovisionUpstash(ctx context.Context, token, provi
 
 // --- Local admin path (dev/test) ---
 
-// provisionLocal creates an ACL user on the dedicated Redis with full keyspace access.
-// Unlike the shared backend (which restricts to {token}:* prefix), a dedicated user
-// gets access to ~* (all keys) because the entire Redis instance is theirs.
+// provisionLocal creates an ACL user on the dedicated Redis with whole-keyspace
+// access. Unlike the shared backend (which restricts to {token}:* prefix), a
+// dedicated user gets ~* (all keys) because the entire Redis instance is theirs.
+//
+// Command grants are still scoped: aclAllowlist (the shared backend's command
+// allowlist) replaces "+@all". "+@all" grants FLUSHALL, CONFIG SET (defeats the
+// tier memory cap), MONITOR and DEBUG — dangerous even on a "dedicated" instance,
+// which in local dev is in fact shared (see deprovisionLocal). See P1-B.
 func (p *DedicatedProvider) provisionLocal(ctx context.Context, token, tier string) (*Credentials, error) {
 	short := token
 	if len(short) > 8 {
@@ -118,14 +123,18 @@ func (p *DedicatedProvider) provisionLocal(ctx context.Context, token, tier stri
 	}
 	password := hex.EncodeToString(pwBytes)
 
-	// Full keyspace access — no prefix restriction for dedicated instances.
-	aclCmd := p.rdb.Do(ctx, "ACL", "SETUSER", username,
+	// Whole-keyspace key/channel access (~* &*) — the instance is theirs — but
+	// the command set is scoped via aclAllowlist, dropping FLUSHALL/FLUSHDB/
+	// CONFIG/MONITOR/DEBUG/ACL/KEYS. Reuses the shared backend's allowlist so
+	// the two paths can never drift.
+	aclArgs := []interface{}{"ACL", "SETUSER", username,
 		"on",
-		">"+password,
-		"~*",    // all keys
-		"&*",    // all channels
-		"+@all", // all commands
-	)
+		">" + password,
+		"~*", // all keys — dedicated instance
+		"&*", // all channels
+	}
+	aclArgs = append(aclArgs, aclAllowlist...)
+	aclCmd := p.rdb.Do(ctx, aclArgs...)
 	if aclCmd.Err() != nil {
 		// ACL unavailable — fall back to returning the admin URL directly.
 		// This degrades gracefully on older Redis versions.

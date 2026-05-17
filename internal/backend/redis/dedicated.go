@@ -75,11 +75,16 @@ func (p *DedicatedProvider) StorageBytes(ctx context.Context, token, providerRes
 }
 
 // Deprovision tears down the dedicated Redis instance.
+//
+// providerResourceID is the canonical ACL username stamped at provision time
+// (see dedident.go). Deprovision deletes that username and ALSO probes the
+// legacy ded_<token[:8]> form so an ACL user created before the token-
+// truncation fix shipped is still cleaned up.
 func (p *DedicatedProvider) Deprovision(ctx context.Context, token, providerResourceID string) error {
 	if p.upstashAPIKey != "" {
 		return p.deprovisionUpstash(ctx, token, providerResourceID)
 	}
-	return p.deprovisionLocal(ctx, token)
+	return p.deprovisionLocal(ctx, token, providerResourceID)
 }
 
 // --- Upstash path (stubbed) ---
@@ -111,11 +116,13 @@ func (p *DedicatedProvider) deprovisionUpstash(ctx context.Context, token, provi
 // tier memory cap), MONITOR and DEBUG — dangerous even on a "dedicated" instance,
 // which in local dev is in fact shared (see deprovisionLocal). See P1-B.
 func (p *DedicatedProvider) provisionLocal(ctx context.Context, token, tier string) (*Credentials, error) {
-	short := token
-	if len(short) > 8 {
-		short = short[:8]
-	}
-	username := fmt.Sprintf("ded_%s", short)
+	// Token-truncation fix (P1, BUGHUNT-REPORT-2026-05-17-round2): the ACL
+	// username uses the FULL token via dedicatedACLUsername — never the old
+	// ded_<token[:8]> truncation, which let two tokens sharing 8 hex chars
+	// collide on one ACL user. The canonical username is also returned as
+	// ProviderResourceID so every lifecycle RPC resolves it from the stored
+	// value instead of re-deriving. See dedident.go.
+	username := dedicatedACLUsername(token)
 
 	pwBytes := make([]byte, 16)
 	if _, err := rand.Read(pwBytes); err != nil {
@@ -141,6 +148,9 @@ func (p *DedicatedProvider) provisionLocal(ctx context.Context, token, tier stri
 		slog.Warn("cache.dedicated.provisionLocal: ACL SETUSER failed, returning admin URL",
 			"token", token, "error", aclCmd.Err())
 		url := fmt.Sprintf("redis://%s/0", p.redisHost)
+		// No ACL user was created — there is no per-resource identifier to
+		// persist, so ProviderResourceID stays empty (lifecycle RPCs then
+		// fall back to the canonical full-token derivation).
 		return &Credentials{
 			URL:       url,
 			KeyPrefix: "", // no prefix restriction
@@ -156,6 +166,9 @@ func (p *DedicatedProvider) provisionLocal(ctx context.Context, token, tier stri
 	return &Credentials{
 		URL:       url,
 		KeyPrefix: "", // no prefix restriction for dedicated
+		// Persist the EXACT ACL username created above so Deprovision /
+		// StorageBytes resolve it from the stored value, never re-derive it.
+		ProviderResourceID: username,
 	}, nil
 }
 
@@ -183,19 +196,32 @@ func (p *DedicatedProvider) localStorageBytes(ctx context.Context, token string)
 // It does NOT flush the database — that would disrupt other users on a shared
 // dedicated Redis in local dev.  For a real dedicated instance the entire
 // instance would be destroyed instead.
-func (p *DedicatedProvider) deprovisionLocal(ctx context.Context, token string) error {
-	short := token
-	if len(short) > 8 {
-		short = short[:8]
-	}
-	username := fmt.Sprintf("ded_%s", short)
+//
+// It deletes the canonical username (resolved from providerResourceID, the
+// value stamped at provision time) AND probes the legacy ded_<token[:8]> form
+// so an ACL user created before the token-truncation fix is still cleaned up.
+// DELUSER is idempotent — deleting a non-existent user is a Redis no-op — so
+// probing both names is always safe.
+func (p *DedicatedProvider) deprovisionLocal(ctx context.Context, token, providerResourceID string) error {
+	canonical := resolveDedicatedACLUsername(token, providerResourceID)
+	legacy := legacyDedicatedACLUsername(token)
 
-	if err := p.rdb.Do(ctx, "ACL", "DELUSER", username).Err(); err != nil {
-		// Best-effort — user may not exist.
-		slog.Warn("cache.dedicated.deprovisionLocal: ACL DELUSER (non-fatal)",
-			"token", token, "user", username, "error", err)
+	// Probe the canonical name, plus the legacy 8-char name when it is
+	// non-empty and distinct. DELUSER is idempotent (non-existent user → Redis
+	// no-op), so probing both is always safe.
+	probes := []string{canonical}
+	if legacy != "" && legacy != canonical {
+		probes = append(probes, legacy)
 	}
-	slog.Info("cache.dedicated.deprovisionLocal: deprovisioned", "token", token, "user", username)
+	for _, username := range probes {
+		if err := p.rdb.Do(ctx, "ACL", "DELUSER", username).Err(); err != nil {
+			// Best-effort — user may not exist.
+			slog.Warn("cache.dedicated.deprovisionLocal: ACL DELUSER (non-fatal)",
+				"token", token, "user", username, "error", err)
+		}
+	}
+	slog.Info("cache.dedicated.deprovisionLocal: deprovisioned",
+		"token", token, "user", canonical)
 	return nil
 }
 

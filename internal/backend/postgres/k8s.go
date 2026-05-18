@@ -213,13 +213,16 @@ func (b *K8sBackend) EnableRouteRegistry(rdb *goredis.Client, prefix string) {
 // by the entitlement reconciler on the next tick.
 func (b *K8sBackend) Provision(ctx context.Context, token, tier string, connLimit int) (*Credentials, error) {
 	ns := k8sNsPrefix + token
-	dbName := "db_" + k8sShort(token)
+	// Canonical, collision-free identifiers — full dash-stripped token, never
+	// truncated. See naming.go (P1-W5-05). The pre-fix k8sShort 12-char
+	// truncation collided any two tokens sharing 12 hex digits onto one DB+role.
+	dbName := k8sDBName(token)
 	adminUser := "pgadmin"
 	adminPass, err := k8sRandHex(16)
 	if err != nil {
 		return nil, fmt.Errorf("k8s postgres: rand admin pass: %w", err)
 	}
-	appUser := "usr_" + k8sShort(token)
+	appUser := k8sRoleName(token)
 	appPass, err := k8sRandHex(16)
 	if err != nil {
 		return nil, fmt.Errorf("k8s postgres: rand app pass: %w", err)
@@ -316,7 +319,6 @@ func (b *K8sBackend) StorageBytes(ctx context.Context, token, providerResourceID
 	if ns == "" {
 		ns = k8sNsPrefix + token
 	}
-	dbName := "db_" + k8sShort(token)
 
 	// Fail-soft when the customer namespace exists but is missing the
 	// modern postgres-admin Secret or postgres Service — these are
@@ -352,11 +354,22 @@ func (b *K8sBackend) StorageBytes(ctx context.Context, token, providerResourceID
 	}
 	defer conn.Close(ctx)
 
-	var bytes int64
-	if err := conn.QueryRow(ctx, "SELECT pg_database_size($1)", dbName).Scan(&bytes); err != nil {
-		return 0, fmt.Errorf("k8s postgres.StorageBytes: query: %w", err)
+	// Try the canonical DB name first, then the legacy 12-char-truncated name.
+	// A pod provisioned before the P1-W5-05 naming fix holds its data under the
+	// legacy db_<token[:12]> name; pg_database_size on the canonical-only name
+	// would error ("database does not exist") and silently un-enforce quota.
+	var lastErr error
+	for _, dbName := range legacyK8sDBNames(token) {
+		var bytes int64
+		if err := conn.QueryRow(ctx, "SELECT pg_database_size($1)", dbName).Scan(&bytes); err != nil {
+			lastErr = err
+			slog.Debug("k8s postgres.StorageBytes: pg_database_size miss for candidate",
+				"namespace", ns, "db", dbName, "error", err)
+			continue
+		}
+		return bytes, nil
 	}
-	return bytes, nil
+	return 0, fmt.Errorf("k8s postgres.StorageBytes: query (all candidates): %w", lastErr)
 }
 
 // Deprovision deletes the customer namespace. k8s GC cascades to all owned resources
@@ -379,11 +392,16 @@ func (b *K8sBackend) Deprovision(ctx context.Context, token, providerResourceID 
 		slog.Info("k8s.postgres.deprovision.namespace_already_gone", "namespace", ns)
 	}
 	if b.rdb != nil {
-		dbName := "db_" + k8sShort(token)
+		// Delete route keys for the canonical name AND the legacy 12-char
+		// scheme — the pod was registered under whichever scheme was current
+		// when it was provisioned, and a stale route key would leave the
+		// pg-proxy forwarding to a deleted pod.
 		delCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
-		if err := b.rdb.Del(delCtx, b.routePrefix+dbName).Err(); err != nil {
-			slog.Warn("k8s.postgres.route_unregister_failed", "db", dbName, "error", err)
+		for _, dbName := range legacyK8sDBNames(token) {
+			if err := b.rdb.Del(delCtx, b.routePrefix+dbName).Err(); err != nil {
+				slog.Warn("k8s.postgres.route_unregister_failed", "db", dbName, "error", err)
+			}
 		}
 	}
 	slog.Info("k8s.postgres.deprovisioned", "namespace", ns)
@@ -427,8 +445,6 @@ func (b *K8sBackend) Regrade(ctx context.Context, token, providerResourceID stri
 
 	adminUser := string(secret.Data["POSTGRES_USER"])
 	adminPass := string(secret.Data["POSTGRES_PASSWORD"])
-	// The app role is derived from the token exactly as in Provision.
-	appUser := "usr_" + k8sShort(token)
 
 	dsn := fmt.Sprintf("postgres://%s:%s@%s:5432/postgres?sslmode=disable", adminUser, adminPass, svc.Spec.ClusterIP)
 	conn, err := pgx.Connect(ctx, dsn)
@@ -439,11 +455,26 @@ func (b *K8sBackend) Regrade(ctx context.Context, token, providerResourceID stri
 
 	// ALTER ROLE re-applies the tier's connection cap. -1 = unlimited (passed
 	// through verbatim). Identifier quoted with %q, mirroring the CREATE USER
-	// path in initDatabase.
-	stmt := fmt.Sprintf(`ALTER ROLE %q CONNECTION LIMIT %d`, appUser, connLimit)
-	if _, err := conn.Exec(ctx, stmt); err != nil {
+	// path in initDatabase. The role is resolved by trying the canonical
+	// full-token name first, then the legacy 12-char-truncated name — a pod
+	// provisioned before the P1-W5-05 naming fix holds its role under the
+	// legacy usr_<token[:12]> name, and ALTER ROLE on the canonical-only name
+	// would error and silently leave the old connection cap in place.
+	var lastErr error
+	for _, appUser := range legacyK8sRoleNames(token) {
+		stmt := fmt.Sprintf(`ALTER ROLE %q CONNECTION LIMIT %d`, appUser, connLimit)
+		if _, err := conn.Exec(ctx, stmt); err != nil {
+			lastErr = err
+			slog.Debug("k8s postgres.Regrade: alter role miss for candidate",
+				"namespace", ns, "role", appUser, "error", err)
+			continue
+		}
+		lastErr = nil
+		break
+	}
+	if lastErr != nil {
 		// Role missing on a live pod is non-actionable too — treat as skip.
-		return RegradeResult{Applied: false, SkipReason: fmt.Sprintf("resource not reachable: alter role: %v", err)}, nil
+		return RegradeResult{Applied: false, SkipReason: fmt.Sprintf("resource not reachable: alter role (all candidates): %v", lastErr)}, nil
 	}
 
 	return RegradeResult{Applied: true, AppliedConnLimit: connLimit}, nil
@@ -737,16 +768,6 @@ func (b *K8sBackend) initDatabase(ctx context.Context, adminDSN, dbName, appUser
 }
 
 // --- helpers (package-private, not exported) ---
-
-// k8sShort strips dashes from a UUID-like token and returns the first 12 hex chars.
-// Used for database names and usernames where length matters (postgres identifier limit: 63).
-func k8sShort(token string) string {
-	s := strings.ReplaceAll(token, "-", "")
-	if len(s) > 12 {
-		return s[:12]
-	}
-	return s
-}
 
 // k8sRandHex returns a cryptographically random hex string of length n*2.
 func k8sRandHex(n int) (string, error) {

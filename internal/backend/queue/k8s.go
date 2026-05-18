@@ -247,7 +247,22 @@ func (b *K8sBackend) Provision(ctx context.Context, token, tier string) (*Creden
 		return nil, rollback("wait ready", err)
 	}
 
+	// P2 (W3 T2): a NodePort Service's .spec.ports[].nodePort is allocated by
+	// the apiserver. The Create response usually carries it, but not always —
+	// re-Get the Service once if it is still 0 so the legacy fallback URL never
+	// embeds a dead "nats://host:0". This only matters when publicHost is unset
+	// (the nats-proxy path does not use the NodePort at all).
 	nodePort := int(svc.Spec.Ports[0].NodePort)
+	if nodePort == 0 && b.publicHost == "" {
+		if fresh, getErr := b.cs.CoreV1().Services(ns).Get(provCtx, "nats", metav1.GetOptions{}); getErr != nil {
+			slog.Warn("k8s.nats.nodeport_refetch_failed", "namespace", ns, "error", getErr)
+		} else if len(fresh.Spec.Ports) > 0 {
+			nodePort = int(fresh.Spec.Ports[0].NodePort)
+		}
+		if nodePort == 0 {
+			return nil, rollback("nodeport allocation", fmt.Errorf("service %s/nats has no allocated NodePort", ns))
+		}
+	}
 
 	// Customer-facing URL.
 	//   With publicHost set (typical prod): nats://<token>@nats.instanode.dev:4222

@@ -31,7 +31,13 @@ type ClusterRouter struct {
 	maxDBs    []int // capacity cap per cluster (defaults to 400 each)
 
 	mu     sync.RWMutex
-	counts []int // current db_{token} database count per cluster
+	counts []int // current db_{token} database count per cluster (last poll)
+	// inflight tracks provisions Pick'd but not yet reflected in a poll. The
+	// poll cadence is 60s, so without this a burst of concurrent provisions
+	// all see the same stale count and stampede one cluster past maxDBs.
+	// Pick increments the chosen cluster's inflight count; ReleasePick
+	// decrements it once the provision (success or failure) settles.
+	inflight []int
 
 	done chan struct{}
 }
@@ -50,6 +56,7 @@ func newClusterRouter(adminURLs []string, maxPerCluster int) *ClusterRouter {
 		adminURLs: adminURLs,
 		maxDBs:    caps,
 		counts:    make([]int, len(adminURLs)),
+		inflight:  make([]int, len(adminURLs)),
 		done:      make(chan struct{}),
 	}
 }
@@ -71,9 +78,17 @@ func (r *ClusterRouter) Shutdown() {
 
 // Pick returns the index and admin DSN of the cluster with the most available
 // capacity. Returns an error if all clusters are at capacity.
+//
+// Headroom is computed against the last poll count PLUS the in-flight count of
+// provisions already routed to that cluster but not yet visible to a poll.
+// Pick increments the chosen cluster's in-flight count; the caller MUST call
+// ReleasePick with the returned index once the provision settles (success or
+// failure) so the in-flight count does not leak. Without this, a burst of
+// concurrent Picks between two 60s polls would all see the same stale count
+// and stampede one cluster past maxDBs.
 func (r *ClusterRouter) Pick() (int, string, error) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
 	if len(r.adminURLs) == 0 {
 		return 0, "", fmt.Errorf("cluster_router: no clusters configured")
@@ -85,7 +100,7 @@ func (r *ClusterRouter) Pick() (int, string, error) {
 		if url == "" {
 			continue
 		}
-		headroom := r.maxDBs[i] - r.counts[i]
+		headroom := r.maxDBs[i] - r.counts[i] - r.inflight[i]
 		if headroom > bestHeadroom {
 			bestHeadroom = headroom
 			best = i
@@ -95,16 +110,40 @@ func (r *ClusterRouter) Pick() (int, string, error) {
 	if best < 0 || bestHeadroom <= 0 {
 		// All clusters at or over capacity — still pick the best one and let
 		// the provision attempt proceed; failing here would block all writes.
+		// The in-flight count is still incremented so a stampede past capacity
+		// is at least visible to subsequent Picks.
 		slog.Warn("cluster_router.Pick: all clusters at capacity — falling back to index 0")
-		return 0, r.adminURLs[0], nil
+		if best < 0 {
+			best = 0
+		}
+		r.inflight[best]++
+		return best, r.adminURLs[best], nil
 	}
 
+	r.inflight[best]++
 	slog.Debug("cluster_router.Pick",
 		"cluster_index", best,
 		"headroom", bestHeadroom,
 		"total_clusters", len(r.adminURLs),
 	)
 	return best, r.adminURLs[best], nil
+}
+
+// ReleasePick decrements the in-flight provision count for the cluster at
+// clusterIndex. It MUST be called exactly once for every Pick — typically via
+// defer immediately after a successful Pick — once the provision attempt has
+// settled, whether it succeeded or failed. The count is clamped at zero so a
+// double-release or a release after a poll already absorbed the provision can
+// never drive it negative.
+func (r *ClusterRouter) ReleasePick(clusterIndex int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if clusterIndex < 0 || clusterIndex >= len(r.inflight) {
+		return
+	}
+	if r.inflight[clusterIndex] > 0 {
+		r.inflight[clusterIndex]--
+	}
 }
 
 // AdminURLForResource returns the admin DSN for an existing resource given its

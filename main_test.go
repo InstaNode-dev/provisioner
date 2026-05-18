@@ -27,7 +27,7 @@ func TestHealthzReturnsCommitID(t *testing.T) {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 
-	server.HealthzHandler().ServeHTTP(rec, req)
+	server.HealthzHandler(nil).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)

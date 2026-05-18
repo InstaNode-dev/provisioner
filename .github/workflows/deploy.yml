@@ -171,13 +171,17 @@ jobs:
             exit 1
           fi
 
-      - name: Confirm new pod reports new SHA via in-cluster /healthz
+      - name: Confirm new pod reports new SHA via /healthz (port-forward)
         # provisioner exposes /healthz on :8092 inside the cluster
-        # (CLAUDE.md: "Mirrored on provisioner-sidecar (:8092), ..."). We
-        # shell into the freshest Ready pod and curl localhost to confirm
-        # the binary itself reports our short SHA in commit_id.
-        # The prod image is distroless and has no shell, so this step
-        # treats failure as a warning, not a hard fail.
+        # (CLAUDE.md: "HTTP sidecar (:8092)"). The previous version of this
+        # step did `kubectl exec ... sh -c 'wget/curl ...'` — but the prod
+        # image is DISTROLESS: it has no shell, no wget and no curl, so the
+        # exec ALWAYS failed and the step ALWAYS hit its warning branch. The
+        # build-SHA gate (CLAUDE.md rule 14) was therefore a permanent no-op.
+        #
+        # Fix: `kubectl port-forward` the pod's :8092 to the runner and curl
+        # the sidecar from the runner — the runner HAS curl. This makes the
+        # gate real: a mismatch now fails the deploy instead of warning.
         run: |
           SHORT_SHA="${{ steps.meta.outputs.short_sha }}"
           POD=$(kubectl get pod -n "${K8S_NAMESPACE}" \
@@ -185,18 +189,33 @@ jobs:
             --field-selector=status.phase=Running \
             -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
           if [ -z "${POD}" ]; then
-            echo "::warning::could not locate a running ${K8S_DEPLOYMENT} pod by label app=${K8S_DEPLOYMENT}; rollout already succeeded, skipping in-pod SHA check"
-            exit 0
+            echo "::error::could not locate a running ${K8S_DEPLOYMENT} pod by label app=${K8S_DEPLOYMENT}"
+            exit 1
           fi
-          echo "Probing /healthz inside ${POD}"
+          echo "Port-forwarding ${POD}:8092 to the runner"
+          kubectl port-forward -n "${K8S_NAMESPACE}" "pod/${POD}" 18092:8092 >/tmp/pf.log 2>&1 &
+          PF_PID=$!
+          trap 'kill ${PF_PID} 2>/dev/null || true' EXIT
+          # Give port-forward a moment to establish.
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            if curl -fsS http://127.0.0.1:18092/healthz >/dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
+          OK=""
           for i in 1 2 3 4 5; do
-            BODY=$(kubectl exec -n "${K8S_NAMESPACE}" "${POD}" -- \
-              sh -c 'wget -qO- http://127.0.0.1:8092/healthz 2>/dev/null || curl -fsSL http://127.0.0.1:8092/healthz 2>/dev/null' || echo "")
+            BODY=$(curl -fsS http://127.0.0.1:18092/healthz 2>/dev/null || echo "")
             echo "Attempt ${i}: ${BODY}"
-            if echo "${BODY}" | grep -q "${SHORT_SHA}"; then
-              echo "Confirmed in-pod /healthz reports commit_id=${SHORT_SHA}"
-              exit 0
+            COMMIT=$(echo "${BODY}" | sed -n 's/.*"commit_id":"\([^"]*\)".*/\1/p')
+            if [ "${COMMIT}" = "${SHORT_SHA}" ]; then
+              OK="yes"
+              break
             fi
             sleep 3
           done
-          echo "::warning::could not confirm SHA via in-pod /healthz (distroless image likely has no curl/wget). Image-tag check passed; deploy is good."
+          if [ -z "${OK}" ]; then
+            echo "::error::in-pod /healthz did not report commit_id=${SHORT_SHA} (last body above). Deploy not verified."
+            exit 1
+          fi
+          echo "Confirmed /healthz reports commit_id=${SHORT_SHA}"

@@ -127,9 +127,13 @@ func stampTraceIDFromNR(ctx context.Context) context.Context {
 // Returns the *http.Server so the caller can shut it down cleanly. The
 // listener errors are logged but never crash the process — losing /healthz
 // should not take down provisioning.
-func startHealthzSidecar() *http.Server {
+//
+// The readiness gate is wired into the handler so /healthz reports ok:false
+// (HTTP 503) until the gRPC listener is up and again once shutdown begins,
+// instead of an unconditional ok:true the instant the HTTP sidecar binds.
+func startHealthzSidecar(readiness *server.Readiness) *http.Server {
 	mux := http.NewServeMux()
-	mux.Handle("/healthz", server.HealthzHandler())
+	mux.Handle("/healthz", server.HealthzHandler(readiness))
 
 	srv := &http.Server{
 		Addr:              healthzAddr,
@@ -171,8 +175,11 @@ func main() {
 
 	// Start the HTTP /healthz sidecar early so k8s readiness probes (track 5
 	// switches them from gRPC tcpSocket to HTTP) can see commit_id even
-	// while the gRPC server is still booting backends.
-	healthzSrv := startHealthzSidecar()
+	// while the gRPC server is still booting backends. The readiness gate
+	// starts "not ready" and flips true only once the gRPC listener binds
+	// below, so /healthz does not lie ok:true during backend boot.
+	readiness := &server.Readiness{}
+	healthzSrv := startHealthzSidecar(readiness)
 
 	shutdownTracer := telemetry.InitTracer("instant-provisioner", os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"))
 	defer func() {
@@ -305,6 +312,11 @@ func main() {
 
 	slog.Info("provisioner.starting", "port", cfg.Port, "healthz_addr", healthzAddr)
 
+	// The TCP listener is bound and the gRPC server is about to serve — the
+	// process is ready to accept provisioning RPCs. Flip the readiness gate
+	// so /healthz reports ok:true.
+	readiness.SetReady(true)
+
 	// Serve gRPC in a goroutine so we can also handle SIGTERM cleanly and
 	// shut the /healthz sidecar down too. The previous main.go blocked on
 	// grpcServer.Serve directly; that worked, but left the HTTP server
@@ -329,6 +341,11 @@ func main() {
 			slog.Error("provisioner.serve_failed", "error", err)
 		}
 	}
+
+	// Flip readiness off first so any /healthz probe arriving during the
+	// drain window reports ok:false (503) and k8s pulls the pod out of the
+	// Service endpoints before in-flight gRPC calls are torn down.
+	readiness.SetReady(false)
 
 	// Graceful shutdown of both surfaces. GracefulStop on grpc.Server drains
 	// in-flight calls; Shutdown on the HTTP server gives /healthz a 5s window.

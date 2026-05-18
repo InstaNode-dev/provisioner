@@ -67,6 +67,14 @@ type Manager struct {
 	refillCh chan string
 	done     chan struct{}
 	wg       sync.WaitGroup
+
+	// runCtx is the lifecycle context for all background work — the maintenance
+	// loop and every fillPool / provisionOneItem it spawns derive from it.
+	// Shutdown cancels runCancel so an in-flight provision aborts promptly
+	// instead of running to its own 60s timeout against a process that is
+	// already tearing down (BugBash 2026-05-18 P3 — "pool shutdown ctx").
+	runCtx    context.Context
+	runCancel context.CancelFunc
 }
 
 // New creates a Manager. Call Start to begin background maintenance.
@@ -91,14 +99,20 @@ func New(db *pgxpool.Pool, aesKey []byte, cfg Config,
 	}
 }
 
-// Start initialises the schema, triggers an initial fill, and begins the maintenance loop.
+// Start initialises the schema, triggers an initial fill, and begins the
+// maintenance loop. The passed ctx bounds only the one-time migrate step; all
+// recurring background work runs under an internal context (runCtx) that
+// Shutdown cancels, so the caller can pass a request-scoped or background ctx
+// without it dictating the maintenance loop's lifetime.
 func (m *Manager) Start(ctx context.Context) error {
 	if err := m.migrate(ctx); err != nil {
 		return fmt.Errorf("pool.Start: migrate: %w", err)
 	}
 
+	m.runCtx, m.runCancel = context.WithCancel(context.Background())
+
 	m.wg.Add(1)
-	go m.run(ctx)
+	go m.run(m.runCtx)
 
 	// Trigger initial refill for all resource types.
 	for rt := range m.targets {
@@ -107,8 +121,15 @@ func (m *Manager) Start(ctx context.Context) error {
 	return nil
 }
 
-// Shutdown stops background goroutines.
+// Shutdown stops background goroutines and aborts any in-flight pool fill.
+// It cancels runCtx first so a provisionOneItem mid-flight returns promptly
+// (its 60s timeout is derived from runCtx), then closes done to break the
+// maintenance loop's select, then waits for run to exit. Calling Shutdown
+// before Start (runCancel still nil) is a no-op on the cancel step.
 func (m *Manager) Shutdown() {
+	if m.runCancel != nil {
+		m.runCancel()
+	}
 	close(m.done)
 	m.wg.Wait()
 }

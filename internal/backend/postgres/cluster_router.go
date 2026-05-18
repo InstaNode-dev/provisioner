@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -39,7 +40,14 @@ type ClusterRouter struct {
 	// decrements it once the provision (success or failure) settles.
 	inflight []int
 
-	done chan struct{}
+	// startOnce guards pollLoop so Start is genuinely idempotent — calling it
+	// twice must not spawn a second polling goroutine (which would double the
+	// poll load and leak on Shutdown, since Shutdown only closes done once).
+	startOnce sync.Once
+	// pollStarts counts poller-goroutine starts; used by the once-guard
+	// regression test to assert exactly one poller runs across N Start calls.
+	pollStarts atomic.Int32
+	done       chan struct{}
 }
 
 // newClusterRouter creates a ClusterRouter for the given admin DSNs.
@@ -61,10 +69,14 @@ func newClusterRouter(adminURLs []string, maxPerCluster int) *ClusterRouter {
 	}
 }
 
-// Start begins background capacity polling. Safe to call multiple times — only
-// the first call starts the goroutine. Call Shutdown to stop.
+// Start begins background capacity polling. Safe to call multiple times — the
+// sync.Once guard ensures only the first call starts the polling goroutine, so
+// a duplicate Start (e.g. a backend wired into more than one code path) cannot
+// spawn a second poller. Call Shutdown to stop.
 func (r *ClusterRouter) Start(ctx context.Context) {
-	go r.pollLoop(ctx)
+	r.startOnce.Do(func() {
+		go r.pollLoop(ctx)
+	})
 }
 
 // Shutdown stops the background polling goroutine.
@@ -181,6 +193,11 @@ func (r *ClusterRouter) ProviderResourceID(clusterIndex int) string {
 // --- internal ---
 
 func (r *ClusterRouter) pollLoop(ctx context.Context) {
+	// pollStarts counts how many times a poller goroutine actually began.
+	// The startOnce guard in Start must keep this at exactly 1 no matter how
+	// many times Start is called — the once-guard regression test asserts it.
+	r.pollStarts.Add(1)
+
 	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
 

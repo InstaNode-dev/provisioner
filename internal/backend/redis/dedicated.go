@@ -193,17 +193,17 @@ func (p *DedicatedProvider) localStorageBytes(ctx context.Context, token string)
 	if err != nil {
 		return 0, fmt.Errorf("cache.dedicated.localStorageBytes: INFO memory: %w", err)
 	}
-	// Parse used_memory from INFO output.
-	const key = "used_memory:"
-	for _, line := range splitLines(info) {
-		if len(line) > len(key) && line[:len(key)] == key {
-			var size int64
-			if _, err := fmt.Sscanf(line[len(key):], "%d", &size); err == nil {
-				return size, nil
-			}
-		}
+	// Parse used_memory via the single shared parser (parseUsedMemory in
+	// k8s.go). Previously dedicated.go carried its own inline parser plus a
+	// bespoke splitLines helper — two copies of one INFO-memory parser that
+	// could silently drift. parseUsedMemory also returns an error (not a
+	// silent 0) when the line is absent, so a malformed INFO reply does not
+	// under-report quota usage.
+	used, err := parseUsedMemory(info)
+	if err != nil {
+		return 0, fmt.Errorf("cache.dedicated.localStorageBytes: %w", err)
 	}
-	return 0, nil
+	return used, nil
 }
 
 // deprovisionLocal removes the ACL user from the dedicated Redis.
@@ -237,24 +237,4 @@ func (p *DedicatedProvider) deprovisionLocal(ctx context.Context, token, provide
 	slog.Info("cache.dedicated.deprovisionLocal: deprovisioned",
 		"token", token, "user", canonical)
 	return nil
-}
-
-// splitLines splits a string by newlines (handles \r\n and \n).
-func splitLines(s string) []string {
-	var lines []string
-	start := 0
-	for i := 0; i < len(s); i++ {
-		if s[i] == '\n' {
-			line := s[start:i]
-			if len(line) > 0 && line[len(line)-1] == '\r' {
-				line = line[:len(line)-1]
-			}
-			lines = append(lines, line)
-			start = i + 1
-		}
-	}
-	if start < len(s) {
-		lines = append(lines, s[start:])
-	}
-	return lines
 }

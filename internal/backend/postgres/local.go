@@ -16,6 +16,8 @@ import (
 	"log/slog"
 	"math/big"
 	"os"
+	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -37,6 +39,31 @@ const alphanumChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ01234
 // sqlCreateExtensionVector installs pgvector on a freshly provisioned database.
 // Applied unconditionally — see the call site in Provision for the rationale.
 const sqlCreateExtensionVector = "CREATE EXTENSION IF NOT EXISTS vector"
+
+// deprovisionDropDBAttempts is the number of DROP DATABASE tries in Deprovision.
+// A concurrent connection that reconnects between pg_terminate_backend and
+// DROP DATABASE produces "is being accessed by other users"; a short retry loop
+// rides out that TOCTOU window. WITH (FORCE) (Postgres 13+) terminates stragglers
+// itself, so one or two attempts is normally enough.
+const deprovisionDropDBAttempts = 3
+
+// deprovisionDropDBRetryDelay is the pause between DROP DATABASE attempts.
+const deprovisionDropDBRetryDelay = 500 * time.Millisecond
+
+// pgDatabaseInUseMarker is the Postgres error-message fragment for SQLSTATE
+// 55006 (object_in_use) raised by DROP DATABASE when a backend is still
+// connected. It is the ONLY DROP DATABASE failure Deprovision retries.
+const pgDatabaseInUseMarker = "being accessed by other users"
+
+// isDatabaseInUseErr reports whether a DROP DATABASE error is the transient
+// "database is being accessed by other users" race that the Deprovision retry
+// loop should ride out. Any other error is terminal.
+func isDatabaseInUseErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), pgDatabaseInUseMarker)
+}
 
 // LocalBackend provisions databases on one or more shared postgres-customers instances.
 // When multiple admin URLs are provided, the ClusterRouter distributes provisions
@@ -104,11 +131,15 @@ func (b *LocalBackend) Provision(ctx context.Context, token, tier string, connLi
 		return nil, fmt.Errorf("db.local.Provision: %w", err)
 	}
 
-	// Pick the least-loaded cluster for this provision.
+	// Pick the least-loaded cluster for this provision. Pick increments the
+	// cluster's in-flight count so concurrent provisions between two 60s
+	// capacity polls don't all stampede the same cluster; ReleasePick (deferred)
+	// decrements it once this provision settles, success or failure.
 	clusterIdx, adminURL, err := b.router.Pick()
 	if err != nil {
 		return nil, fmt.Errorf("db.local.Provision: pick cluster: %w", err)
 	}
+	defer b.router.ReleasePick(clusterIdx)
 
 	// Connect as admin.
 	conn, err := pgx.Connect(ctx, adminURL)
@@ -231,6 +262,14 @@ func (b *LocalBackend) StorageBytes(ctx context.Context, token, providerResource
 // not the request token; poolident.NamingToken resolves the correct name from
 // provider_resource_id so DROP DATABASE actually destroys the backing infra
 // rather than no-op'ing on a db_<real-token> that was never created.
+//
+// P2-07: idempotency. The pre-fix code dropped the database first and returned
+// Internal on any failure — so a transient "database is being accessed by other
+// users" (a client reconnected in the TOCTOU window after pg_terminate_backend)
+// aborted the whole RPC and the role was never dropped, leaking it forever.
+// Now DROP USER runs unconditionally regardless of the DROP DATABASE outcome,
+// and DROP DATABASE uses WITH (FORCE) inside a short retry loop so it can ride
+// out the reconnect race itself.
 func (b *LocalBackend) Deprovision(ctx context.Context, token, providerResourceID string) error {
 	namingToken := poolident.NamingToken(token, providerResourceID)
 	dbName := dbNamePrefix + namingToken
@@ -247,23 +286,55 @@ func (b *LocalBackend) Deprovision(ctx context.Context, token, providerResourceI
 		}
 	}()
 
-	// Terminate active connections before dropping.
-	_, err = conn.Exec(ctx,
+	// Revoke CONNECT so no new connections can be established mid-teardown, then
+	// terminate the active ones. Both are best-effort — DROP DATABASE WITH
+	// (FORCE) below will terminate any straggler itself.
+	if _, err := conn.Exec(ctx, fmt.Sprintf("REVOKE CONNECT ON DATABASE %q FROM PUBLIC", dbName)); err != nil {
+		slog.Debug("db.local.Deprovision: REVOKE CONNECT (continuing)", "token", token, "error", err)
+	}
+	if _, err := conn.Exec(ctx,
 		"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=$1 AND pid<>pg_backend_pid()",
 		dbName,
-	)
-	if err != nil {
+	); err != nil {
 		slog.Error("db.local.Deprovision: terminate connections (continuing)", "token", token, "error", err)
 	}
 
-	// DROP DATABASE IF EXISTS.
-	if _, err := conn.Exec(ctx, fmt.Sprintf("DROP DATABASE IF EXISTS %q", dbName)); err != nil {
-		return fmt.Errorf("db.local.Deprovision: DROP DATABASE: %w", err)
+	// DROP DATABASE IF EXISTS WITH (FORCE): FORCE (Postgres 13+) terminates any
+	// remaining backends rather than failing with "is being accessed by other
+	// users". The retry loop covers a client that reconnects between FORCE's
+	// own terminate and the drop.
+	var dropDBErr error
+	for attempt := 1; attempt <= deprovisionDropDBAttempts; attempt++ {
+		_, dropDBErr = conn.Exec(ctx, fmt.Sprintf("DROP DATABASE IF EXISTS %q WITH (FORCE)", dbName))
+		if dropDBErr == nil {
+			break
+		}
+		// Only retry the in-use race; any other error is terminal.
+		if !isDatabaseInUseErr(dropDBErr) {
+			break
+		}
+		slog.Warn("db.local.Deprovision: DROP DATABASE in-use, retrying",
+			"token", token, "db", dbName, "attempt", attempt, "error", dropDBErr)
+		select {
+		case <-ctx.Done():
+			dropDBErr = ctx.Err()
+		case <-time.After(deprovisionDropDBRetryDelay):
+		}
+		if ctx.Err() != nil {
+			break
+		}
 	}
 
-	// DROP USER IF EXISTS.
+	// DROP USER runs unconditionally — even if DROP DATABASE failed above. A
+	// leaked role is worse than a leaked database: the role is a credential, the
+	// database is dead weight. Dropping the role last means a failed DROP
+	// DATABASE no longer leaves the credential behind.
 	if _, err := conn.Exec(ctx, fmt.Sprintf("DROP USER IF EXISTS %q", username)); err != nil {
 		slog.Error("db.local.Deprovision: DROP USER (continuing)", "token", token, "error", err)
+	}
+
+	if dropDBErr != nil {
+		return fmt.Errorf("db.local.Deprovision: DROP DATABASE: %w", dropDBErr)
 	}
 
 	slog.Info("db.local.Deprovision: deprovisioned", "token", token, "db", dbName, "user", username)

@@ -2,11 +2,13 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -563,8 +565,16 @@ func (s *Server) GetStorageBytes(ctx context.Context, req *provisionerv1.Storage
 
 	switch req.ResourceType {
 	case commonv1.ResourceType_RESOURCE_TYPE_POSTGRES:
-		// Route to dedicated backend when a providerResourceID is present (Neon project ID).
-		if s.dedicatedPostgresBackend != nil && req.ProviderResourceId != "" {
+		// Route to dedicated backend when a providerResourceID is present (Neon
+		// project ID). P1-W3-12 / P2-W2-06: a pool-claimed SHARED resource also
+		// carries a non-empty provider_resource_id ("local:<N>" and/or a
+		// "pooltok:" marker) — that is NOT a dedicated resource. The
+		// "instant-customer-" guard (matching DeprovisionResource's routing)
+		// keeps pool-claimed shared Postgres measured by the shared backend
+		// instead of being mis-routed to the dedicated backend, which would
+		// measure the wrong instance or fail outright.
+		if s.dedicatedPostgresBackend != nil && req.ProviderResourceId != "" &&
+			!isSharedBackendProviderID(req.ProviderResourceId) {
 			bytes, err := s.dedicatedPostgresBackend.StorageBytes(ctx, req.Token, req.ProviderResourceId)
 			if err != nil {
 				return nil, mapError("GetStorageBytes.postgres.dedicated", err)
@@ -584,8 +594,13 @@ func (s *Server) GetStorageBytes(ctx context.Context, req *provisionerv1.Storage
 		}, nil
 
 	case commonv1.ResourceType_RESOURCE_TYPE_REDIS:
-		// Route to dedicated backend when a providerResourceID is present (Upstash DB ID).
-		if s.dedicatedRedisBackend != nil && req.ProviderResourceId != "" {
+		// Route to dedicated backend when a providerResourceID is present
+		// (Upstash DB ID). P1-W3-12 / P2-W2-06: skip the dedicated backend for
+		// pool-claimed shared Redis — its PRID carries the "pooltok:" marker —
+		// so a pool-claimed resource is measured against the shared instance it
+		// actually lives on, not a dedicated instance that does not exist.
+		if s.dedicatedRedisBackend != nil && req.ProviderResourceId != "" &&
+			!isSharedBackendProviderID(req.ProviderResourceId) {
 			bytes, err := s.dedicatedRedisBackend.StorageBytes(ctx, req.Token, req.ProviderResourceId)
 			if err != nil {
 				return nil, mapError("GetStorageBytes.redis.dedicated", err)
@@ -628,6 +643,20 @@ func (s *Server) GetStorageBytes(ctx context.Context, req *provisionerv1.Storage
 			MeasuredAt:   time.Now().Unix(),
 		}, nil
 
+	case commonv1.ResourceType_RESOURCE_TYPE_QUEUE:
+		// P2-W2-05: queues are metered by messages-stored (plans.yaml
+		// webhook/queue stored-count limits), not by on-disk bytes — the
+		// queue.Backend interface has no StorageBytes method. Returning
+		// InvalidArgument here (the pre-fix default-case behaviour) made the
+		// worker's storage sweep log a spurious gRPC error for every queue
+		// resource on every tick. Return 0 explicitly so the sweep treats
+		// queues as a clean zero-byte resource, matching the storage-backend-
+		// not-configured fail-open path above.
+		return &provisionerv1.StorageResponse{
+			StorageBytes: 0,
+			MeasuredAt:   time.Now().Unix(),
+		}, nil
+
 	case commonv1.ResourceType_RESOURCE_TYPE_UNSPECIFIED:
 		return nil, status.Error(codes.InvalidArgument, "resource_type is unspecified")
 
@@ -649,6 +678,34 @@ var regradeConnLimits = plans.Default()
 // Using a constant here (rather than importing the redis package's private const)
 // keeps the dependency clean; both values must stay in sync with k8s.go.
 const redisK8sProviderIDPrefix = "instant-customer-"
+
+// localClusterPRIDPrefix is the provider_resource_id form of a shared (local)
+// Postgres resource: "local:<clusterIndex>". See postgres/cluster_router.go.
+const localClusterPRIDPrefix = "local:"
+
+// isSharedBackendProviderID reports whether a provider_resource_id belongs to a
+// SHARED-backend resource rather than a genuine dedicated (Neon/Upstash) one.
+//
+// A shared resource's PRID is one of:
+//   - "" — live-provisioned shared Redis/Mongo
+//   - "local:<N>" — shared Postgres cluster index
+//   - any value carrying the poolident "pooltok:" marker — a pool-claimed
+//     shared resource (e.g. "local:0;pooltok:pool-<uuid>" or "pooltok:pool-<uuid>")
+//
+// P1-W3-12 / P2-W2-06: GetStorageBytes must not route these to the dedicated
+// backend just because the PRID is non-empty — a pool-claimed shared resource
+// always has a non-empty PRID. DeprovisionResource already guards on the
+// "instant-customer-" k8s prefix; this is the GetStorageBytes-side equivalent,
+// expressed positively so a "local:" / "pooltok:" PRID is unambiguously shared.
+func isSharedBackendProviderID(providerResourceID string) bool {
+	if providerResourceID == "" {
+		return true
+	}
+	if strings.HasPrefix(providerResourceID, localClusterPRIDPrefix) {
+		return true
+	}
+	return strings.Contains(providerResourceID, poolident.Marker)
+}
 
 // RegradeResource re-applies the tier's infrastructure cap to an
 // already-provisioned resource. It exists because a plan upgrade does not, on
@@ -851,6 +908,14 @@ func (s *Server) regradeRedis(ctx context.Context, req *provisionerv1.RegradeReq
 }
 
 // mapError converts backend errors to appropriate gRPC status codes.
+//
+// P1-02: when the error is a typed *pgconn.PgError, classification is driven by
+// its SQLSTATE — NOT by substring-matching the free-text message. A real
+// CREATE DATABASE failure (e.g. "permission denied", SQLSTATE 42501) whose
+// message happens to contain the word "connection" must NOT be reported as
+// Unavailable, or the worker retries a non-retryable failure. The substring
+// path is kept only as a fallback for non-Postgres backends (redis/mongo/k8s)
+// and for transport-layer errors that never reach a SQLSTATE.
 func mapError(op string, err error) error {
 	if err == nil {
 		return nil
@@ -858,6 +923,24 @@ func mapError(op string, err error) error {
 	msg := err.Error()
 	slog.Error(fmt.Sprintf("server.%s", op), "error", msg)
 
+	// Typed Postgres error → classify on SQLSTATE, authoritatively.
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		switch {
+		case isPgConnectSQLSTATE(pgErr.Code):
+			return status.Errorf(codes.Unavailable, "%s: connect failure: %v", op, err)
+		case pgErr.Code == pgSQLStateDuplicateDatabase || pgErr.Code == pgSQLStateDuplicateObject:
+			return status.Errorf(codes.AlreadyExists, "%s: already exists: %v", op, err)
+		default:
+			// Any other SQLSTATE (permission denied, syntax error, etc.) is a
+			// real, non-retryable Internal failure — even if its message text
+			// contains "connect"/"connection".
+			return status.Errorf(codes.Internal, "%s: %v", op, err)
+		}
+	}
+
+	// Non-Postgres backend (redis/mongo/k8s) or a transport error with no
+	// SQLSTATE — fall back to message-substring heuristics.
 	if isConnectError(msg) {
 		return status.Errorf(codes.Unavailable, "%s: connect failure: %v", op, err)
 	}
@@ -868,6 +951,28 @@ func mapError(op string, err error) error {
 		return status.Errorf(codes.InvalidArgument, "%s: invalid argument: %v", op, err)
 	}
 	return status.Errorf(codes.Internal, "%s: %v", op, err)
+}
+
+// Postgres SQLSTATE codes used for typed error classification (see
+// https://www.postgresql.org/docs/current/errcodes-appendix.html).
+const (
+	// pgSQLStateClassConnection is SQLSTATE class 08 — "Connection Exception".
+	// Every code in this class (08000, 08003, 08006, 08001, 08004, 08007, 08P01)
+	// is a genuine connect/transport failure and is safely retryable.
+	pgSQLStateClassConnection = "08"
+	// pgSQLStateCannotConnectNow is 57P03 — server is starting up / shutting
+	// down. Transient and retryable, but not in class 08.
+	pgSQLStateCannotConnectNow = "57P03"
+	// pgSQLStateDuplicateDatabase is 42P04 — CREATE DATABASE of an existing DB.
+	pgSQLStateDuplicateDatabase = "42P04"
+	// pgSQLStateDuplicateObject is 42710 — e.g. CREATE USER of an existing role.
+	pgSQLStateDuplicateObject = "42710"
+)
+
+// isPgConnectSQLSTATE reports whether a Postgres SQLSTATE denotes a genuine
+// connect/transport failure that the caller may safely retry.
+func isPgConnectSQLSTATE(code string) bool {
+	return strings.HasPrefix(code, pgSQLStateClassConnection) || code == pgSQLStateCannotConnectNow
 }
 
 func isConnectError(msg string) bool {

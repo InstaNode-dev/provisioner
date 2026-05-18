@@ -172,8 +172,22 @@ func (p *DedicatedProvider) provisionLocal(ctx context.Context, token, tier stri
 	}, nil
 }
 
-// localStorageBytes returns the total memory used by the dedicated Redis instance
-// via INFO memory (reports used_memory for the whole instance).
+// localStorageBytes returns the total memory used by the dedicated Redis
+// instance via INFO memory (reports used_memory for the whole instance).
+//
+// P2-09 (KNOWN LIMITATION, not fixed here — requires a design change):
+// In a TRUE dedicated deployment (one Redis instance per Team-tier token) the
+// whole-instance used_memory IS the per-tenant figure — there is exactly one
+// tenant, so this is correct. In local-dev "shared dedicated" mode (multiple
+// tokens' ACL users on one Redis, see deprovisionLocal) every tenant reports
+// the same inflated whole-instance number. A per-tenant SCAN+MEMORY USAGE pass
+// is NOT possible for the dedicated provider because it grants each ACL user
+// "~*" (whole keyspace) with no key prefix — there is no prefix to SCAN by, by
+// design (the instance is meant to be theirs alone). Scoping per-tenant would
+// require assigning prefixes to dedicated users, which would defeat the
+// "dedicated = whole keyspace" contract. The shared/prefixed backend
+// (local.go) measures correctly via its {token}:* prefix; the dedicated
+// provider is accurate only in real one-instance-per-tenant production.
 func (p *DedicatedProvider) localStorageBytes(ctx context.Context, token string) (int64, error) {
 	info, err := p.rdb.Info(ctx, "memory").Result()
 	if err != nil {

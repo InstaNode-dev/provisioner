@@ -52,6 +52,7 @@ import (
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 
 	"instant.dev/provisioner/internal/ctxkeys"
+	"instant.dev/provisioner/internal/poolident"
 )
 
 const (
@@ -385,10 +386,17 @@ func (b *K8sBackend) Provision(ctx context.Context, token, tier string) (*Creden
 }
 
 // StorageBytes returns the storageSize from dbStats for the customer database.
+//
+// P2-08: a pool-claimed Mongo resource's database is named from the pool token
+// (db_pool-<uuid>), not the request token; poolident.NamingToken resolves the
+// canonical naming token from provider_resource_id so the dbStats probe targets
+// the database that actually holds the customer's data. Local Mongo already
+// resolves this — k8s did not, a latent drift if Mongo ever joins the hot pool.
 func (b *K8sBackend) StorageBytes(ctx context.Context, token, providerResourceID string) (int64, error) {
-	ns := providerResourceID
+	namingToken := poolident.NamingToken(token, providerResourceID)
+	ns := poolident.BasePRID(providerResourceID)
 	if ns == "" {
-		ns = mongoK8sNsPrefix + token
+		ns = mongoK8sNsPrefix + namingToken
 	}
 
 	// Fail-soft when the customer namespace exists but is missing the
@@ -429,7 +437,7 @@ func (b *K8sBackend) StorageBytes(ctx context.Context, token, providerResourceID
 	// 12-char-truncated name; probing only the canonical name would read 0
 	// bytes and silently un-enforce the customer's Mongo quota.
 	var lastErr error
-	for _, dbName := range legacyMongoDBNames(token) {
+	for _, dbName := range legacyMongoDBNames(namingToken) {
 		var result bson.M
 		if err := client.Database(dbName).RunCommand(ctx, bson.D{{Key: "dbStats", Value: 1}}).Decode(&result); err != nil {
 			lastErr = err
@@ -459,9 +467,13 @@ func (b *K8sBackend) StorageBytes(ctx context.Context, token, providerResourceID
 // mongo-proxy fails fast on a stale username instead of hitting a non-existent
 // pod.
 func (b *K8sBackend) Deprovision(ctx context.Context, token, providerResourceID string) error {
-	ns := providerResourceID
+	// P2-08: resolve the pool naming token before deriving the namespace and
+	// route keys — a pool-claimed resource is named from the pool token, not
+	// the request token. BasePRID strips any pool marker from the namespace ID.
+	namingToken := poolident.NamingToken(token, providerResourceID)
+	ns := poolident.BasePRID(providerResourceID)
 	if ns == "" {
-		ns = mongoK8sNsPrefix + token
+		ns = mongoK8sNsPrefix + namingToken
 	}
 	if err := b.cs.CoreV1().Namespaces().Delete(ctx, ns, metav1.DeleteOptions{}); err != nil {
 		if !k8serrors.IsNotFound(err) {
@@ -476,12 +488,12 @@ func (b *K8sBackend) Deprovision(ctx context.Context, token, providerResourceID 
 		// forwarding to a deleted pod.
 		delCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
-		for _, dbName := range legacyMongoDBNames(token) {
+		for _, dbName := range legacyMongoDBNames(namingToken) {
 			if err := b.rdb.Del(delCtx, b.routePrefix+dbName).Err(); err != nil {
 				slog.Warn("k8s.mongo.route_unregister_failed", "db", dbName, "error", err)
 			}
 		}
-		for _, appUser := range legacyMongoUserNames(token) {
+		for _, appUser := range legacyMongoUserNames(namingToken) {
 			if err := b.rdb.Del(delCtx, b.userPrefix+appUser).Err(); err != nil {
 				slog.Warn("k8s.mongo.user_route_unregister_failed", "user", appUser, "error", err)
 			}

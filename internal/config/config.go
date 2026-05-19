@@ -35,10 +35,10 @@ type Config struct {
 	// Pool configuration — hot-provisioning pool.
 	ProvisionerDatabaseURL string // PROVISIONER_DATABASE_URL — provisioner's own Postgres
 	AESKey                 string // AES_KEY (hex) — encrypts pool connection URLs at rest
-	PoolPostgresSize       int    // POOL_POSTGRES_SIZE, default 2
-	PoolRedisSize          int    // POOL_REDIS_SIZE, default 3
-	PoolMongoSize          int    // POOL_MONGO_SIZE, default 2
-	PoolQueueSize          int    // POOL_QUEUE_SIZE (NATS), default 2
+	PoolPostgresSize       int    // POOL_POSTGRES_SIZE, default 10
+	PoolRedisSize          int    // POOL_REDIS_SIZE, default 10
+	PoolMongoSize          int    // POOL_MONGO_SIZE, default 10
+	PoolQueueSize          int    // POOL_QUEUE_SIZE (NATS), default 10
 
 	// ── Kubernetes dedicated backend (Team tier) ─────────────────────────────
 	//
@@ -116,10 +116,16 @@ func Load() *Config {
 		UpstashAPIKey:            os.Getenv("UPSTASH_API_KEY"),
 		ProvisionerDatabaseURL:   os.Getenv("PROVISIONER_DATABASE_URL"),
 		AESKey:                   os.Getenv("AES_KEY"),
-		PoolPostgresSize:         getenvInt("POOL_POSTGRES_SIZE", 2),
-		PoolRedisSize:            getenvInt("POOL_REDIS_SIZE", 3),
-		PoolMongoSize:            getenvInt("POOL_MONGO_SIZE", 2),
-		PoolQueueSize:            getenvInt("POOL_QUEUE_SIZE", 2),
+		// Pool targets default to 10 (was 2/3/2/2). A drained pool now refills
+		// concurrently (see pool.maxRefillConcurrency), so a deeper warm buffer
+		// no longer costs a proportionally longer serial refill — and 10 ready
+		// items absorbs the load test's concurrency-8 burst entirely on the
+		// fast pool-claim path instead of falling through to slow live
+		// provisioning. Override per-type via the POOL_*_SIZE env vars.
+		PoolPostgresSize:         getenvInt("POOL_POSTGRES_SIZE", 10),
+		PoolRedisSize:            getenvInt("POOL_REDIS_SIZE", 10),
+		PoolMongoSize:            getenvInt("POOL_MONGO_SIZE", 10),
+		PoolQueueSize:            getenvInt("POOL_QUEUE_SIZE", 10),
 		K8sDedicatedBackend:      os.Getenv("K8S_DEDICATED_BACKEND") == "true",
 		K8sKubeconfig:            os.Getenv("K8S_KUBECONFIG"),
 		K8sExternalHost:          os.Getenv("K8S_EXTERNAL_HOST"),

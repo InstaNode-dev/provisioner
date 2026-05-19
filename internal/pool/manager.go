@@ -54,6 +54,25 @@ type Config struct {
 	QueueSize    int // target number of ready NATS items in pool
 }
 
+// maxRefillConcurrency bounds the number of backend provisions fillPool runs
+// in parallel when topping up a drained pool.
+//
+// Before this constant existed, fillPool provisioned its `needed` items in a
+// strictly sequential `for` loop on the single maintenance goroutine, so a
+// pool drained by a concurrency burst refilled at ~1 item per single-provision
+// latency (15-25s on shared backends). That made the pool useless as a burst
+// absorber — the load test's F1 cliff — because under concurrency ≥ 8 the pool
+// stayed empty for the whole run and every request paid full live-provision
+// latency. Refilling `needed` items concurrently lets a drained pool recover
+// in roughly one single-provision window instead of N of them.
+//
+// It is bounded (not unbounded) so a deep deficit cannot open hundreds of
+// simultaneous admin connections against the shared customer Postgres/Redis/
+// Mongo and starve the request-path provisions of connection slots. 8 matches
+// the concurrency the load test exercises and stays well under any backend's
+// connection ceiling.
+const maxRefillConcurrency = 8
+
 // Manager maintains a pool of pre-provisioned resources.
 type Manager struct {
 	db        *pgxpool.Pool
@@ -254,18 +273,91 @@ func (m *Manager) fillPool(ctx context.Context, resourceType string) {
 	slog.Info("pool.fillPool: topping up", "resource_type", resourceType,
 		"current", count, "target", target, "provisioning", needed)
 
-	for i := 0; i < needed; i++ {
-		if err := m.provisionOneItem(ctx, resourceType); err != nil {
-			slog.Error("pool.fillPool: provision", "resource_type", resourceType, "error", err)
-			// Continue — provision as many items as possible.
-		}
-	}
+	m.provisionItemsConcurrently(ctx, resourceType, needed)
 }
 
+// provisionItemsConcurrently provisions `needed` pool items in parallel, bounded
+// to maxRefillConcurrency in-flight backend calls. Each item runs the full slow
+// backend Provision; running them concurrently — rather than the old sequential
+// `for` loop — lets a drained pool refill in roughly one single-provision window
+// instead of N of them. This is the core of the F1 latency-cliff fix.
+//
+// Split out of fillPool (and exercised directly by the regression test) so the
+// concurrency property can be asserted without a live DB: a test injects backends
+// with an artificial delay and checks aggregate wall time is far below
+// needed × single-latency.
+func (m *Manager) provisionItemsConcurrently(ctx context.Context, resourceType string, needed int) {
+	if needed <= 0 {
+		return
+	}
+	// sem bounds concurrent backend provisions; cap the worker count at `needed`
+	// so a small top-up does not spin up maxRefillConcurrency idle slots.
+	limit := maxRefillConcurrency
+	if needed < limit {
+		limit = needed
+	}
+	sem := make(chan struct{}, limit)
+	var wg sync.WaitGroup
+	for i := 0; i < needed; i++ {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if err := m.provisionOneItem(ctx, resourceType); err != nil {
+				slog.Error("pool.fillPool: provision", "resource_type", resourceType, "error", err)
+				// Continue — provision as many items as possible.
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// provisionOneItem provisions a single pool item: it runs the slow backend
+// Provision, then persists the resulting row. The two phases are split into
+// provisionOneItemBackend (no DB) and the INSERT below so the backend phase is
+// independently unit-testable. The whole operation is concurrency-safe — it
+// shares no mutable Manager state with sibling calls — which is what makes
+// provisionItemsConcurrently correct.
 func (m *Manager) provisionOneItem(ctx context.Context, resourceType string) error {
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 
+	item, err := m.provisionOneItemBackend(ctx, resourceType)
+	if err != nil {
+		return err
+	}
+
+	if _, err := m.db.Exec(ctx, `
+		INSERT INTO pool_items
+			(resource_type, connection_url, provider_resource_id, database_name, username, key_prefix, pool_token)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+	`, resourceType, item.encURL, item.providerResourceID, item.databaseName,
+		item.username, item.keyPrefix, item.poolToken); err != nil {
+		return fmt.Errorf("insert pool item: %w", err)
+	}
+
+	slog.Info("pool.provisionOneItem: added", "resource_type", resourceType, "pool_token", item.poolToken)
+	return nil
+}
+
+// provisionedItem is the result of provisionOneItemBackend — the encrypted
+// connection URL plus the identifiers needed to persist the pool_items row.
+type provisionedItem struct {
+	encURL             string
+	providerResourceID string
+	databaseName       string
+	username           string
+	keyPrefix          string
+	poolToken          string
+}
+
+// provisionOneItemBackend runs the slow backend Provision for one pool item and
+// returns the encrypted credentials. It touches NO Manager-shared mutable state
+// (no m.db, no maps) so N concurrent calls are race-free — the property
+// provisionItemsConcurrently relies on. Kept separate from the DB INSERT so a
+// hermetic test can drive it with mock backends and no Postgres.
+func (m *Manager) provisionOneItemBackend(ctx context.Context, resourceType string) (provisionedItem, error) {
 	// Pool tokens use a distinct prefix so they're identifiable in backend logs.
 	// Use "pool-" (hyphen), not "pool_" — k8s namespace names are RFC 1123,
 	// which disallows underscores.
@@ -287,11 +379,11 @@ func (m *Manager) provisionOneItem(ctx context.Context, resourceType string) err
 		// by the entitlement reconciler when it is assigned to a real team.
 		creds, err := m.postgresB.Provision(ctx, poolToken, "anonymous", -1)
 		if err != nil {
-			return fmt.Errorf("provision postgres: %w", err)
+			return provisionedItem{}, fmt.Errorf("provision postgres: %w", err)
 		}
 		enc, err := crypto.Encrypt(m.aesKey, creds.URL)
 		if err != nil {
-			return fmt.Errorf("encrypt postgres url: %w", err)
+			return provisionedItem{}, fmt.Errorf("encrypt postgres url: %w", err)
 		}
 		encURL = enc
 		providerResourceID = creds.ProviderResourceID
@@ -301,11 +393,11 @@ func (m *Manager) provisionOneItem(ctx context.Context, resourceType string) err
 	case "redis":
 		creds, err := m.redisB.Provision(ctx, poolToken, "anonymous")
 		if err != nil {
-			return fmt.Errorf("provision redis: %w", err)
+			return provisionedItem{}, fmt.Errorf("provision redis: %w", err)
 		}
 		enc, err := crypto.Encrypt(m.aesKey, creds.URL)
 		if err != nil {
-			return fmt.Errorf("encrypt redis url: %w", err)
+			return provisionedItem{}, fmt.Errorf("encrypt redis url: %w", err)
 		}
 		encURL = enc
 		keyPrefix = creds.KeyPrefix
@@ -313,11 +405,11 @@ func (m *Manager) provisionOneItem(ctx context.Context, resourceType string) err
 	case "mongodb":
 		creds, err := m.mongoB.Provision(ctx, poolToken, "anonymous")
 		if err != nil {
-			return fmt.Errorf("provision mongodb: %w", err)
+			return provisionedItem{}, fmt.Errorf("provision mongodb: %w", err)
 		}
 		enc, err := crypto.Encrypt(m.aesKey, creds.URL)
 		if err != nil {
-			return fmt.Errorf("encrypt mongodb url: %w", err)
+			return provisionedItem{}, fmt.Errorf("encrypt mongodb url: %w", err)
 		}
 		encURL = enc
 		databaseName = creds.DatabaseName
@@ -327,29 +419,27 @@ func (m *Manager) provisionOneItem(ctx context.Context, resourceType string) err
 		// URL + ProviderResourceID; no per-resource database/user concept.
 		creds, err := m.queueB.Provision(ctx, poolToken, "anonymous")
 		if err != nil {
-			return fmt.Errorf("provision queue: %w", err)
+			return provisionedItem{}, fmt.Errorf("provision queue: %w", err)
 		}
 		enc, err := crypto.Encrypt(m.aesKey, creds.URL)
 		if err != nil {
-			return fmt.Errorf("encrypt queue url: %w", err)
+			return provisionedItem{}, fmt.Errorf("encrypt queue url: %w", err)
 		}
 		encURL = enc
 		providerResourceID = creds.ProviderResourceID
 
 	default:
-		return fmt.Errorf("unknown resource type: %s", resourceType)
+		return provisionedItem{}, fmt.Errorf("unknown resource type: %s", resourceType)
 	}
 
-	if _, err := m.db.Exec(ctx, `
-		INSERT INTO pool_items
-			(resource_type, connection_url, provider_resource_id, database_name, username, key_prefix, pool_token)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
-	`, resourceType, encURL, providerResourceID, databaseName, username, keyPrefix, poolToken); err != nil {
-		return fmt.Errorf("insert pool item: %w", err)
-	}
-
-	slog.Info("pool.provisionOneItem: added", "resource_type", resourceType, "pool_token", poolToken)
-	return nil
+	return provisionedItem{
+		encURL:             encURL,
+		providerResourceID: providerResourceID,
+		databaseName:       databaseName,
+		username:           username,
+		keyPrefix:          keyPrefix,
+		poolToken:          poolToken,
+	}, nil
 }
 
 func (m *Manager) migrate(ctx context.Context) error {

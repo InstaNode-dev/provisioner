@@ -268,6 +268,15 @@ func (s *Server) PostgresBackend() postgres.Backend {
 	return s.postgresBackend
 }
 
+// Breakers returns the per-backend circuit-breaker set. Used by main.go to
+// wire each breaker as a `backend_<name>` check on the /readyz handler so a
+// tripped breaker surfaces as a degraded readiness component (not failed —
+// the breaker's job is to keep the provisioner serving while one backend
+// is sick; pulling the pod from rotation would defeat that). Returns nil
+// if the server was constructed without breakers (test path); main.go
+// callers should range over a nil slice safely.
+func (s *Server) Breakers() *circuit.Breakers { return s.breakers }
+
 // ProvisionResource provisions a resource of the requested type.
 // It first tries to claim a pre-provisioned item from the pool.
 // If the pool is empty or disabled, it falls back to live provisioning.

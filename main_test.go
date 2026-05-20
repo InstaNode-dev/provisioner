@@ -18,6 +18,7 @@ import (
 	"google.golang.org/grpc"
 
 	"instant.dev/common/logctx"
+	"instant.dev/provisioner/internal/circuit"
 	"instant.dev/provisioner/internal/server"
 )
 
@@ -338,5 +339,50 @@ func TestStartHealthzSidecar_ServesMetrics(t *testing.T) {
 	rzResp.Body.Close()
 	if rzResp.StatusCode != 200 {
 		t.Fatalf("/readyz returned %d, want 200 (pool disabled — platform_db should be skipped)", rzResp.StatusCode)
+	}
+}
+
+// TestCollectBreakerInspectors_NilSafe — collectBreakerInspectors(nil) must
+// return nil rather than panic. The test path constructs a Server without
+// breakers; main.go's readyz wiring should range over a nil slice safely.
+func TestCollectBreakerInspectors_NilSafe(t *testing.T) {
+	got := collectBreakerInspectors(nil)
+	if got != nil {
+		t.Fatalf("collectBreakerInspectors(nil) = %v, want nil", got)
+	}
+}
+
+// TestCollectBreakerInspectors_AllBackendsSurfaced — when handed a real
+// *circuit.Breakers, collectBreakerInspectors must surface every backend
+// the Breakers struct exposes (postgres_admin / postgres_k8s / redis_admin
+// / mongo_admin / k8s_api) so /readyz reports each one. A future breaker
+// added to the struct without a matching adapter entry here would silently
+// drop off /readyz; this test is the registry pin.
+func TestCollectBreakerInspectors_AllBackendsSurfaced(t *testing.T) {
+	bs := circuit.NewBreakers()
+	got := collectBreakerInspectors(bs)
+	want := map[string]bool{
+		"postgres_admin": false,
+		"postgres_k8s":   false,
+		"redis_admin":    false,
+		"mongo_admin":    false,
+		"k8s_api":        false,
+	}
+	for _, ins := range got {
+		name := ins.Name()
+		if _, ok := want[name]; !ok {
+			t.Errorf("unexpected breaker surfaced: %q", name)
+			continue
+		}
+		want[name] = true
+		// Fresh breakers start StateClosed → IsOpen() == false.
+		if ins.IsOpen() {
+			t.Errorf("breaker %q reports IsOpen()=true on a fresh Breakers — fresh state should be closed", name)
+		}
+	}
+	for name, found := range want {
+		if !found {
+			t.Errorf("breaker %q not surfaced — Breakers struct gained a backend without updating collectBreakerInspectors", name)
+		}
 	}
 }

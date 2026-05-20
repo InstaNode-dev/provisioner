@@ -41,6 +41,7 @@ import (
 
 	"instant.dev/common/crypto"
 	"instant.dev/common/logctx"
+	"instant.dev/provisioner/internal/circuit"
 	"instant.dev/provisioner/internal/config"
 	"instant.dev/provisioner/internal/handlers"
 	"instant.dev/provisioner/internal/interceptor"
@@ -48,6 +49,36 @@ import (
 	"instant.dev/provisioner/internal/server"
 	"instant.dev/provisioner/internal/telemetry"
 )
+
+// breakerAdapter wraps a *circuit.Breaker so it satisfies the
+// handlers.CircuitInspector interface (Name() / IsOpen()). The breaker's
+// own API is Backend() string + State() State for historical reasons; this
+// adapter renames+maps without changing the breaker surface every other
+// consumer relies on. A tripped breaker (StateOpen) shows up on /readyz as
+// the corresponding `backend_<name>` check in degraded state — exactly the
+// signal an operator needs to see "one downstream is sick, the pod is
+// staying in rotation while it half-opens".
+type breakerAdapter struct{ b *circuit.Breaker }
+
+func (a breakerAdapter) Name() string { return a.b.Backend() }
+func (a breakerAdapter) IsOpen() bool { return a.b.State() == circuit.StateOpen }
+
+// collectBreakerInspectors returns the per-backend breakers as the
+// CircuitInspector slice the readyz handler wants. nil-safe — if `bs` is
+// nil (test path that constructs the server without breakers) returns nil
+// and the handler registers zero backend_* checks.
+func collectBreakerInspectors(bs *circuit.Breakers) []handlers.CircuitInspector {
+	if bs == nil {
+		return nil
+	}
+	return []handlers.CircuitInspector{
+		breakerAdapter{b: bs.PostgresAdmin},
+		breakerAdapter{b: bs.PostgresK8s},
+		breakerAdapter{b: bs.RedisAdmin},
+		breakerAdapter{b: bs.MongoAdmin},
+		breakerAdapter{b: bs.K8sAPI},
+	}
+}
 
 // healthzAddr is the listen address for the HTTP sidecar. Port 8092 was
 // chosen by the rollout plan because it doesn't collide with the gRPC port
@@ -201,6 +232,18 @@ func startHealthzSidecar(ready *server.Readiness, box *poolBox, poolEnabled bool
 	// existing failed-critical signal still applies (BugBash B14-P0-F2).
 	cfg := handlers.Config{
 		PoolPinger: poolProbe{box: box},
+		// Wire the per-backend circuit breakers so /readyz surfaces a
+		// tripped breaker as `backend_<name>` degraded. The breakers run
+		// from circuit.Default (package-level) — same instance the gRPC
+		// server's callBackend wraps every backend dispatch with. A
+		// tripped breaker means the upstream is failing fast: surface
+		// that on /readyz as degraded (not failed — the breaker exists
+		// precisely so the provisioner can stay up while one backend is
+		// sick; pulling the pod from rotation would defeat the breaker).
+		// BugBash 2026-05-20 — `Circuits` had been silently empty since
+		// the deep /readyz shipped, so the breaker state was invisible
+		// to anything except logs.
+		Circuits: collectBreakerInspectors(circuit.Default),
 	}
 	if !poolEnabled {
 		cfg.PoolPinger = nil // tells NewReadyzHandler to skip the check

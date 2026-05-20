@@ -30,6 +30,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/newrelic/go-agent/v3/integrations/nrgrpc"
 	"github.com/newrelic/go-agent/v3/newrelic"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
@@ -176,7 +177,7 @@ var errPoolNotReady = errors.New("pool_not_ready")
 // poolBox starts holding nil and is populated by main once the pgxpool is up;
 // /readyz reports platform_db=failed with LastError="pgxpool_not_configured"
 // until that happens.
-func startHealthzSidecar(ready *server.Readiness, box *poolBox) *http.Server {
+func startHealthzSidecar(ready *server.Readiness, box *poolBox, poolEnabled bool) *http.Server {
 	mux := http.NewServeMux()
 	mux.Handle("/healthz", server.HealthzHandler(ready))
 
@@ -185,10 +186,34 @@ func startHealthzSidecar(ready *server.Readiness, box *poolBox) *http.Server {
 	// the deep check function inside readyzPoolPing reaches into the
 	// box at probe time so the check transitions from failed → ok the
 	// moment main.Box.Set() runs.
-	readyzH := handlers.NewReadyzHandler(handlers.Config{
+	//
+	// poolEnabled gates whether platform_db is even a registered check.
+	// When the operator intentionally runs without PROVISIONER_DATABASE_URL
+	// (hot pool disabled — gRPC provisioning works fine without it because
+	// the provisioner reads its own state from k8s + customer DB, not from
+	// the provisioner's platform DB), reporting platform_db=failed-critical
+	// → 503 forever is a false alarm. It pulls both pods out of the Service
+	// endpoint list (k8s readinessProbe == 503), silences every NR alert
+	// keyed off provisioner metrics (because /metrics goes with /readyz),
+	// and turns the api's deep-readyz provisioner_grpc check red. When
+	// the pool is intentionally disabled, omit platform_db entirely; when
+	// PROVISIONER_DATABASE_URL is set but Set() hasn't fired yet, the
+	// existing failed-critical signal still applies (BugBash B14-P0-F2).
+	cfg := handlers.Config{
 		PoolPinger: poolProbe{box: box},
-	})
+	}
+	if !poolEnabled {
+		cfg.PoolPinger = nil // tells NewReadyzHandler to skip the check
+	}
+	readyzH := handlers.NewReadyzHandler(cfg)
 	mux.HandleFunc("/readyz", readyzH.Get)
+
+	// /metrics — expose the process's default Prometheus registry so
+	// the cluster ServiceMonitor scrapes circuit breaker state, backend
+	// latency histograms, readyz_check_status gauge, and the standard
+	// Go runtime collectors. Without this handler, every NR alert keyed
+	// off provisioner_* metrics is silently dead (BugBash B14-P0-F1).
+	mux.Handle("/metrics", promhttp.Handler())
 
 	srv := &http.Server{
 		Addr:              healthzAddr,
@@ -240,7 +265,15 @@ func main() {
 	// nil until the pgxpool succeeds below.
 	readiness := &server.Readiness{}
 	poolHolder := &poolBox{}
-	healthzSrv := startHealthzSidecar(readiness, poolHolder)
+	// poolEnabled mirrors the hot-pool startup condition below. We
+	// compute it BEFORE starting the sidecar so /readyz semantics are
+	// stable from the first probe: if the pool is disabled by config,
+	// platform_db is not a registered check (no /readyz 503 forever);
+	// if it's enabled, the check is registered and starts in
+	// "pgxpool_not_configured" → flips to ok once poolHolder.Set fires.
+	cfg := config.Load()
+	poolEnabled := cfg.ProvisionerDatabaseURL != "" && cfg.AESKey != ""
+	healthzSrv := startHealthzSidecar(readiness, poolHolder, poolEnabled)
 
 	shutdownTracer := telemetry.InitTracer("instant-provisioner", os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"))
 	defer func() {
@@ -248,8 +281,6 @@ func main() {
 			slog.Error("telemetry.shutdown_failed", "error", err)
 		}
 	}()
-
-	cfg := config.Load()
 
 	// P1-M: fail closed on a missing/empty PROVISIONER_SECRET. An
 	// unauthenticated provisioner is a remote create/destroy-database surface;

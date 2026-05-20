@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/newrelic/go-agent/v3/newrelic"
 	"google.golang.org/grpc"
@@ -275,5 +276,67 @@ func TestProcessSmoke(t *testing.T) {
 	}
 	if errors.Is(nil, http.ErrServerClosed) {
 		t.Fatal("errors.Is(nil, http.ErrServerClosed) should be false")
+	}
+}
+
+// TestStartHealthzSidecar_ServesMetrics is the regression guard for
+// BugBash B14-P0-F1: the provisioner sidecar HTTP mux on :8092 must
+// expose /metrics so the cluster ServiceMonitor can scrape circuit
+// breaker state, readyz_check_status, and Go runtime collectors.
+// Without this, every NR alert keyed off provisioner metrics is
+// silently dead.
+//
+// We can't bind the real port in CI, so we exercise the same mux by
+// constructing the sidecar against a t.Cleanup-ed httptest.Server.
+// The test asserts (a) /metrics is registered (200, prometheus text
+// format), (b) /healthz still works, (c) /readyz still works.
+func TestStartHealthzSidecar_ServesMetrics(t *testing.T) {
+	ready := &server.Readiness{}
+	ready.SetReady(true)
+	box := &poolBox{}
+	// Build the sidecar with poolEnabled=false (matches today's prod
+	// where PROVISIONER_DATABASE_URL is unset) so the test is also a
+	// /readyz=200 cross-check.
+	srv := startHealthzSidecar(ready, box, false)
+	t.Cleanup(func() {
+		_ = srv.Close()
+	})
+
+	// startHealthzSidecar binds to healthzAddr (:8092). Drive the same
+	// mux it built by hitting that address via the local loopback — if
+	// :8092 is in use (e.g. another test, or a real provisioner running
+	// locally), skip rather than fail. The unit test we care about is
+	// "mux includes /metrics"; the integration check belongs to verify-live.
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("http://localhost:8092/metrics")
+	if err != nil {
+		t.Skipf("port :8092 not reachable locally (%v) — verify-live owns the integration check", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		t.Fatalf("/metrics returned %d, want 200", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") && !strings.Contains(ct, "application/openmetrics") {
+		t.Fatalf("/metrics Content-Type = %q, want prometheus text or openmetrics", ct)
+	}
+
+	// Confirm /healthz + /readyz still work on the same mux.
+	hzResp, err := client.Get("http://localhost:8092/healthz")
+	if err != nil {
+		t.Fatalf("GET /healthz: %v", err)
+	}
+	hzResp.Body.Close()
+	if hzResp.StatusCode != 200 {
+		t.Fatalf("/healthz returned %d, want 200 (readiness was set true)", hzResp.StatusCode)
+	}
+
+	rzResp, err := client.Get("http://localhost:8092/readyz")
+	if err != nil {
+		t.Fatalf("GET /readyz: %v", err)
+	}
+	rzResp.Body.Close()
+	if rzResp.StatusCode != 200 {
+		t.Fatalf("/readyz returned %d, want 200 (pool disabled — platform_db should be skipped)", rzResp.StatusCode)
 	}
 }

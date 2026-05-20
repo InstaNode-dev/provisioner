@@ -25,6 +25,7 @@ import (
 	"instant.dev/provisioner/internal/backend/queue"
 	"instant.dev/provisioner/internal/backend/redis"
 	"instant.dev/provisioner/internal/backend/storage"
+	"instant.dev/provisioner/internal/circuit"
 	"instant.dev/provisioner/internal/config"
 	"instant.dev/provisioner/internal/ctxkeys"
 	"instant.dev/provisioner/internal/pool"
@@ -65,6 +66,16 @@ type Server struct {
 	dedicatedMongoBackend    mongo.Backend         // nil if not configured; used for Pro/Team tier
 	dedicatedQueueBackend    queue.Backend         // nil if not configured; used for Pro/Team tier
 	pool                     *pool.Manager         // nil if pool is disabled
+
+	// breakers — per-backend in-process circuit breakers (audit P0-3).
+	// Independent instance per backend so a Redis outage cannot trip the
+	// Postgres breaker. See internal/circuit/breakers.go for the full set
+	// (postgres_k8s, postgres_admin, redis_admin, mongo_admin, k8s_api).
+	//
+	// Tests construct a fresh Breakers via circuit.NewBreakers() and pass
+	// it through NewWithBackends so per-test breaker state stays local;
+	// production wires this to circuit.Default in New().
+	breakers *circuit.Breakers
 }
 
 // New creates a Server with backends and optional pool manager.
@@ -168,7 +179,87 @@ func NewWithBackends(
 		dedicatedMongoBackend:    dedicatedMongo,
 		dedicatedQueueBackend:    dedicatedQueue,
 		pool:                     poolMgr,
+		// circuit.Default is the process-wide breaker set. Tests inject
+		// their own via SetBreakers() (or NewServerForTest) so per-test
+		// trips don't bleed into other tests.
+		breakers: circuit.Default,
 	}
+}
+
+// SetBreakers replaces the breaker set used by every backend dispatch path.
+// Test-only entry point — production code wires circuit.Default in
+// NewWithBackends and never calls this. Returns the server for chaining.
+func (s *Server) SetBreakers(b *circuit.Breakers) *Server {
+	s.breakers = b
+	return s
+}
+
+// breakerForPostgres returns the right breaker for a Postgres call: the
+// `postgres_k8s` breaker when the dedicated k8s backend will be used (Pro/
+// Team/Growth tier with a configured dedicated backend), and the
+// `postgres_admin` breaker for shared-cluster calls through LocalBackend.
+//
+// Routing here MUST match the same isDedicatedTier + non-nil-backend gate
+// the provision/deprovision/storage handlers use — otherwise a call wrapped
+// against `postgres_k8s` could end up dispatched to `local.go` (or vice
+// versa) and the breaker would protect the wrong downstream.
+//
+// For deprovision/storage paths that dispatch on PRID prefix
+// ("instant-customer-" → dedicated k8s, else shared) the caller passes
+// `useDedicated=true` directly.
+func (s *Server) breakerForPostgres(useDedicated bool) *circuit.Breaker {
+	if useDedicated {
+		return s.breakers.PostgresK8s
+	}
+	return s.breakers.PostgresAdmin
+}
+
+// breakerForRedis returns the right breaker for a Redis call. The shared
+// LocalBackend manipulates the redis-provision ACL (the "Redis admin"
+// surface in the brief); the dedicated k8s backend issues raw kube-
+// apiserver calls (the "k8s_api" surface).
+func (s *Server) breakerForRedis(useDedicated bool) *circuit.Breaker {
+	if useDedicated {
+		return s.breakers.K8sAPI
+	}
+	return s.breakers.RedisAdmin
+}
+
+// breakerForMongo — shared Mongo backend issues admin CREATE USER on the
+// shared cluster (`mongo_admin`); dedicated k8s backend issues kube-
+// apiserver calls (`k8s_api`).
+func (s *Server) breakerForMongo(useDedicated bool) *circuit.Breaker {
+	if useDedicated {
+		return s.breakers.K8sAPI
+	}
+	return s.breakers.MongoAdmin
+}
+
+// callBackend wraps a backend invocation behind the given breaker. Returns
+// circuit.ErrOpen verbatim when the breaker is open so the caller can map
+// it to a gRPC Unavailable via mapError. The breaker's caller-deadline
+// filter (audit P1-1) is built into circuit.Breaker.Record itself; a fn
+// that returns context.Canceled / context.DeadlineExceeded will NOT count
+// toward the failure threshold.
+func callBackend[T any](b *circuit.Breaker, fn func() (T, error)) (T, error) {
+	var zero T
+	if !b.Allow() {
+		return zero, circuit.ErrOpen
+	}
+	v, err := fn()
+	b.Record(err)
+	return v, err
+}
+
+// callBackendVoid is the no-return-value flavour of callBackend, used by
+// Deprovision paths whose backend methods return only error.
+func callBackendVoid(b *circuit.Breaker, fn func() error) error {
+	if !b.Allow() {
+		return circuit.ErrOpen
+	}
+	err := fn()
+	b.Record(err)
+	return err
 }
 
 // PostgresBackend returns the shared Postgres backend. Used by main to start
@@ -241,7 +332,10 @@ func (s *Server) provisionPostgres(ctx context.Context, req *provisionerv1.Provi
 	// Pro and team tiers with a configured dedicated backend skip the shared pool entirely.
 	if isDedicatedTier(req.Tier) && s.dedicatedPostgresBackend != nil {
 		slog.Info("server.provisionPostgres: using dedicated backend", "token", req.Token, "tier", req.Tier)
-		creds, err := s.dedicatedPostgresBackend.Provision(ctx, req.Token, req.Tier, connLimit)
+		// Breaker: postgres_k8s — dedicated k8s Postgres pod ops.
+		creds, err := callBackend(s.breakerForPostgres(true), func() (*postgres.Credentials, error) {
+			return s.dedicatedPostgresBackend.Provision(ctx, req.Token, req.Tier, connLimit)
+		})
 		if err != nil {
 			return nil, mapError("ProvisionResource.postgres.dedicated", err)
 		}
@@ -312,7 +406,15 @@ func (s *Server) provisionPostgres(ctx context.Context, req *provisionerv1.Provi
 
 	// Pool miss — live provision.
 	slog.Info("server.provisionPostgres: pool miss, provisioning live", "token", req.Token, "conn_limit", connLimit)
-	creds, err := s.postgresBackend.Provision(ctx, req.Token, req.Tier, connLimit)
+	// Breaker: postgres_admin — shared postgres-customers CREATE DATABASE /
+	// CREATE USER (local.go) when LocalBackend is the active type; the
+	// dedicated k8s backend (when wired here as a fallback in unusual
+	// configs) gets the same `postgres_admin` breaker because it would be
+	// hitting the SHARED cluster — the dedicated case above is already
+	// dispatched to `postgres_k8s`.
+	creds, err := callBackend(s.breakerForPostgres(false), func() (*postgres.Credentials, error) {
+		return s.postgresBackend.Provision(ctx, req.Token, req.Tier, connLimit)
+	})
 	if err != nil {
 		return nil, mapError("ProvisionResource.postgres", err)
 	}
@@ -328,7 +430,10 @@ func (s *Server) provisionRedis(ctx context.Context, req *provisionerv1.Provisio
 	// Pro and team tiers with a configured dedicated backend skip the shared pool entirely.
 	if isDedicatedTier(req.Tier) && s.dedicatedRedisBackend != nil {
 		slog.Info("server.provisionRedis: using dedicated backend", "token", req.Token, "tier", req.Tier)
-		creds, err := s.dedicatedRedisBackend.Provision(ctx, req.Token, req.Tier)
+		// Breaker: k8s_api — dedicated Redis pod ops issue kube-apiserver calls.
+		creds, err := callBackend(s.breakerForRedis(true), func() (*redis.Credentials, error) {
+			return s.dedicatedRedisBackend.Provision(ctx, req.Token, req.Tier)
+		})
 		if err != nil {
 			return nil, mapError("ProvisionResource.redis.dedicated", err)
 		}
@@ -358,7 +463,10 @@ func (s *Server) provisionRedis(ctx context.Context, req *provisionerv1.Provisio
 	}
 
 	slog.Info("server.provisionRedis: pool miss, provisioning live", "token", req.Token)
-	creds, err := s.redisBackend.Provision(ctx, req.Token, req.Tier)
+	// Breaker: redis_admin — shared Redis ACL provider (local.go) operations.
+	creds, err := callBackend(s.breakerForRedis(false), func() (*redis.Credentials, error) {
+		return s.redisBackend.Provision(ctx, req.Token, req.Tier)
+	})
 	if err != nil {
 		return nil, mapError("ProvisionResource.redis", err)
 	}
@@ -372,7 +480,10 @@ func (s *Server) provisionMongo(ctx context.Context, req *provisionerv1.Provisio
 	// Pro and team tiers with a configured dedicated backend skip the shared pool entirely.
 	if isDedicatedTier(req.Tier) && s.dedicatedMongoBackend != nil {
 		slog.Info("server.provisionMongo: using dedicated backend", "token", req.Token, "tier", req.Tier)
-		creds, err := s.dedicatedMongoBackend.Provision(ctx, req.Token, req.Tier)
+		// Breaker: k8s_api — dedicated Mongo pod ops go through kube-apiserver.
+		creds, err := callBackend(s.breakerForMongo(true), func() (*mongo.Credentials, error) {
+			return s.dedicatedMongoBackend.Provision(ctx, req.Token, req.Tier)
+		})
 		if err != nil {
 			return nil, mapError("ProvisionResource.mongo.dedicated", err)
 		}
@@ -402,7 +513,10 @@ func (s *Server) provisionMongo(ctx context.Context, req *provisionerv1.Provisio
 	}
 
 	slog.Info("server.provisionMongo: pool miss, provisioning live", "token", req.Token)
-	creds, err := s.mongoBackend.Provision(ctx, req.Token, req.Tier)
+	// Breaker: mongo_admin — shared MongoDB CREATE USER / role grants.
+	creds, err := callBackend(s.breakerForMongo(false), func() (*mongo.Credentials, error) {
+		return s.mongoBackend.Provision(ctx, req.Token, req.Tier)
+	})
 	if err != nil {
 		return nil, mapError("ProvisionResource.mongo", err)
 	}
@@ -486,12 +600,18 @@ func (s *Server) DeprovisionResource(ctx context.Context, req *provisionerv1.Dep
 			!strings.HasPrefix(req.ProviderResourceId, "instant-customer-") {
 			slog.Info("server.DeprovisionResource: postgres using dedicated backend",
 				"token", req.Token, "provider_resource_id", req.ProviderResourceId)
-			if err := s.dedicatedPostgresBackend.Deprovision(ctx, req.Token, req.ProviderResourceId); err != nil {
+			// Breaker: postgres_k8s — dedicated Postgres teardown.
+			if err := callBackendVoid(s.breakerForPostgres(true), func() error {
+				return s.dedicatedPostgresBackend.Deprovision(ctx, req.Token, req.ProviderResourceId)
+			}); err != nil {
 				return nil, mapError("DeprovisionResource.postgres.dedicated", err)
 			}
 			return &provisionerv1.DeprovisionResponse{Deprovisioned: true}, nil
 		}
-		if err := s.postgresBackend.Deprovision(ctx, req.Token, req.ProviderResourceId); err != nil {
+		// Breaker: postgres_admin — shared cluster DROP DATABASE / DROP USER.
+		if err := callBackendVoid(s.breakerForPostgres(false), func() error {
+			return s.postgresBackend.Deprovision(ctx, req.Token, req.ProviderResourceId)
+		}); err != nil {
 			return nil, mapError("DeprovisionResource.postgres", err)
 		}
 		return &provisionerv1.DeprovisionResponse{Deprovisioned: true}, nil
@@ -503,12 +623,18 @@ func (s *Server) DeprovisionResource(ctx context.Context, req *provisionerv1.Dep
 			!strings.HasPrefix(req.ProviderResourceId, "instant-customer-") {
 			slog.Info("server.DeprovisionResource: redis using dedicated backend",
 				"token", req.Token, "provider_resource_id", req.ProviderResourceId)
-			if err := s.dedicatedRedisBackend.Deprovision(ctx, req.Token, req.ProviderResourceId); err != nil {
+			// Breaker: k8s_api — dedicated Redis pod teardown via kube-apiserver.
+			if err := callBackendVoid(s.breakerForRedis(true), func() error {
+				return s.dedicatedRedisBackend.Deprovision(ctx, req.Token, req.ProviderResourceId)
+			}); err != nil {
 				return nil, mapError("DeprovisionResource.redis.dedicated", err)
 			}
 			return &provisionerv1.DeprovisionResponse{Deprovisioned: true}, nil
 		}
-		if err := s.redisBackend.Deprovision(ctx, req.Token, req.ProviderResourceId); err != nil {
+		// Breaker: redis_admin — shared Redis ACL DELUSER / namespace cleanup.
+		if err := callBackendVoid(s.breakerForRedis(false), func() error {
+			return s.redisBackend.Deprovision(ctx, req.Token, req.ProviderResourceId)
+		}); err != nil {
 			return nil, mapError("DeprovisionResource.redis", err)
 		}
 		return &provisionerv1.DeprovisionResponse{Deprovisioned: true}, nil
@@ -518,12 +644,18 @@ func (s *Server) DeprovisionResource(ctx context.Context, req *provisionerv1.Dep
 			!strings.HasPrefix(req.ProviderResourceId, "instant-customer-") {
 			slog.Info("server.DeprovisionResource: mongo using dedicated backend",
 				"token", req.Token, "provider_resource_id", req.ProviderResourceId)
-			if err := s.dedicatedMongoBackend.Deprovision(ctx, req.Token, req.ProviderResourceId); err != nil {
+			// Breaker: k8s_api — dedicated Mongo pod teardown via kube-apiserver.
+			if err := callBackendVoid(s.breakerForMongo(true), func() error {
+				return s.dedicatedMongoBackend.Deprovision(ctx, req.Token, req.ProviderResourceId)
+			}); err != nil {
 				return nil, mapError("DeprovisionResource.mongo.dedicated", err)
 			}
 			return &provisionerv1.DeprovisionResponse{Deprovisioned: true}, nil
 		}
-		if err := s.mongoBackend.Deprovision(ctx, req.Token, req.ProviderResourceId); err != nil {
+		// Breaker: mongo_admin — shared MongoDB DROP USER / DROP DATABASE.
+		if err := callBackendVoid(s.breakerForMongo(false), func() error {
+			return s.mongoBackend.Deprovision(ctx, req.Token, req.ProviderResourceId)
+		}); err != nil {
 			return nil, mapError("DeprovisionResource.mongo", err)
 		}
 		return &provisionerv1.DeprovisionResponse{Deprovisioned: true}, nil
@@ -575,7 +707,10 @@ func (s *Server) GetStorageBytes(ctx context.Context, req *provisionerv1.Storage
 		// measure the wrong instance or fail outright.
 		if s.dedicatedPostgresBackend != nil && req.ProviderResourceId != "" &&
 			!isSharedBackendProviderID(req.ProviderResourceId) {
-			bytes, err := s.dedicatedPostgresBackend.StorageBytes(ctx, req.Token, req.ProviderResourceId)
+			// Breaker: postgres_k8s — dedicated Postgres pg_database_size.
+			bytes, err := callBackend(s.breakerForPostgres(true), func() (int64, error) {
+				return s.dedicatedPostgresBackend.StorageBytes(ctx, req.Token, req.ProviderResourceId)
+			})
 			if err != nil {
 				return nil, mapError("GetStorageBytes.postgres.dedicated", err)
 			}
@@ -584,7 +719,10 @@ func (s *Server) GetStorageBytes(ctx context.Context, req *provisionerv1.Storage
 				MeasuredAt:   time.Now().Unix(),
 			}, nil
 		}
-		bytes, err := s.postgresBackend.StorageBytes(ctx, req.Token, req.ProviderResourceId)
+		// Breaker: postgres_admin — shared cluster pg_database_size query.
+		bytes, err := callBackend(s.breakerForPostgres(false), func() (int64, error) {
+			return s.postgresBackend.StorageBytes(ctx, req.Token, req.ProviderResourceId)
+		})
 		if err != nil {
 			return nil, mapError("GetStorageBytes.postgres", err)
 		}
@@ -601,7 +739,10 @@ func (s *Server) GetStorageBytes(ctx context.Context, req *provisionerv1.Storage
 		// actually lives on, not a dedicated instance that does not exist.
 		if s.dedicatedRedisBackend != nil && req.ProviderResourceId != "" &&
 			!isSharedBackendProviderID(req.ProviderResourceId) {
-			bytes, err := s.dedicatedRedisBackend.StorageBytes(ctx, req.Token, req.ProviderResourceId)
+			// Breaker: k8s_api — dedicated Redis MEMORY USAGE via the pod's kube-exec channel.
+			bytes, err := callBackend(s.breakerForRedis(true), func() (int64, error) {
+				return s.dedicatedRedisBackend.StorageBytes(ctx, req.Token, req.ProviderResourceId)
+			})
 			if err != nil {
 				return nil, mapError("GetStorageBytes.redis.dedicated", err)
 			}
@@ -610,7 +751,10 @@ func (s *Server) GetStorageBytes(ctx context.Context, req *provisionerv1.Storage
 				MeasuredAt:   time.Now().Unix(),
 			}, nil
 		}
-		bytes, err := s.redisBackend.StorageBytes(ctx, req.Token, req.ProviderResourceId)
+		// Breaker: redis_admin — shared Redis MEMORY USAGE / DBSIZE query.
+		bytes, err := callBackend(s.breakerForRedis(false), func() (int64, error) {
+			return s.redisBackend.StorageBytes(ctx, req.Token, req.ProviderResourceId)
+		})
 		if err != nil {
 			return nil, mapError("GetStorageBytes.redis", err)
 		}
@@ -620,7 +764,10 @@ func (s *Server) GetStorageBytes(ctx context.Context, req *provisionerv1.Storage
 		}, nil
 
 	case commonv1.ResourceType_RESOURCE_TYPE_MONGODB:
-		bytes, err := s.mongoBackend.StorageBytes(ctx, req.Token, req.ProviderResourceId)
+		// Breaker: mongo_admin — shared MongoDB dbStats command.
+		bytes, err := callBackend(s.breakerForMongo(false), func() (int64, error) {
+			return s.mongoBackend.StorageBytes(ctx, req.Token, req.ProviderResourceId)
+		})
 		if err != nil {
 			return nil, mapError("GetStorageBytes.mongo", err)
 		}
@@ -769,7 +916,13 @@ func (s *Server) regradePostgres(ctx context.Context, req *provisionerv1.Regrade
 	// backend does the same against the pod-local Postgres.
 	connLimit := regradeConnLimits.ConnectionsLimit(req.Tier, "postgres")
 
-	result, err := backend.Regrade(ctx, req.Token, req.ProviderResourceId, connLimit)
+	// Pick the breaker that matches the backend we just routed to: dedicated
+	// k8s backend → `postgres_k8s`; LocalBackend → `postgres_admin`. Mirrors
+	// the routing branch above.
+	regradeBreaker := s.breakerForPostgres(backend == s.dedicatedPostgresBackend)
+	result, err := callBackend(regradeBreaker, func() (postgres.RegradeResult, error) {
+		return backend.Regrade(ctx, req.Token, req.ProviderResourceId, connLimit)
+	})
 	if err != nil {
 		return nil, mapError("RegradeResource.postgres", err)
 	}
@@ -878,7 +1031,11 @@ func (s *Server) regradeRedis(ctx context.Context, req *provisionerv1.RegradeReq
 		targetMaxmemoryMB = 0
 	}
 
-	result, err := regrader.Regrade(ctx, req.Token, effectivePRID, targetMaxmemoryMB)
+	// Breaker: k8s_api — Regrade on the dedicated Redis pod goes through the
+	// kube-apiserver (CONFIG SET via pod-exec or direct AUTH-then-CONFIG-SET).
+	result, err := callBackend(s.breakerForRedis(true), func() (redis.RegradeResult, error) {
+		return regrader.Regrade(ctx, req.Token, effectivePRID, targetMaxmemoryMB)
+	})
 	if err != nil {
 		return nil, mapError("RegradeResource.redis", err)
 	}
@@ -919,6 +1076,15 @@ func (s *Server) regradeRedis(ctx context.Context, req *provisionerv1.RegradeReq
 func mapError(op string, err error) error {
 	if err == nil {
 		return nil
+	}
+	// Audit P0-3: a breaker-open response from any per-backend in-process
+	// circuit MUST surface as gRPC Unavailable so the api caller can react
+	// cleanly. Returning Internal would defeat the whole point of the
+	// breaker — the api side would treat it as a non-retryable failure and
+	// pass it through to the agent as a 500.
+	if errors.Is(err, circuit.ErrOpen) {
+		slog.Warn(fmt.Sprintf("server.%s", op), "circuit", "open", "error", err.Error())
+		return status.Errorf(codes.Unavailable, "%s: provisioner circuit open: %v", op, err)
 	}
 	msg := err.Error()
 	slog.Error(fmt.Sprintf("server.%s", op), "error", msg)

@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -31,6 +32,8 @@ import (
 	"github.com/newrelic/go-agent/v3/newrelic"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/health"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/keepalive"
 
 	provisionerv1 "instant.dev/proto/provisioner/v1"
@@ -38,6 +41,7 @@ import (
 	"instant.dev/common/crypto"
 	"instant.dev/common/logctx"
 	"instant.dev/provisioner/internal/config"
+	"instant.dev/provisioner/internal/handlers"
 	"instant.dev/provisioner/internal/interceptor"
 	"instant.dev/provisioner/internal/pool"
 	"instant.dev/provisioner/internal/server"
@@ -123,6 +127,42 @@ func stampTraceIDFromNR(ctx context.Context) context.Context {
 	return logctx.WithTraceID(ctx, md.TraceID)
 }
 
+// poolBox is a goroutine-safe holder for the lazily-initialized
+// pgxpool. The HTTP sidecar binds before the pool exists (so /healthz
+// stays available during pool boot), but /readyz needs to probe the
+// pool once it's up. The box bridges the two: at boot, /readyz reports
+// platform_db=failed; after the pool is set, /readyz starts pinging it.
+type poolBox struct {
+	mu   sync.Mutex
+	pool *pgxpool.Pool
+}
+
+func (b *poolBox) Get() *pgxpool.Pool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.pool
+}
+
+func (b *poolBox) Set(p *pgxpool.Pool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.pool = p
+}
+
+// poolProbe adapts the box to the handlers.Config.Pool API by lazily
+// fetching the pool at probe time.
+type poolProbe struct{ box *poolBox }
+
+func (p poolProbe) Ping(ctx context.Context) error {
+	pool := p.box.Get()
+	if pool == nil {
+		return errPoolNotReady
+	}
+	return pool.Ping(ctx)
+}
+
+var errPoolNotReady = errors.New("pool_not_ready")
+
 // startHealthzSidecar starts the HTTP server on healthzAddr in a goroutine.
 // Returns the *http.Server so the caller can shut it down cleanly. The
 // listener errors are logged but never crash the process — losing /healthz
@@ -131,9 +171,24 @@ func stampTraceIDFromNR(ctx context.Context) context.Context {
 // The readiness gate is wired into the handler so /healthz reports ok:false
 // (HTTP 503) until the gRPC listener is up and again once shutdown begins,
 // instead of an unconditional ok:true the instant the HTTP sidecar binds.
-func startHealthzSidecar(readiness *server.Readiness) *http.Server {
+//
+// readyz is the new deep readiness probe — see internal/handlers/readyz.go.
+// poolBox starts holding nil and is populated by main once the pgxpool is up;
+// /readyz reports platform_db=failed with LastError="pgxpool_not_configured"
+// until that happens.
+func startHealthzSidecar(ready *server.Readiness, box *poolBox) *http.Server {
 	mux := http.NewServeMux()
-	mux.Handle("/healthz", server.HealthzHandler(readiness))
+	mux.Handle("/healthz", server.HealthzHandler(ready))
+
+	// /readyz — wraps the box so the pool can be set after the sidecar
+	// is bound. The handler is constructed here (once) with a Pool=nil;
+	// the deep check function inside readyzPoolPing reaches into the
+	// box at probe time so the check transitions from failed → ok the
+	// moment main.Box.Set() runs.
+	readyzH := handlers.NewReadyzHandler(handlers.Config{
+		PoolPinger: poolProbe{box: box},
+	})
+	mux.HandleFunc("/readyz", readyzH.Get)
 
 	srv := &http.Server{
 		Addr:              healthzAddr,
@@ -178,8 +233,14 @@ func main() {
 	// while the gRPC server is still booting backends. The readiness gate
 	// starts "not ready" and flips true only once the gRPC listener binds
 	// below, so /healthz does not lie ok:true during backend boot.
+	//
+	// poolHolder is the lazy slot the /readyz handler reads at probe
+	// time. Bound to the box BEFORE the sidecar starts so the wire
+	// shape is stable from the first probe; the box's pool field stays
+	// nil until the pgxpool succeeds below.
 	readiness := &server.Readiness{}
-	healthzSrv := startHealthzSidecar(readiness)
+	poolHolder := &poolBox{}
+	healthzSrv := startHealthzSidecar(readiness, poolHolder)
 
 	shutdownTracer := telemetry.InitTracer("instant-provisioner", os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"))
 	defer func() {
@@ -239,6 +300,12 @@ func main() {
 		if pingErr != nil {
 			slog.Warn("provisioner.pool_db_ping_failed — pool disabled", "error", pingErr)
 		} else {
+			// Pool is up — surface it on /readyz via the lazy box so the
+			// platform_db check transitions from failed → ok. Done BEFORE
+			// pool.Manager.Start so a slow refill doesn't keep /readyz red
+			// (the DB is reachable; the refill is async).
+			poolHolder.Set(dbPool)
+
 			// Build pool manager — it shares the same backends as the server.
 			// The server's New() also initialises its own backend instances;
 			// pool uses separate instances pointing to the same infrastructure.
@@ -304,6 +371,18 @@ func main() {
 
 	provisionerv1.RegisterProvisionerServiceServer(grpcServer, srv)
 
+	// Register the standard grpc.health.v1 service. The api's /readyz
+	// uses this to probe the provisioner — see api/internal/provisioner/
+	// client.go HealthCheck(). We mark the empty-string service ("")
+	// SERVING immediately because the gRPC listener is about to bind
+	// below; if a future refactor moves the bind earlier or later,
+	// this status flip should move with it. (The HTTP sidecar's
+	// readiness gate is the source of truth for HTTP probes; this is
+	// the gRPC mirror.)
+	healthSrv := health.NewServer()
+	healthSrv.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
+	healthpb.RegisterHealthServer(grpcServer, healthSrv)
+
 	lis, err := net.Listen("tcp", ":"+cfg.Port)
 	if err != nil {
 		slog.Error("provisioner.listen_failed", "port", cfg.Port, "error", err)
@@ -346,6 +425,10 @@ func main() {
 	// drain window reports ok:false (503) and k8s pulls the pod out of the
 	// Service endpoints before in-flight gRPC calls are torn down.
 	readiness.SetReady(false)
+	// Mirror to the gRPC health server so any in-flight grpc.health.v1
+	// probe from the api gets NOT_SERVING and the api's /readyz turns
+	// the provisioner_grpc check red before our actual RPC teardown.
+	healthSrv.SetServingStatus("", healthpb.HealthCheckResponse_NOT_SERVING)
 
 	// Graceful shutdown of both surfaces. GracefulStop on grpc.Server drains
 	// in-flight calls; Shutdown on the HTTP server gives /healthz a 5s window.

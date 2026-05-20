@@ -47,11 +47,18 @@ func TestReadyz_AllOK(t *testing.T) {
 	}
 }
 
-// TestReadyz_PoolNotConfigured_Is503 — when poolHolder hasn't been
-// .Set'ed yet (or PROVISIONER_DATABASE_URL is unset), platform_db
-// reports failed-critical → 503. This is the wire signal the operator
-// reads to spot a pool-init failure.
-func TestReadyz_PoolNotConfigured_Is503(t *testing.T) {
+// TestReadyz_PoolDisabled_Is200 — when the operator intentionally
+// runs without a PROVISIONER_DATABASE_URL (hot pool feature off),
+// main.go passes PoolPinger=nil to signal "skip platform_db
+// entirely." The provisioner serves gRPC fine without the pool, so
+// /readyz must return 200/ok rather than 503-ing the pod out of
+// the Service endpoints (which would also blackout /metrics
+// scraping → silently dead NR alerts). See BugBash B14-P0-F2.
+//
+// This replaces the prior TestReadyz_PoolNotConfigured_Is503 which
+// encoded the broken semantics — a nil PoolPinger no longer means
+// "failed", it means "not a registered check at all."
+func TestReadyz_PoolDisabled_Is200(t *testing.T) {
 	h := handlers.NewReadyzHandler(handlers.Config{
 		PoolPinger: nil,
 	})
@@ -59,13 +66,42 @@ func TestReadyz_PoolNotConfigured_Is503(t *testing.T) {
 	req := httptest.NewRequest("GET", "/readyz", nil)
 	h.Get(rr, req)
 
-	if rr.Code != 503 {
-		t.Fatalf("nil PoolPinger must yield 503, got %d", rr.Code)
+	if rr.Code != 200 {
+		t.Fatalf("nil PoolPinger (pool intentionally disabled) must yield 200, got %d", rr.Code)
 	}
 	var got readiness.Response
-	_ = json.Unmarshal(rr.Body.Bytes(), &got)
-	if got.Overall != readiness.StatusFailed {
-		t.Fatalf("want failed, got %q", got.Overall)
+	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+		t.Fatalf("body not valid JSON: %v", err)
+	}
+	if got.Overall != readiness.StatusOK {
+		t.Fatalf("want overall=ok, got %q", got.Overall)
+	}
+	// platform_db must NOT appear in the checks list when the pool
+	// is disabled — registering an always-ok or always-failed dummy
+	// check would re-introduce the false-alarm pattern.
+	for _, c := range got.Checks {
+		if c.Name == "platform_db" {
+			t.Fatalf("platform_db check must be omitted when pool is disabled; found %+v", c)
+		}
+	}
+}
+
+// TestReadyz_PoolEnabledButNotReady_Is503 — guards the failure
+// mode the new nil semantics could hide. When PROVISIONER_DATABASE_URL
+// is set (so main wires a real poolProbe adapter), but the lazy
+// poolHolder.Set() has not fired yet because the DB was unreachable
+// at boot, platform_db must surface as failed-critical → 503 so the
+// operator sees the wire signal. The fake adapter returns the same
+// "pool_not_ready" error path the production lazy adapter uses.
+func TestReadyz_PoolEnabledButNotReady_Is503(t *testing.T) {
+	h := handlers.NewReadyzHandler(handlers.Config{
+		PoolPinger: fakePool{err: errors.New("pool_not_ready")},
+	})
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/readyz", nil)
+	h.Get(rr, req)
+	if rr.Code != 503 {
+		t.Fatalf("pool wired but unset must yield 503, got %d", rr.Code)
 	}
 }
 

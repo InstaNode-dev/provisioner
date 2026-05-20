@@ -71,9 +71,18 @@ type ReadyzHandler struct {
 // Config tunes the handler's behavior.
 type Config struct {
 	// PoolPinger is the lazy adapter around the platform/pool DB
-	// connection. May be nil — in which case the platform_db check
-	// reports failed; the operator can see from the wire that
-	// PROVISIONER_DATABASE_URL is unset.
+	// connection. When non-nil, the platform_db check pings it on
+	// every probe (with a 2s timeout, reported as failed-critical on
+	// nil-pool / ping-error). When nil, platform_db is NOT registered
+	// as a check — operator's intentional choice when the hot-pool
+	// feature is disabled (no PROVISIONER_DATABASE_URL). The
+	// provisioner serves gRPC fine without the pool, so its /readyz
+	// must not 503 the pod out of the Service endpoints over a
+	// missing optional dependency. See BugBash B14-P0-F2.
+	//
+	// Production callers wire the lazy poolProbe adapter when
+	// PROVISIONER_DATABASE_URL + AES_KEY are set, and pass nil
+	// otherwise.
 	PoolPinger PoolPinger
 	// Circuits are the per-backend breakers (postgres / redis / mongo
 	// / storage / queue). Each one surfaces as a non-critical
@@ -104,18 +113,26 @@ func NewReadyzHandler(cfg Config) *ReadyzHandler {
 
 // buildChecks registers:
 //   - platform_db (CRITICAL): the provisioner's own pgxpool. If the
-//     hot-pool DB is unreachable, the provisioner can't even read its
-//     own state — pull from rotation.
+//     hot-pool DB is unreachable while the pool is enabled, the
+//     provisioner can't read its own state — pull from rotation.
+//     OMITTED entirely when h.pool == nil — the hot-pool feature is
+//     intentionally disabled (no PROVISIONER_DATABASE_URL) and gRPC
+//     serving doesn't need it. Registering a failed-critical check
+//     in that mode 503s the pod out of the Service endpoints and
+//     blocks Prometheus scraping every gauge in the process (the NR
+//     alert pipeline blackouts), which is the exact failure mode
+//     BugBash B14-P0-F2 surfaced in prod.
 //   - backend_<name> (non-critical): one per circuit breaker. A
 //     tripped breaker surfaces as degraded. The breaker has its own
 //     half-open recovery so /readyz only mirrors it.
 func (h *ReadyzHandler) buildChecks() []readiness.Check {
-	checks := []readiness.Check{
-		{
+	checks := []readiness.Check{}
+	if h.pool != nil {
+		checks = append(checks, readiness.Check{
 			Name:     "platform_db",
 			Critical: true,
 			Fn:       h.platformDBCheck(),
-		},
+		})
 	}
 	for _, c := range h.circuits {
 		c := c // capture

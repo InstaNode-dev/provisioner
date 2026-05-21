@@ -346,11 +346,37 @@ func main() {
 			os.Exit(1)
 		}
 
-		dbPool, err := pgxpool.New(context.Background(), cfg.ProvisionerDatabaseURL)
+		// Wave-3 chaos verify (2026-05-21): use bounded pgxpool config
+		// instead of pgxpool.New's defaults (default MaxConns =
+		// max(4, runtime.NumCPU()) which under-bounds on big-CPU
+		// nodes). newBoundedPgxPoolConfig also reads
+		// PROVISIONER_PG_MAX_CONNS / PROVISIONER_PG_MIN_CONNS /
+		// PROVISIONER_PG_CONN_MAX_LIFETIME / PROVISIONER_PG_CONN_MAX_IDLE_TIME
+		// so the operator can raise the ceiling per-environment.
+		pgxCfg, err := newBoundedPgxPoolConfig(cfg.ProvisionerDatabaseURL)
+		if err != nil {
+			slog.Error("provisioner.pool_db_parse_failed", "error", err)
+			os.Exit(1)
+		}
+		slog.Info("provisioner.pool_db_config_resolved",
+			"max_conns", pgxCfg.MaxConns,
+			"min_conns", pgxCfg.MinConns,
+			"max_conn_lifetime", pgxCfg.MaxConnLifetime.String(),
+			"max_conn_idle_time", pgxCfg.MaxConnIdleTime.String(),
+		)
+		dbPool, err := pgxpool.NewWithConfig(context.Background(), pgxCfg)
 		if err != nil {
 			slog.Error("provisioner.pool_db_connect_failed", "error", err)
 			os.Exit(1)
 		}
+
+		// Pool-saturation observability. Goroutine ticks every 5s
+		// and pushes pgxpool.Stat onto instant_pg_pool_* Prometheus
+		// gauges. Lives for the process lifetime; the cancel function
+		// is wired into the existing shutdown path via context.
+		poolStatsCtx, poolStatsCancel := context.WithCancel(context.Background())
+		defer poolStatsCancel()
+		go startPgxPoolStatsExporter(poolStatsCtx, dbPool, "provisioner_db")
 
 		// Verify connectivity with retries — k3s/Flannel sometimes needs a moment
 		// to establish ClusterIP routing in a freshly-started container.

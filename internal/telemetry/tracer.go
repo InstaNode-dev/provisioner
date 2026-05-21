@@ -98,7 +98,7 @@ func InitTracer(serviceName, otlpEndpoint string) func(context.Context) error {
 		return func(context.Context) error { return nil }
 	}
 
-	res, err := resource.New(ctx,
+	res, err := newResource(ctx,
 		resource.WithAttributes(semconv.ServiceName(serviceName)),
 	)
 	if err != nil {
@@ -132,6 +132,15 @@ func InitTracer(serviceName, otlpEndpoint string) func(context.Context) error {
 		return nil
 	}
 }
+
+// newResource is the indirection point for resource.New so a unit test can
+// force the resource-construction-failed branch without touching the OTel
+// SDK internals. Production code calls resource.New unchanged — this var
+// holds the production reference and only a test reassigns it (then defers
+// restore). The defensive branch it guards (`telemetry.resource_failed` →
+// no-op fallback) is part of the "InitTracer NEVER crashes" contract; the
+// indirection is the cheapest way to keep that contract exercised by tests.
+var newResource = resource.New
 
 // shouldUseTLS returns true when the OTLP endpoint should be dialed over
 // TLS. Heuristics, in order:

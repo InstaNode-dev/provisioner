@@ -231,9 +231,18 @@ func (m *Manager) triggerRefill(resourceType string) {
 	}
 }
 
+// runTickInterval is the cadence of the maintenance loop's periodic
+// health-check tick. Exposed as a package-private var (not a const) so a
+// unit test can shorten it to a few milliseconds and exercise the ticker
+// arm of the select within a sub-second test budget. Production code never
+// reassigns it. Changing the default also changes the load profile against
+// the customer DB (every tick is a count query per resource type) — pick
+// a value above 1s to keep the steady-state cost negligible.
+var runTickInterval = 30 * time.Second
+
 func (m *Manager) run(ctx context.Context) {
 	defer m.wg.Done()
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(runTickInterval)
 	defer ticker.Stop()
 
 	for {

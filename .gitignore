@@ -19,3 +19,6 @@ vendor/
 # OS
 .DS_Store
 
+
+# Internal Claude Code skills
+.claude/

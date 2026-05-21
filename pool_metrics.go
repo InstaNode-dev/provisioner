@@ -3,9 +3,9 @@ package main
 // pool_metrics.go — bounded pgxpool config + saturation metrics for the
 // provisioner's hot-pool database connection. Wave-3 chaos verify
 // (2026-05-21): a 50-concurrent api /db/new burst exhausted the shared
-// DigitalOcean Managed Postgres user-connection ceiling. The
-// provisioner's own pgxpool wasn't the proximate cause (it talks to
-// PROVISIONER_DATABASE_URL on a different DO host — 161.35.111.84 —
+// upstream managed-Postgres user-connection ceiling. The provisioner's
+// own pgxpool wasn't the proximate cause (it talks to
+// PROVISIONER_DATABASE_URL on a separate operator-managed Postgres host,
 // not the platform DB), but the same pattern can recur on that host
 // once the hot-pool churns under load; this file extends the same
 // observability + bounded-pool discipline applied in api and worker.
@@ -24,14 +24,14 @@ import (
 
 // Pool-size defaults.
 //
-// Provisioner's database is a workhorse Postgres at 161.35.111.84 used
-// for hot-pool tracking + cluster routing. Unlike the api/worker
-// platform_db, this host is a single DO Droplet (not Managed PG with
-// its slot reservations) — so the per-process pool ceiling matters
-// less for upstream-saturation reasons and more for "don't open more
-// conns than the workload actually needs" reasons. Default 10/3 is
-// generous for the workload (hot-pool refill + the occasional gRPC
-// handler INSERT).
+// Provisioner's database is a workhorse Postgres at the host pointed to
+// by PROVISIONER_DATABASE_URL, used for hot-pool tracking + cluster
+// routing. Unlike the api/worker platform_db, this host is typically a
+// single self-managed instance (not managed Postgres with its slot
+// reservations) — so the per-process pool ceiling matters less for
+// upstream-saturation reasons and more for "don't open more conns than
+// the workload actually needs" reasons. Default 10/3 is generous for
+// the workload (hot-pool refill + the occasional gRPC handler INSERT).
 const (
 	defaultProvisionerPGMaxConns    = 10
 	defaultProvisionerPGMinConns    = 2

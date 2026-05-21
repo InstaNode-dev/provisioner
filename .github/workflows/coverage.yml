@@ -1,5 +1,30 @@
 name: coverage
 
+# Coverage CI for the provisioner.
+#
+# Unlike api/ and worker/ — which need real Postgres/Redis/Mongo service
+# containers to exercise their integration test surface — the provisioner's
+# test suite is entirely mock-based at this layer:
+#
+#   - internal/server/*_test.go uses mockPostgresBackend / mockRedisBackend /
+#     mockMongoBackend (server_test.go:24-100) — no real DB connections.
+#   - internal/backend/postgres/local_test.go tests pure functions
+#     (connLimitClauseFor, naming) — no live cluster needed.
+#   - internal/backend/redis/local_test.go uses goredis pointed at an
+#     intentionally unreachable address (127.0.0.1:1) to verify the P2
+#     fail-open contract — no real Redis needed.
+#   - internal/backend/mongo/*_test.go tests naming + k8s-route logic — no
+#     real MongoDB.
+#
+# Live-cluster integration tests for the provisioner live in api/e2e under
+# the `e2e` build tag and run against the actual k8s deployment, not in this
+# coverage job. Adding service containers here would slow the job without
+# raising the executable test surface.
+#
+# If a future test needs a real backend, gate it on an env var
+# (e.g. TEST_POSTGRES_CUSTOMERS_URL) AND add the matching service container
+# below — same pattern as api/ and worker/.
+
 on:
   pull_request:
     branches: [master, main]
@@ -30,9 +55,14 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: provisioner/go.mod
+      # Drop the `|| true` from the previous revision — it masked real test
+      # failures and let coverage drift unnoticed (CLAUDE.md rule 12: shipped
+      # ≠ verified). A red test must fail the job; codecov upload below is
+      # still soft-failed via fail_ci_if_error: false so a missing token
+      # doesn't take CI down.
       - name: Generate coverage
         working-directory: provisioner
-        run: go test ./... -short -coverprofile=coverage.out -covermode=atomic || true
+        run: go test ./... -short -coverprofile=coverage.out -covermode=atomic
       - uses: codecov/codecov-action@v4
         with:
           files: provisioner/coverage.out

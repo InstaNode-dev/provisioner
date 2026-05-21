@@ -176,7 +176,8 @@ func sizingForTier(tier string) tierSizing {
 			maxClients:  10,
 			maxmemoryMB: 5, // plans.yaml: anonymous redis_memory_mb = 5
 		}
-	case "hobby":
+	case "hobby", "hobby_yearly":
+		// hobby_yearly mirrors hobby (plans.yaml: identical limits, annual billing).
 		return tierSizing{
 			cpuReq: "100m", memReq: "128Mi",
 			cpuLim: "500m", memLim: "512Mi",
@@ -186,7 +187,24 @@ func sizingForTier(tier string) tierSizing {
 			maxClients:  50,
 			maxmemoryMB: 50, // plans.yaml: hobby redis_memory_mb = 50
 		}
-	case "pro":
+	case "hobby_plus", "hobby_plus_yearly":
+		// hobby_plus (W11 mid-tier insertion 2026-05-13). Redis memory cap
+		// matches hobby (50MB) per plans.yaml; the upsell over hobby is on
+		// postgres/mongo/storage, not redis. F1 fix (2026-05-21): explicit
+		// case so this tier no longer falls through to the default → hobby
+		// path, which by coincidence had the same maxmemoryMB but would
+		// silently drift the moment hobby_plus diverged from hobby.
+		return tierSizing{
+			cpuReq: "100m", memReq: "128Mi",
+			cpuLim: "500m", memLim: "512Mi",
+			pvcMi:        1024, // 1Gi (matches hobby)
+			qCPURequests: "200m", qMemRequests: "256Mi",
+			qCPULimits: "1", qMemLimits: "1Gi",
+			maxClients:  50,
+			maxmemoryMB: 50, // plans.yaml: hobby_plus redis_memory_mb = 50
+		}
+	case "pro", "pro_yearly":
+		// pro_yearly mirrors pro (plans.yaml: identical limits, annual billing).
 		return tierSizing{
 			cpuReq: "250m", memReq: "512Mi",
 			cpuLim: "2", memLim: "2Gi",
@@ -206,7 +224,8 @@ func sizingForTier(tier string) tierSizing {
 			maxClients:  1000,
 			maxmemoryMB: 1024, // plans.yaml: growth redis_memory_mb = 1024
 		}
-	case "team":
+	case "team", "team_yearly":
+		// team_yearly mirrors team (plans.yaml: identical -1 limits, annual billing).
 		return tierSizing{
 			cpuReq: "500m", memReq: "1Gi",
 			cpuLim: "4", memLim: "4Gi",

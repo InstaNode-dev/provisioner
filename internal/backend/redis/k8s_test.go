@@ -60,8 +60,13 @@ func TestSizingForTier_MaxmemoryMB_MatchesPlansYAML(t *testing.T) {
 	}{
 		{"anonymous", 5, true},   // plans.yaml: anonymous redis_memory_mb = 5
 		{"hobby", 50, true},      // plans.yaml: hobby redis_memory_mb = 50
+		{"hobby_yearly", 50, true}, // plans.yaml: hobby_yearly mirrors hobby
+		{"hobby_plus", 50, true}, // plans.yaml: hobby_plus redis_memory_mb = 50
+		{"hobby_plus_yearly", 50, true}, // plans.yaml: hobby_plus_yearly mirrors hobby_plus
 		{"pro", 512, true},       // plans.yaml: pro redis_memory_mb = 512
+		{"pro_yearly", 512, true},// plans.yaml: pro_yearly mirrors pro
 		{"team", -1, false},      // unlimited — flag omitted
+		{"team_yearly", -1, false}, // plans.yaml: team_yearly mirrors team (unlimited)
 		{"growth", 1024, true},   // plans.yaml: growth redis_memory_mb = 1024
 		{"unknown", 50, true},    // unknown → hobby fallback
 	}
@@ -123,7 +128,7 @@ func TestSizingForTier_MaxmemoryFlag_InCommand(t *testing.T) {
 		return ""
 	}
 
-	limitedTiers := []string{"anonymous", "hobby", "pro", "growth"}
+	limitedTiers := []string{"anonymous", "hobby", "hobby_yearly", "hobby_plus", "hobby_plus_yearly", "pro", "pro_yearly", "growth"}
 	for _, tier := range limitedTiers {
 		t.Run("limited/"+tier, func(t *testing.T) {
 			sz := sizingForTier(tier)
@@ -142,7 +147,7 @@ func TestSizingForTier_MaxmemoryFlag_InCommand(t *testing.T) {
 		})
 	}
 
-	unlimitedTiers := []string{"team"}
+	unlimitedTiers := []string{"team", "team_yearly"}
 	for _, tier := range unlimitedTiers {
 		t.Run("unlimited/"+tier, func(t *testing.T) {
 			sz := sizingForTier(tier)

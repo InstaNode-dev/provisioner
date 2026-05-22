@@ -20,8 +20,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/jackc/pgx/v5"
 )
 
 // ClusterRouter picks the admin DSN of the least-loaded shared Postgres cluster.
@@ -48,7 +46,16 @@ type ClusterRouter struct {
 	// regression test to assert exactly one poller runs across N Start calls.
 	pollStarts atomic.Int32
 	done       chan struct{}
+
+	// pollInterval is the refresh cadence. Defaults to defaultClusterPollInterval;
+	// a test sets it on its own router instance (no shared global) to exercise the
+	// ticker branch quickly without a 60s wait.
+	pollInterval time.Duration
 }
+
+// defaultClusterPollInterval is the production cadence at which pollLoop
+// refreshes per-cluster database counts.
+const defaultClusterPollInterval = 60 * time.Second
 
 // newClusterRouter creates a ClusterRouter for the given admin DSNs.
 // maxPerCluster sets the database capacity cap. Pass 0 to use the default (400).
@@ -61,11 +68,12 @@ func newClusterRouter(adminURLs []string, maxPerCluster int) *ClusterRouter {
 		caps[i] = maxPerCluster
 	}
 	return &ClusterRouter{
-		adminURLs: adminURLs,
-		maxDBs:    caps,
-		counts:    make([]int, len(adminURLs)),
-		inflight:  make([]int, len(adminURLs)),
-		done:      make(chan struct{}),
+		adminURLs:    adminURLs,
+		maxDBs:       caps,
+		counts:       make([]int, len(adminURLs)),
+		inflight:     make([]int, len(adminURLs)),
+		done:         make(chan struct{}),
+		pollInterval: defaultClusterPollInterval,
 	}
 }
 
@@ -198,7 +206,11 @@ func (r *ClusterRouter) pollLoop(ctx context.Context) {
 	// many times Start is called — the once-guard regression test asserts it.
 	r.pollStarts.Add(1)
 
-	ticker := time.NewTicker(60 * time.Second)
+	interval := r.pollInterval
+	if interval <= 0 {
+		interval = defaultClusterPollInterval
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	// Immediate first poll so counts are populated before the first provision.
@@ -248,7 +260,7 @@ func (r *ClusterRouter) dbCount(ctx context.Context, adminURL string) (int, erro
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	conn, err := pgx.Connect(ctx, adminURL)
+	conn, err := pgxConnect(ctx, adminURL)
 	if err != nil {
 		return 0, fmt.Errorf("connect: %w", err)
 	}

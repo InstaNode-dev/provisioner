@@ -40,14 +40,12 @@ import (
 	goredis "github.com/redis/go-redis/v9"
 
 	"context"
-	"crypto/rand"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -64,17 +62,28 @@ import (
 )
 
 const (
-	k8sNsPrefix      = "instant-customer-"
-	k8sRoleLabel     = "instant.dev/role"
-	k8sRoleValue     = "customer-resource"
-	k8sReadyTimeout  = 3 * time.Minute
-	k8sReadyInterval = 3 * time.Second
+	k8sNsPrefix  = "instant-customer-"
+	k8sRoleLabel = "instant.dev/role"
+	k8sRoleValue = "customer-resource"
 
 	// k8sOwnerTeamLabel is applied to dedicated customer namespaces to record
 	// the owning team UUID.  The deploy-side NetworkPolicy in the api repo
 	// combines this label with k8sRoleLabel to scope DB-port egress per-team.
 	// Pentest fix: 2026-05-16.
 	k8sOwnerTeamLabel = "instant.dev/owner-team"
+)
+
+// k8sReadyTimeout / k8sReadyInterval bound waitPodReady. They are package vars
+// (not consts) only so tests can shrink them to milliseconds to reach the
+// timeout branch without a 3-minute wait. Production values are unchanged.
+var (
+	k8sReadyTimeout  = 3 * time.Minute
+	k8sReadyInterval = 3 * time.Second
+
+	// k8sNsTerminateTimeout / k8sNsTerminatePoll bound the Terminating-namespace
+	// wait loop in applyNamespace. Package vars for the same test-shrink reason.
+	k8sNsTerminateTimeout = 2 * time.Minute
+	k8sNsTerminatePoll    = 3 * time.Second
 )
 
 // tierSizing maps a billing tier to k8s resource sizing for the provisioned pod.
@@ -108,7 +117,7 @@ func sizingForTier(tier string) tierSizing {
 			pvcGi:        0,
 			qCPURequests: "100m", qMemRequests: "256Mi",
 			qCPULimits: "500m", qMemLimits: "512Mi",
-			connLimit:    2,
+			connLimit: 2,
 		}
 	case "hobby":
 		return tierSizing{
@@ -117,7 +126,7 @@ func sizingForTier(tier string) tierSizing {
 			pvcGi:        5,
 			qCPURequests: "200m", qMemRequests: "512Mi",
 			qCPULimits: "1", qMemLimits: "2Gi",
-			connLimit:    5,
+			connLimit: 5,
 		}
 	case "pro":
 		return tierSizing{
@@ -126,7 +135,7 @@ func sizingForTier(tier string) tierSizing {
 			pvcGi:        50,
 			qCPURequests: "500m", qMemRequests: "2Gi",
 			qCPULimits: "4", qMemLimits: "8Gi",
-			connLimit:    20,
+			connLimit: 20,
 		}
 	case "team", "growth":
 		return tierSizing{
@@ -135,7 +144,7 @@ func sizingForTier(tier string) tierSizing {
 			pvcGi:        200,
 			qCPURequests: "1", qMemRequests: "4Gi",
 			qCPULimits: "8", qMemLimits: "16Gi",
-			connLimit:    -1, // unlimited; capped only by pod max_connections
+			connLimit: -1, // unlimited; capped only by pod max_connections
 		}
 	default:
 		// Unknown tier → conservative hobby-equivalent sizing rather than fail-open.
@@ -147,10 +156,10 @@ func sizingForTier(tier string) tierSizing {
 // All configuration comes from environment variables — see config.go for the full list.
 type K8sBackend struct {
 	cs            kubernetes.Interface // kubernetes.Interface allows fake.Clientset in tests
-	storageClass  string // K8S_STORAGE_CLASS: "gp3" (EKS) or "local-path" (dev)
-	image         string // K8S_POSTGRES_IMAGE: "pgvector/pgvector:pg16" (default)
-	externalHost  string // K8S_EXTERNAL_HOST: node IP, LB DNS, or proxy hostname
-	storageSizeGi int    // K8S_POSTGRES_STORAGE_GI: default 50
+	storageClass  string               // K8S_STORAGE_CLASS: "gp3" (EKS) or "local-path" (dev)
+	image         string               // K8S_POSTGRES_IMAGE: "pgvector/pgvector:pg16" (default)
+	externalHost  string               // K8S_EXTERNAL_HOST: node IP, LB DNS, or proxy hostname
+	storageSizeGi int                  // K8S_POSTGRES_STORAGE_GI: default 50
 	// Route registration for the pg-proxy. When rdb is set, Provision writes
 	// `<routePrefix><dbName>` → `<service-fqdn>:5432` so the proxy can route
 	// new client connections to this pod. Deprovision deletes the key.
@@ -348,7 +357,7 @@ func (b *K8sBackend) StorageBytes(ctx context.Context, token, providerResourceID
 	adminPass := string(secret.Data["POSTGRES_PASSWORD"])
 	dsn := fmt.Sprintf("postgres://%s:%s@%s:5432/postgres?sslmode=disable", adminUser, adminPass, svc.Spec.ClusterIP)
 
-	conn, err := pgx.Connect(ctx, dsn)
+	conn, err := pgxConnect(ctx, dsn)
 	if err != nil {
 		return 0, fmt.Errorf("k8s postgres.StorageBytes: connect: %w", err)
 	}
@@ -447,7 +456,7 @@ func (b *K8sBackend) Regrade(ctx context.Context, token, providerResourceID stri
 	adminPass := string(secret.Data["POSTGRES_PASSWORD"])
 
 	dsn := fmt.Sprintf("postgres://%s:%s@%s:5432/postgres?sslmode=disable", adminUser, adminPass, svc.Spec.ClusterIP)
-	conn, err := pgx.Connect(ctx, dsn)
+	conn, err := pgxConnect(ctx, dsn)
 	if err != nil {
 		return RegradeResult{Applied: false, SkipReason: fmt.Sprintf("resource not reachable: connect: %v", err)}, nil
 	}
@@ -518,12 +527,12 @@ func (b *K8sBackend) applyNamespace(ctx context.Context, ns string) error {
 	if getErr != nil || existing.Status.Phase != corev1.NamespaceTerminating {
 		return err // not terminating — surface the original AlreadyExists error
 	}
-	deadline := time.Now().Add(2 * time.Minute)
+	deadline := time.Now().Add(k8sNsTerminateTimeout)
 	for time.Now().Before(deadline) {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(3 * time.Second):
+		case <-time.After(k8sNsTerminatePoll):
 		}
 		_, getErr = b.cs.CoreV1().Namespaces().Get(ctx, ns, metav1.GetOptions{})
 		if k8serrors.IsNotFound(getErr) {
@@ -531,7 +540,7 @@ func (b *K8sBackend) applyNamespace(ctx context.Context, ns string) error {
 			return err
 		}
 	}
-	return fmt.Errorf("namespace %s still terminating after 2 minutes", ns)
+	return fmt.Errorf("namespace %s still terminating after %s", ns, k8sNsTerminateTimeout)
 }
 
 // applyNetworkPolicy creates a deny-all policy with targeted allow rules.
@@ -732,7 +741,7 @@ func (b *K8sBackend) waitPodReady(ctx context.Context, ns, labelSelector string)
 }
 
 func (b *K8sBackend) initDatabase(ctx context.Context, adminDSN, dbName, appUser, appPass string, connLimit int) error {
-	conn, err := pgx.Connect(ctx, adminDSN)
+	conn, err := pgxConnect(ctx, adminDSN)
 	if err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}
@@ -759,7 +768,7 @@ func (b *K8sBackend) initDatabase(ctx context.Context, adminDSN, dbName, appUser
 	//
 	// adminDSN connects to the "postgres" DB; replace it with dbName for this step.
 	dbDSN := strings.Replace(adminDSN, "/postgres?", "/"+dbName+"?", 1)
-	if dbConn, dbErr := pgx.Connect(ctx, dbDSN); dbErr == nil {
+	if dbConn, dbErr := pgxConnect(ctx, dbDSN); dbErr == nil {
 		_, _ = dbConn.Exec(ctx, `CREATE EXTENSION IF NOT EXISTS vector`)
 		_, _ = dbConn.Exec(ctx, fmt.Sprintf(`ALTER EXTENSION vector OWNER TO %q`, appUser))
 		dbConn.Close(ctx)
@@ -772,7 +781,7 @@ func (b *K8sBackend) initDatabase(ctx context.Context, adminDSN, dbName, appUser
 // k8sRandHex returns a cryptographically random hex string of length n*2.
 func k8sRandHex(n int) (string, error) {
 	b := make([]byte, n)
-	if _, err := rand.Read(b); err != nil {
+	if _, err := randRead(b); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil

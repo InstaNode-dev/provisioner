@@ -53,6 +53,16 @@ func teamIDFromContext(ctx context.Context) string {
 	return vals[0]
 }
 
+// PoolClaimer is the minimal Claim surface server.go uses from
+// *pool.Manager. Extracting it lets tests inject a fake claimer that
+// returns synthesised pool hits / errors without standing up a real
+// *pgxpool.Pool — *pool.Manager itself remains the production
+// implementation. Keep this interface byte-for-byte aligned with
+// (*pool.Manager).Claim so the concrete type continues to satisfy it.
+type PoolClaimer interface {
+	Claim(ctx context.Context, resourceType string) (*pool.Item, error)
+}
+
 // Server implements ProvisionerServiceServer.
 type Server struct {
 	provisionerv1.UnimplementedProvisionerServiceServer
@@ -65,7 +75,7 @@ type Server struct {
 	dedicatedRedisBackend    redis.Backend         // nil if not configured; used for Pro/Team tier
 	dedicatedMongoBackend    mongo.Backend         // nil if not configured; used for Pro/Team tier
 	dedicatedQueueBackend    queue.Backend         // nil if not configured; used for Pro/Team tier
-	pool                     *pool.Manager         // nil if pool is disabled
+	pool                     PoolClaimer           // nil if pool is disabled; production type is *pool.Manager
 
 	// breakers — per-backend in-process circuit breakers (audit P0-3).
 	// Independent instance per backend so a Redis outage cannot trip the
@@ -168,6 +178,16 @@ func NewWithBackends(
 	dedicatedQueue queue.Backend,
 	poolMgr *pool.Manager,
 ) *Server {
+	// A typed nil *pool.Manager assigned to a PoolClaimer interface field
+	// would make `s.pool != nil` evaluate true (the interface holds a
+	// non-nil type descriptor) and the next Claim call would dereference a
+	// nil receiver. Normalise the nil pointer to a nil interface here so
+	// production callers that pass nil get the documented "pool disabled"
+	// behaviour.
+	var poolClaimer PoolClaimer
+	if poolMgr != nil {
+		poolClaimer = poolMgr
+	}
 	return &Server{
 		postgresBackend:          pgB,
 		redisBackend:             rB,
@@ -178,7 +198,7 @@ func NewWithBackends(
 		dedicatedRedisBackend:    dedicatedRedis,
 		dedicatedMongoBackend:    dedicatedMongo,
 		dedicatedQueueBackend:    dedicatedQueue,
-		pool:                     poolMgr,
+		pool:                     poolClaimer,
 		// circuit.Default is the process-wide breaker set. Tests inject
 		// their own via SetBreakers() (or NewServerForTest) so per-test
 		// trips don't bleed into other tests.
@@ -191,6 +211,15 @@ func NewWithBackends(
 // NewWithBackends and never calls this. Returns the server for chaining.
 func (s *Server) SetBreakers(b *circuit.Breakers) *Server {
 	s.breakers = b
+	return s
+}
+
+// SetPool injects an alternate pool claimer. Test-only entry point — production
+// code wires *pool.Manager via NewWithBackends and never calls this. Useful
+// for exercising the pool-hit / pool-error / pool-miss branches in
+// provisionPostgres/Redis/Mongo/Queue without standing up a real *pgxpool.Pool.
+func (s *Server) SetPool(p PoolClaimer) *Server {
+	s.pool = p
 	return s
 }
 

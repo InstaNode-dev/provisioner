@@ -155,6 +155,39 @@ func TestReadyz_OpenCircuit_Degrades(t *testing.T) {
 	}
 }
 
+// TestReadyz_LongErrorMessage_Truncated — when the pool ping fails with a
+// >80-char message, /readyz truncates it to 80 chars before surfacing it on
+// the platform_db check (avoids leaking long connection-string bytes through
+// the response body).
+func TestReadyz_LongErrorMessage_Truncated(t *testing.T) {
+	// 120-char error message — must end up truncated to 80 in the response.
+	longMsg := "connection refused: tcp dial 10.0.0.1:5432 failed because the server is offline and rebooting now"
+	if len(longMsg) <= 80 {
+		t.Fatalf("test setup: long message must be > 80 chars (got %d)", len(longMsg))
+	}
+	h := handlers.NewReadyzHandler(handlers.Config{
+		PoolPinger: fakePool{err: errors.New(longMsg)},
+	})
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/readyz", nil)
+	h.Get(rr, req)
+	if rr.Code != 503 {
+		t.Fatalf("expected 503, got %d", rr.Code)
+	}
+	var got readiness.Response
+	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	for _, c := range got.Checks {
+		if c.Name == "platform_db" {
+			if len(c.LastError) > 80 {
+				t.Errorf("platform_db.LastError = %q (len %d); want ≤80 chars",
+					c.LastError, len(c.LastError))
+			}
+		}
+	}
+}
+
 // TestReadyz_ContentType_AndNoStore — the response is JSON and tagged
 // no-store so probes don't stale.
 func TestReadyz_ContentType_AndNoStore(t *testing.T) {

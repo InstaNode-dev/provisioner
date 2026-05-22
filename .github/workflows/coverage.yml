@@ -101,20 +101,6 @@ jobs:
           --health-timeout 5s
           --health-retries 10
 
-      nats:
-        image: nats:latest
-        ports:
-          - 4222:4222
-          - 8222:8222
-        # nats:latest's default entrypoint is `nats-server`; pass -js for
-        # JetStream and -m 8222 for the HTTP monitor port the queue backend
-        # health-probes.
-        options: >-
-          --health-cmd "wget -q -O- http://127.0.0.1:8222/healthz || exit 1"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-
     # TEST_* env vars the pool/backend test helpers read via os.Getenv. The
     # exact names were grepped from the test files (os.Getenv("TEST_…") and the
     # liveXxx() helper fallbacks) — wrong names = silent skip = lost coverage.

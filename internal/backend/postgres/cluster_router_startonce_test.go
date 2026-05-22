@@ -36,6 +36,9 @@ func TestStart_OnceGuard_SinglePoller(t *testing.T) {
 	cancel()
 
 	r := newClusterRouter([]string{"postgres://bogus@127.0.0.1:1/none"}, 0)
+	// Join the poller on exit so it cannot outlive this test and call the real
+	// pgxConnect after a later test installs a fake seam (Shutdown now Waits).
+	defer r.Shutdown()
 
 	for i := 0; i < 5; i++ {
 		r.Start(ctx)

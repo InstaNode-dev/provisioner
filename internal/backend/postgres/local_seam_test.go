@@ -311,6 +311,11 @@ func TestLocalBackend_Regrade_CloseErrorLogged(t *testing.T) {
 }
 
 func TestLocalBackend_StartShutdown_Seam(t *testing.T) {
+	// Install a fast, deterministic seam so the immediate first refreshCounts
+	// poll returns at once rather than dialing a real (absent) Postgres for the
+	// full 5s connect timeout. Shutdown joins the poll goroutine, so this also
+	// guarantees no router goroutine survives the test to race the global seam.
+	withPGXConnect(t, &fakePGConn{}, nil)
 	b := newLocalBackend("")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

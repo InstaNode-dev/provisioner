@@ -46,6 +46,12 @@ type ClusterRouter struct {
 	// regression test to assert exactly one poller runs across N Start calls.
 	pollStarts atomic.Int32
 	done       chan struct{}
+	// pollWG tracks the poll goroutine so Shutdown can block until it has
+	// fully returned. Without this, Shutdown only signals done and returns —
+	// the goroutine may still be mid-pgxConnect, so the polling connection
+	// (and any seam it reads) outlives Shutdown. Joining here makes Shutdown a
+	// true barrier: no router goroutine touches pgxConnect after it returns.
+	pollWG sync.WaitGroup
 
 	// pollInterval is the refresh cadence. Defaults to defaultClusterPollInterval;
 	// a test sets it on its own router instance (no shared global) to exercise the
@@ -83,17 +89,26 @@ func newClusterRouter(adminURLs []string, maxPerCluster int) *ClusterRouter {
 // spawn a second poller. Call Shutdown to stop.
 func (r *ClusterRouter) Start(ctx context.Context) {
 	r.startOnce.Do(func() {
-		go r.pollLoop(ctx)
+		r.pollWG.Add(1)
+		go func() {
+			defer r.pollWG.Done()
+			r.pollLoop(ctx)
+		}()
 	})
 }
 
-// Shutdown stops the background polling goroutine.
+// Shutdown stops the background polling goroutine and blocks until it has
+// returned. Joining (rather than only signalling done) guarantees no poll
+// connection is in flight once Shutdown returns — important both in prod (clean
+// teardown) and in tests (a leaked poller would otherwise call pgxConnect after
+// a test restores the seam, racing later tests).
 func (r *ClusterRouter) Shutdown() {
 	select {
 	case <-r.done:
 	default:
 		close(r.done)
 	}
+	r.pollWG.Wait()
 }
 
 // Pick returns the index and admin DSN of the cluster with the most available

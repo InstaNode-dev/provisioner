@@ -94,9 +94,9 @@ func TestApplyNamespace_NoOwnerTeamLabel_WhenContextEmpty(t *testing.T) {
 // each.
 func TestApplyNamespace_OwnerTeamLabel_TableDriven(t *testing.T) {
 	cases := []struct {
-		name          string
-		teamID        string
-		wantLabel     bool
+		name           string
+		teamID         string
+		wantLabel      bool
 		wantLabelValue string
 	}{
 		{

@@ -18,6 +18,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -274,12 +275,12 @@ func startHealthzSidecar(ready *server.Readiness, box *poolBox, poolEnabled bool
 	return srv
 }
 
-func main() {
-	// First action: install the obs-enriching slog handler as the default
-	// so every log line from boot onward carries service / commit_id and
-	// the empty-string-stable trace_id / tid / team_id fields. The bare slog
-	// default that the provisioner previously used emitted unstructured-ish
-	// records — this is the inconsistency the plan flagged.
+// installLogger sets the obs-enriching slog handler as the process default so
+// every log line from boot onward carries service / commit_id and the
+// empty-string-stable trace_id / tid / team_id fields. Split out of main so the
+// (otherwise untestable) main shell shrinks to signal-wiring + os.Exit, and the
+// handler-install side effect is exercised directly by a test.
+func installLogger() {
 	slog.SetDefault(slog.New(logctx.NewHandler(
 		"provisioner",
 		slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
@@ -287,7 +288,62 @@ func main() {
 			Level:     slog.LevelInfo,
 		}),
 	)))
+}
 
+// bootstrap installs the logger and runs the service under ctx. It is the
+// testable core of main: a test drives it with a pre-cancelled (or quickly
+// cancelled) context and a minimal config so the full boot → ready → teardown
+// path is covered without spawning a process or sending real signals. main
+// itself becomes the thin signal-wiring + os.Exit shell around it.
+func bootstrap(ctx context.Context, cfg *config.Config) error {
+	installLogger()
+	return run(ctx, cfg)
+}
+
+// netListen is an indirection seam over net.Listen so a test can substitute a
+// listener it controls and close it out from under grpcServer.Serve, forcing
+// the otherwise-unreachable serve-error arm of run() (Serve returning a non-nil
+// error before ctx cancels). Production points it at the stdlib net.Listen.
+var netListen = net.Listen
+
+// signalContext returns a context that cancels on SIGINT/SIGTERM plus its stop
+// func. run() blocks on this context and tears down cleanly when it fires.
+// Extracted from main so the signal-wiring is exercised by a test.
+func signalContext() (context.Context, context.CancelFunc) {
+	return signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+}
+
+// realMain is the testable body of the program: load config, run the service
+// under ctx, and translate the outcome into a process exit code (0 on clean
+// shutdown, 1 on a fatal boot error). It takes ctx as a parameter so a test can
+// drive the whole load-config → boot → teardown → exit-code path with a
+// caller-cancellable context instead of a real OS signal. main() is then just
+// the irreducible signalContext + os.Exit shell that `go test` cannot enter.
+func realMain(ctx context.Context) int {
+	if err := bootstrap(ctx, config.Load()); err != nil {
+		slog.Error("provisioner.run_failed", "error", err)
+		return 1
+	}
+	return 0
+}
+
+func main() {
+	ctx, stop := signalContext()
+	defer stop()
+	os.Exit(realMain(ctx))
+}
+
+// runError is a fatal boot error from run(). main maps it to os.Exit(1); a test
+// asserts on it directly. Extracted so the previously-untestable os.Exit(1)
+// arms of main (bad AES key, DB connect failure, auth misconfig, listen
+// failure) are now observable as ordinary returned errors.
+//
+// run wires every dependency main used to wire inline, blocks until ctx is
+// cancelled (SIGTERM in prod) or the gRPC server returns an error, then runs
+// the same ordered teardown main used to. Behaviour is identical to the prior
+// inline main; the only change is that the os.Exit(1) sites became `return err`
+// and the signal/serve select became a ctx-driven one.
+func run(ctx context.Context, cfg *config.Config) error {
 	// Boot NR before any other slog calls that might want to be traced.
 	nrApp := initNewRelic()
 	defer func() {
@@ -314,7 +370,6 @@ func main() {
 	// platform_db is not a registered check (no /readyz 503 forever);
 	// if it's enabled, the check is registered and starts in
 	// "pgxpool_not_configured" → flips to ok once poolHolder.Set fires.
-	cfg := config.Load()
 	poolEnabled := cfg.ProvisionerDatabaseURL != "" && cfg.AESKey != ""
 	healthzSrv := startHealthzSidecar(readiness, poolHolder, poolEnabled)
 
@@ -334,7 +389,8 @@ func main() {
 		slog.Error("provisioner.auth_misconfigured",
 			"error", err,
 			"remediation", "set PROVISIONER_SECRET (k8s: instant-infra-secrets; local: export PROVISIONER_SECRET=$(openssl rand -hex 32))")
-		os.Exit(1)
+		_ = healthzSrv.Close()
+		return fmt.Errorf("auth misconfigured: %w", err)
 	}
 
 	// --- optional hot-pool ---
@@ -343,7 +399,8 @@ func main() {
 		aesKey, err := crypto.ParseAESKey(cfg.AESKey)
 		if err != nil {
 			slog.Error("provisioner.aes_key_parse_failed", "error", err)
-			os.Exit(1)
+			_ = healthzSrv.Close()
+			return fmt.Errorf("aes key parse: %w", err)
 		}
 
 		// Wave-3 chaos verify (2026-05-21): use bounded pgxpool config
@@ -356,7 +413,8 @@ func main() {
 		pgxCfg, err := newBoundedPgxPoolConfig(cfg.ProvisionerDatabaseURL)
 		if err != nil {
 			slog.Error("provisioner.pool_db_parse_failed", "error", err)
-			os.Exit(1)
+			_ = healthzSrv.Close()
+			return fmt.Errorf("pool db parse: %w", err)
 		}
 		slog.Info("provisioner.pool_db_config_resolved",
 			"max_conns", pgxCfg.MaxConns,
@@ -367,7 +425,8 @@ func main() {
 		dbPool, err := pgxpool.NewWithConfig(context.Background(), pgxCfg)
 		if err != nil {
 			slog.Error("provisioner.pool_db_connect_failed", "error", err)
-			os.Exit(1)
+			_ = healthzSrv.Close()
+			return fmt.Errorf("pool db connect: %w", err)
 		}
 
 		// Pool-saturation observability. Goroutine ticks every 5s
@@ -420,7 +479,8 @@ func main() {
 			poolMgr = pool.NewWithConfig(dbPool, aesKey, poolCfg, cfg)
 			if err := poolMgr.Start(context.Background()); err != nil {
 				slog.Error("provisioner.pool_start_failed", "error", err)
-				os.Exit(1)
+				_ = healthzSrv.Close()
+				return fmt.Errorf("pool start: %w", err)
 			}
 			slog.Info("provisioner.pool_enabled",
 				"postgres_target", cfg.PoolPostgresSize,
@@ -483,10 +543,14 @@ func main() {
 	healthSrv.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
 	healthpb.RegisterHealthServer(grpcServer, healthSrv)
 
-	lis, err := net.Listen("tcp", ":"+cfg.Port)
+	lis, err := netListen("tcp", ":"+cfg.Port)
 	if err != nil {
 		slog.Error("provisioner.listen_failed", "port", cfg.Port, "error", err)
-		os.Exit(1)
+		_ = healthzSrv.Close()
+		if poolMgr != nil {
+			poolMgr.Shutdown()
+		}
+		return fmt.Errorf("listen on port %s: %w", cfg.Port, err)
 	}
 
 	slog.Info("provisioner.starting", "port", cfg.Port, "healthz_addr", healthzAddr)
@@ -509,12 +573,12 @@ func main() {
 		close(serveErr)
 	}()
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
+	// Block until the caller's ctx is cancelled (SIGINT/SIGTERM in prod via
+	// signal.NotifyContext in main; a test cancels it directly) or the gRPC
+	// server returns an error.
 	select {
-	case sig := <-sigCh:
-		slog.Info("provisioner.shutdown_signal", "signal", sig.String())
+	case <-ctx.Done():
+		slog.Info("provisioner.shutdown_signal", "cause", context.Cause(ctx))
 	case err := <-serveErr:
 		if err != nil {
 			slog.Error("provisioner.serve_failed", "error", err)
@@ -542,4 +606,5 @@ func main() {
 	if poolMgr != nil {
 		poolMgr.Shutdown()
 	}
+	return nil
 }

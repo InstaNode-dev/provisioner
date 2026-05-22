@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -96,6 +97,21 @@ func TestInitNewRelicFailOpenOnInvalidKey(t *testing.T) {
 	}
 }
 
+// TestInitNewRelic_ConstructsWithValidLengthKey — a 40-char license key makes
+// newrelic.NewApplication succeed at construction (it dials home async), so
+// initNewRelic returns a non-nil app. Covers the success-return arm that the
+// empty/invalid-key fail-open tests don't reach. We shut the app down
+// immediately so the test leaves no background NR harvester running.
+func TestInitNewRelic_ConstructsWithValidLengthKey(t *testing.T) {
+	t.Setenv("NEW_RELIC_LICENSE_KEY", "0123456789012345678901234567890123456789")
+	t.Setenv("NEW_RELIC_APP_NAME", "instant-provisioner-test")
+	app := initNewRelic()
+	if app == nil {
+		t.Fatal("initNewRelic returned nil for a valid-length license key — success arm not exercised")
+	}
+	app.Shutdown(2 * time.Second)
+}
+
 // newTestNRApp constructs a real *newrelic.Application with
 // ConfigEnabled(false) so it produces real trace metadata but performs no
 // network I/O. Returns nil if construction fails — caller decides whether
@@ -135,6 +151,33 @@ func TestStampTraceIDFromNR(t *testing.T) {
 
 	if got := logctx.TraceIDFromContext(out); got != md.TraceID {
 		t.Errorf("stampTraceIDFromNR did not propagate trace_id: got %q, want %q", got, md.TraceID)
+	}
+}
+
+// TestStampTraceIDFromNR_EmptyTraceID — when an NR txn IS on ctx but its trace
+// metadata has an empty TraceID (distributed tracing disabled), stampTraceIDFromNR
+// must take the md.TraceID=="" early-return arm and leave ctx unstamped.
+func TestStampTraceIDFromNR_EmptyTraceID(t *testing.T) {
+	app, err := newrelic.NewApplication(
+		newrelic.ConfigAppName("provisioner-test-nodt"),
+		newrelic.ConfigLicense("0123456789012345678901234567890123456789"),
+		newrelic.ConfigEnabled(false),
+		// Distributed tracing OFF → GetTraceMetadata().TraceID is empty.
+		newrelic.ConfigDistributedTracerEnabled(false),
+	)
+	if err != nil {
+		t.Fatalf("newrelic.NewApplication: %v", err)
+	}
+	txn := app.StartTransaction("test/NoDT")
+	defer txn.End()
+	if txn.GetTraceMetadata().TraceID != "" {
+		t.Skip("NR produced a trace id with DT disabled — arm not reachable this build")
+	}
+
+	ctx := newrelic.NewContext(context.Background(), txn)
+	out := stampTraceIDFromNR(ctx)
+	if got := logctx.TraceIDFromContext(out); got != "" {
+		t.Errorf("empty-trace-id txn should leave ctx unstamped, got %q", got)
 	}
 }
 
@@ -340,6 +383,28 @@ func TestStartHealthzSidecar_ServesMetrics(t *testing.T) {
 	if rzResp.StatusCode != 200 {
 		t.Fatalf("/readyz returned %d, want 200 (pool disabled — platform_db should be skipped)", rzResp.StatusCode)
 	}
+}
+
+// TestStartHealthzSidecar_BindFailureLogged — when :8092 is already bound, the
+// sidecar's ListenAndServe fails; the goroutine must log healthz.serve_failed
+// and NOT crash the process (losing /healthz must never take down the service).
+// We occupy :8092 first, then start the sidecar, then give its goroutine a beat
+// to hit the serve-failed branch.
+func TestStartHealthzSidecar_BindFailureLogged(t *testing.T) {
+	occupier, err := net.Listen("tcp", healthzAddr)
+	if err != nil {
+		t.Skipf("could not occupy %s (already in use by another test/process): %v", healthzAddr, err)
+	}
+	defer occupier.Close()
+
+	ready := &server.Readiness{}
+	srv := startHealthzSidecar(ready, &poolBox{}, false)
+	t.Cleanup(func() { _ = srv.Close() })
+
+	// The goroutine's ListenAndServe should fail fast against the occupied port
+	// and log serve_failed. No assertion on the log (it goes to slog); the
+	// branch is what we're covering, and the test asserts the process survives.
+	time.Sleep(100 * time.Millisecond)
 }
 
 // TestCollectBreakerInspectors_NilSafe — collectBreakerInspectors(nil) must

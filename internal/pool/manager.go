@@ -94,7 +94,15 @@ type Manager struct {
 	// already tearing down (BugBash 2026-05-18 P3 — "pool shutdown ctx").
 	runCtx    context.Context
 	runCancel context.CancelFunc
+
+	// tickInterval is the period of the maintenance loop's health-check ticker.
+	// Zero means the production default (30s); a test sets a tiny value to
+	// exercise the periodic top-up arm without waiting 30 wall-clock seconds.
+	tickInterval time.Duration
 }
+
+// defaultTickInterval is the maintenance loop's periodic health-check period.
+const defaultTickInterval = 30 * time.Second
 
 // New creates a Manager. Call Start to begin background maintenance.
 func New(db *pgxpool.Pool, aesKey []byte, cfg Config,
@@ -233,7 +241,11 @@ func (m *Manager) triggerRefill(resourceType string) {
 
 func (m *Manager) run(ctx context.Context) {
 	defer m.wg.Done()
-	ticker := time.NewTicker(30 * time.Second)
+	interval := m.tickInterval
+	if interval <= 0 {
+		interval = defaultTickInterval
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {

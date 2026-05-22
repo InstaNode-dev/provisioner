@@ -114,7 +114,10 @@ func sizingForTier(tier string) tierSizing {
 
 // K8sBackend provisions a dedicated NATS pod per token.
 type K8sBackend struct {
-	cs           *kubernetes.Clientset
+	// cs uses kubernetes.Interface (not the concrete *kubernetes.Clientset)
+	// so the fake clientset from k8s.io/client-go/kubernetes/fake can be
+	// injected by unit tests — mirroring the same trick redis/k8s.go uses.
+	cs           kubernetes.Interface
 	storageClass string // K8S_STORAGE_CLASS (used for JetStream PVC at hobby+)
 	image        string // K8S_NATS_IMAGE
 	externalHost string // K8S_EXTERNAL_HOST (legacy NodePort host; kept for back-compat)

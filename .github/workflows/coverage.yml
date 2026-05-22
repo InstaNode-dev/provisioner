@@ -2,28 +2,37 @@ name: coverage
 
 # Coverage CI for the provisioner.
 #
-# Unlike api/ and worker/ — which need real Postgres/Redis/Mongo service
-# containers to exercise their integration test surface — the provisioner's
-# test suite is entirely mock-based at this layer:
+# This job runs the FULL test suite against real Postgres / Redis / Mongo /
+# NATS service containers so the env-gated integration tests actually execute
+# and contribute coverage — instead of skipping silently on a DB-less runner.
 #
-#   - internal/server/*_test.go uses mockPostgresBackend / mockRedisBackend /
-#     mockMongoBackend (server_test.go:24-100) — no real DB connections.
-#   - internal/backend/postgres/local_test.go tests pure functions
-#     (connLimitClauseFor, naming) — no live cluster needed.
-#   - internal/backend/redis/local_test.go uses goredis pointed at an
-#     intentionally unreachable address (127.0.0.1:1) to verify the P2
-#     fail-open contract — no real Redis needed.
-#   - internal/backend/mongo/*_test.go tests naming + k8s-route logic — no
-#     real MongoDB.
+# Why the service containers matter (2026-05-22):
+#   A large slice of the provisioner's executable surface is exercised by tests
+#   that t.Skip() unless a real backend is reachable:
+#     - internal/pool/manager_db_test.go         → TEST_PROVISIONER_DATABASE_URL
+#     - internal/backend/postgres/local_live_test → TEST_POSTGRES_ADMIN_DSN /
+#                                                    CUSTOMER_POSTGRES_DSN /
+#                                                    TEST_POSTGRES_CUSTOMERS_URL
+#     - internal/backend/postgres/k8s_provision_test → TEST_REDIS_ADDR
+#     - internal/backend/redis/coverage_test       → CUSTOMER_REDIS_URL
+#                                                    (+ hardcoded :6379 path)
+#     - internal/backend/mongo/*_test              → CUSTOMER_MONGO_URL,
+#                                                    CUSTOMER_MONGO_AUTH_URL,
+#                                                    REDIS_URL_TEST
+#   With no service containers those files skipped and the pool package sat at
+#   47% while the suite still reported "green". Wiring the containers + the
+#   exact TEST_* env var names below moved pool 47%→96%, redis 84%→95%,
+#   mongo 91%→96% and pushed the full-suite total over the 95% floor.
 #
-# Live-cluster integration tests for the provisioner live in api/e2e under
-# the `e2e` build tag and run against the actual k8s deployment, not in this
-# coverage job. Adding service containers here would slow the job without
-# raising the executable test surface.
+# Note: the suite is NOT gated on `testing.Short()` (grep -rn "testing.Short()"
+# internal/ → no hits) — the gate is purely env-var reachability, so `-short`
+# is intentionally NOT passed here.
 #
-# If a future test needs a real backend, gate it on an env var
-# (e.g. TEST_POSTGRES_CUSTOMERS_URL) AND add the matching service container
-# below — same pattern as api/ and worker/.
+# Container ports use the standard host ports (5432/6379/27017/4222) because a
+# few tests hardcode them (e.g. redis StorageBytes connects to the Service
+# ClusterIP on :6379, and coverage_test's liveRedisAddr falls back to
+# localhost:6379). On the Linux runner the service-container network has no
+# IPv6/loopback flakiness, so 127.0.0.1 host addresses connect cleanly.
 
 on:
   pull_request:
@@ -37,7 +46,96 @@ permissions:
 jobs:
   coverage:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+
+    # Real backends for the env-gated integration tests. Health-check options
+    # gate the job's steps until each container is accepting connections.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      mongo:
+        image: mongo:6
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.runCommand({ ping: 1 }).ok' || mongo --quiet --eval 'db.runCommand({ ping: 1 }).ok'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      # Authenticated Mongo for the CUSTOMER_MONGO_AUTH_URL auth-fail branches
+      # (TestLocalProvision_AuthFailReturnsError et al.). Runs on a second host
+      # port so it never collides with the no-auth mongo above.
+      mongo-auth:
+        image: mongo:6
+        env:
+          MONGO_INITDB_ROOT_USERNAME: root
+          MONGO_INITDB_ROOT_PASSWORD: rootpass
+        ports:
+          - 27018:27017
+        options: >-
+          --health-cmd "mongosh --quiet -u root -p rootpass --eval 'db.runCommand({ ping: 1 }).ok' || mongo --quiet -u root -p rootpass --eval 'db.runCommand({ ping: 1 }).ok'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      nats:
+        image: nats:latest
+        ports:
+          - 4222:4222
+          - 8222:8222
+        # nats:latest's default entrypoint is `nats-server`; pass -js for
+        # JetStream and -m 8222 for the HTTP monitor port the queue backend
+        # health-probes.
+        options: >-
+          --health-cmd "wget -q -O- http://127.0.0.1:8222/healthz || exit 1"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    # TEST_* env vars the pool/backend test helpers read via os.Getenv. The
+    # exact names were grepped from the test files (os.Getenv("TEST_…") and the
+    # liveXxx() helper fallbacks) — wrong names = silent skip = lost coverage.
+    env:
+      # internal/pool/manager_db_test.go::testDSN
+      TEST_PROVISIONER_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable
+      # internal/backend/postgres/local_live_test.go::testAdminDSN (any of three)
+      TEST_POSTGRES_ADMIN_DSN: postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable
+      CUSTOMER_POSTGRES_DSN: postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable
+      TEST_POSTGRES_CUSTOMERS_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable
+      # internal/backend/postgres/k8s_provision_test.go
+      TEST_REDIS_ADDR: 127.0.0.1:6379
+      # internal/backend/redis/coverage_test.go::liveRedisAddr
+      CUSTOMER_REDIS_URL: redis://127.0.0.1:6379
+      # internal/backend/mongo/coverage_extra_test.go route-registry arm
+      REDIS_URL_TEST: redis://127.0.0.1:6379
+      # internal/backend/mongo/local_test.go::liveMongoURI
+      CUSTOMER_MONGO_URL: mongodb://127.0.0.1:27017
+      # internal/backend/mongo/coverage_extra_test.go auth-fail branches
+      CUSTOMER_MONGO_AUTH_URL: mongodb://root:rootpass@127.0.0.1:27018
+
     steps:
       - uses: actions/checkout@v4
         with:
@@ -62,7 +160,11 @@ jobs:
       # doesn't take CI down.
       - name: Generate coverage
         working-directory: provisioner
-        run: go test ./... -short -coverprofile=coverage.out -covermode=atomic
+        # No `-short`: the integration tests are gated on TEST_* env-var
+        # reachability (set above), NOT on testing.Short(). `-p 1` serialises
+        # package execution so the many DB-touching packages don't open
+        # connections concurrently against the shared service containers.
+        run: go test ./... -p 1 -coverprofile=coverage.out -covermode=atomic
       - uses: codecov/codecov-action@v4
         with:
           files: provisioner/coverage.out

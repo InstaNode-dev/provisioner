@@ -182,7 +182,7 @@ func sizingForTier(tier string) tierSizing {
 
 // K8sBackend provisions a dedicated MongoDB pod per token.
 type K8sBackend struct {
-	cs            *kubernetes.Clientset
+	cs            kubernetes.Interface // kubernetes.Interface allows fake.Clientset in tests
 	storageClass  string // K8S_STORAGE_CLASS
 	image         string // K8S_MONGO_IMAGE
 	externalHost  string // K8S_EXTERNAL_HOST (legacy NodePort host; kept for back-compat)
@@ -197,6 +197,28 @@ type K8sBackend struct {
 	rdb         *goredis.Client
 	routePrefix string
 	userPrefix  string
+
+	// initMongoFn is the seam between Provision and initMongo. Defaulting
+	// to (b *K8sBackend).initMongo in newK8sBackend; tests substitute a
+	// no-op to drive the Provision happy path against a fake clientset
+	// without standing up a real mongod. Never overridden in prod paths.
+	initMongoFn func(ctx context.Context, adminURI, dbName, appUser, appPass string) error
+
+	// mongoPort is the port StorageBytes dials on the customer pod's Service
+	// ClusterIP. Zero means the canonical 27017 (every prod pod listens there);
+	// tests override it to point the dbStats probe at a real Mongo bound to a
+	// non-default host port so the successful-decode arm is exercisable without
+	// a cluster. Never set in prod paths.
+	mongoPort int
+}
+
+// mongoPortOr27017 returns the configured StorageBytes dial port, defaulting to
+// the canonical 27017 when unset.
+func (b *K8sBackend) mongoPortOr27017() int {
+	if b.mongoPort != 0 {
+		return b.mongoPort
+	}
+	return 27017
 }
 
 func newK8sBackend(kubeconfigPath, storageClass, image, externalHost string, storageSizeGi int) (*K8sBackend, error) {
@@ -224,7 +246,9 @@ func newK8sBackend(kubeconfigPath, storageClass, image, externalHost string, sto
 	if storageSizeGi <= 0 {
 		storageSizeGi = 50
 	}
-	return &K8sBackend{cs: cs, storageClass: storageClass, image: image, externalHost: externalHost, storageSizeGi: storageSizeGi}, nil
+	b := &K8sBackend{cs: cs, storageClass: storageClass, image: image, externalHost: externalHost, storageSizeGi: storageSizeGi}
+	b.initMongoFn = b.initMongo
+	return b, nil
 }
 
 // EnableRouteRegistry tells the K8sBackend to publish routing records to Redis
@@ -335,7 +359,11 @@ func (b *K8sBackend) Provision(ctx context.Context, token, tier string) (*Creden
 	// with SHA-256, but the Go driver's negotiator can pick SHA-1 first which
 	// the server then rejects. Pinning the mechanism removes the race.
 	adminURI := fmt.Sprintf("mongodb://root:%s@%s:27017/admin?authMechanism=SCRAM-SHA-256", adminPass, clusterIP)
-	if err := b.initMongo(provCtx, adminURI, dbName, appUser, appPass); err != nil {
+	initFn := b.initMongoFn
+	if initFn == nil {
+		initFn = b.initMongo
+	}
+	if err := initFn(provCtx, adminURI, dbName, appUser, appPass); err != nil {
 		return nil, rollback("init mongo", err)
 	}
 
@@ -423,7 +451,7 @@ func (b *K8sBackend) StorageBytes(ctx context.Context, token, providerResourceID
 	}
 
 	adminPass := string(secret.Data["MONGO_INITDB_ROOT_PASSWORD"])
-	uri := fmt.Sprintf("mongodb://root:%s@%s:27017/admin", adminPass, svc.Spec.ClusterIP)
+	uri := fmt.Sprintf("mongodb://root:%s@%s:%d/admin", adminPass, svc.Spec.ClusterIP, b.mongoPortOr27017())
 
 	clientOpts := options.Client().ApplyURI(uri).SetServerSelectionTimeout(5 * time.Second)
 	client, err := mongoclient.Connect(ctx, clientOpts)
@@ -444,17 +472,7 @@ func (b *K8sBackend) StorageBytes(ctx context.Context, token, providerResourceID
 			slog.Debug("k8s mongo.StorageBytes: dbStats miss for candidate", "namespace", ns, "db", dbName, "error", err)
 			continue
 		}
-		if v, ok := result["storageSize"]; ok {
-			switch n := v.(type) {
-			case int32:
-				return int64(n), nil
-			case int64:
-				return n, nil
-			case float64:
-				return int64(n), nil
-			}
-		}
-		return 0, nil
+		return decodeStorageSize(result), nil
 	}
 	if lastErr != nil {
 		return 0, fmt.Errorf("k8s mongo.StorageBytes: dbStats (all candidates): %w", lastErr)

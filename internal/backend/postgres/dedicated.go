@@ -15,11 +15,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
-
-	"github.com/jackc/pgx/v5"
 )
 
 const dedicatedNeonRegion = "aws-us-east-2"
@@ -103,12 +100,12 @@ func (p *DedicatedProvider) provisionNeon(ctx context.Context, token, tier strin
 			"region_id":  dedicatedNeonRegion,
 		},
 	}
-	bodyBytes, err := json.Marshal(body)
+	bodyBytes, err := jsonMarshal(body)
 	if err != nil {
 		return nil, fmt.Errorf("db.dedicated.provisionNeon: marshal: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+	req, err := httpNewRequestWithContext(ctx, http.MethodPost,
 		p.neonBaseURL+"/projects", bytes.NewReader(bodyBytes))
 	if err != nil {
 		return nil, fmt.Errorf("db.dedicated.provisionNeon: new request: %w", err)
@@ -122,7 +119,7 @@ func (p *DedicatedProvider) provisionNeon(ctx context.Context, token, tier strin
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	respBytes, err := io.ReadAll(resp.Body)
+	respBytes, err := ioReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("db.dedicated.provisionNeon: read body: %w", err)
 	}
@@ -165,7 +162,7 @@ func (p *DedicatedProvider) neonStorageBytes(ctx context.Context, providerResour
 	if providerResourceID == "" {
 		return 0, fmt.Errorf("db.dedicated.neonStorageBytes: empty providerResourceID")
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+	req, err := httpNewRequestWithContext(ctx, http.MethodGet,
 		p.neonBaseURL+"/projects/"+providerResourceID, nil)
 	if err != nil {
 		return 0, fmt.Errorf("db.dedicated.neonStorageBytes: new request: %w", err)
@@ -178,7 +175,7 @@ func (p *DedicatedProvider) neonStorageBytes(ctx context.Context, providerResour
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	respBytes, err := io.ReadAll(resp.Body)
+	respBytes, err := ioReadAll(resp.Body)
 	if err != nil {
 		return 0, fmt.Errorf("db.dedicated.neonStorageBytes: read body: %w", err)
 	}
@@ -203,7 +200,7 @@ func (p *DedicatedProvider) deprovisionNeon(ctx context.Context, token, provider
 	if providerResourceID == "" {
 		return fmt.Errorf("db.dedicated.deprovisionNeon: empty providerResourceID")
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete,
+	req, err := httpNewRequestWithContext(ctx, http.MethodDelete,
 		p.neonBaseURL+"/projects/"+providerResourceID, nil)
 	if err != nil {
 		return fmt.Errorf("db.dedicated.deprovisionNeon: new request: %w", err)
@@ -217,7 +214,7 @@ func (p *DedicatedProvider) deprovisionNeon(ctx context.Context, token, provider
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := ioReadAll(resp.Body)
 		return fmt.Errorf("db.dedicated.deprovisionNeon: status %d: %s", resp.StatusCode, string(body))
 	}
 	slog.Info("db.dedicated.deprovisionNeon: deprovisioned", "token", token, "project_id", providerResourceID)
@@ -246,7 +243,7 @@ func (p *DedicatedProvider) provisionLocal(ctx context.Context, token, tier stri
 	}
 
 	adminDSN := p.localAdminDSN()
-	conn, err := pgx.Connect(ctx, adminDSN)
+	conn, err := pgxConnect(ctx, adminDSN)
 	if err != nil {
 		return nil, fmt.Errorf("db.dedicated.provisionLocal: connect: %w", err)
 	}
@@ -267,7 +264,7 @@ func (p *DedicatedProvider) provisionLocal(ctx context.Context, token, tier stri
 	}
 
 	// Grant schema privileges on the new database.
-	adminNewDB, err := pgx.Connect(ctx, buildAdminNewDBURL(adminDSN, dbName))
+	adminNewDB, err := pgxConnect(ctx, buildAdminNewDBURL(adminDSN, dbName))
 	if err != nil {
 		slog.Error("db.dedicated.provisionLocal: connect new db for schema grant (non-fatal)", "error", err)
 	} else {
@@ -300,7 +297,7 @@ func (p *DedicatedProvider) provisionLocal(ctx context.Context, token, tier stri
 
 func (p *DedicatedProvider) localStorageBytes(ctx context.Context, token string) (int64, error) {
 	adminDSN := p.localAdminDSN()
-	conn, err := pgx.Connect(ctx, adminDSN)
+	conn, err := pgxConnect(ctx, adminDSN)
 	if err != nil {
 		return 0, fmt.Errorf("db.dedicated.localStorageBytes: connect: %w", err)
 	}
@@ -323,7 +320,7 @@ func (p *DedicatedProvider) deprovisionLocal(ctx context.Context, token string) 
 	username := "dedicated_usr_" + token
 
 	adminDSN := p.localAdminDSN()
-	conn, err := pgx.Connect(ctx, adminDSN)
+	conn, err := pgxConnect(ctx, adminDSN)
 	if err != nil {
 		return fmt.Errorf("db.dedicated.deprovisionLocal: connect: %w", err)
 	}

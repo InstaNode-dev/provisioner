@@ -8,7 +8,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"time"
@@ -100,12 +99,12 @@ func (b *NeonBackend) Provision(ctx context.Context, token, tier string, connLim
 			"pg_version": 16,
 		},
 	}
-	bodyBytes, err := json.Marshal(body)
+	bodyBytes, err := jsonMarshal(body)
 	if err != nil {
 		return nil, fmt.Errorf("db.neon.Provision: marshal: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, b.base()+"/projects", bytes.NewReader(bodyBytes))
+	req, err := httpNewRequestWithContext(ctx, http.MethodPost, b.base()+"/projects", bytes.NewReader(bodyBytes))
 	if err != nil {
 		return nil, fmt.Errorf("db.neon.Provision: new request: %w", err)
 	}
@@ -118,7 +117,7 @@ func (b *NeonBackend) Provision(ctx context.Context, token, tier string, connLim
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	respBytes, err := io.ReadAll(resp.Body)
+	respBytes, err := ioReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("db.neon.Provision: read body: %w", err)
 	}
@@ -167,7 +166,7 @@ func (b *NeonBackend) StorageBytes(ctx context.Context, token, providerResourceI
 		return 0, fmt.Errorf("db.neon.StorageBytes: empty providerResourceID")
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+	req, err := httpNewRequestWithContext(ctx, http.MethodGet,
 		b.base()+"/projects/"+providerResourceID, nil)
 	if err != nil {
 		return 0, fmt.Errorf("db.neon.StorageBytes: new request: %w", err)
@@ -180,7 +179,7 @@ func (b *NeonBackend) StorageBytes(ctx context.Context, token, providerResourceI
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	respBytes, err := io.ReadAll(resp.Body)
+	respBytes, err := ioReadAll(resp.Body)
 	if err != nil {
 		return 0, fmt.Errorf("db.neon.StorageBytes: read body: %w", err)
 	}
@@ -210,7 +209,7 @@ func (b *NeonBackend) Deprovision(ctx context.Context, token, providerResourceID
 		return fmt.Errorf("db.neon.Deprovision: empty providerResourceID")
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete,
+	req, err := httpNewRequestWithContext(ctx, http.MethodDelete,
 		b.base()+"/projects/"+providerResourceID, nil)
 	if err != nil {
 		return fmt.Errorf("db.neon.Deprovision: new request: %w", err)
@@ -224,7 +223,7 @@ func (b *NeonBackend) Deprovision(ctx context.Context, token, providerResourceID
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := ioReadAll(resp.Body)
 		return fmt.Errorf("db.neon.Deprovision: unexpected status %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -245,7 +244,7 @@ func (b *NeonBackend) Regrade(ctx context.Context, token, providerResourceID str
 // so the caller can decide whether to proceed with a create.
 // GET https://console.neon.tech/api/v2/projects
 func (b *NeonBackend) findProjectByName(ctx context.Context, projectName string) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, b.base()+"/projects", nil)
+	req, err := httpNewRequestWithContext(ctx, http.MethodGet, b.base()+"/projects", nil)
 	if err != nil {
 		return "", fmt.Errorf("db.neon.findProjectByName: new request: %w", err)
 	}
@@ -257,7 +256,7 @@ func (b *NeonBackend) findProjectByName(ctx context.Context, projectName string)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	respBytes, err := io.ReadAll(resp.Body)
+	respBytes, err := ioReadAll(resp.Body)
 	if err != nil {
 		return "", fmt.Errorf("db.neon.findProjectByName: read body: %w", err)
 	}

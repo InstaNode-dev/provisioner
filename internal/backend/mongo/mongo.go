@@ -27,10 +27,47 @@ import (
 // Short to fail-fast in tests and when MongoDB is not reachable.
 const connectTimeout = 3 * time.Second
 
+// decodeStorageSize extracts the dbStats storageSize from a decoded result,
+// tolerating every BSON numeric encoding the server may use across versions
+// (int32 / int64 / float64). Any missing or non-numeric value yields 0 — the
+// fail-open contract for the quota scanner. Extracted as a standalone helper so
+// the per-type decode arms are unit-testable without a live server returning a
+// specific BSON type (real dbStats emits float64, leaving the integer arms
+// otherwise unexercised).
+func decodeStorageSize(result bson.M) int64 {
+	switch v := result["storageSize"].(type) {
+	case int32:
+		return int64(v)
+	case int64:
+		return v
+	case float64:
+		return int64(v)
+	default:
+		return 0
+	}
+}
+
 // LocalBackend provisions MongoDB databases on a local instance.
 type LocalBackend struct {
 	adminURI  string // admin connection URI, e.g. mongodb://root:root@localhost:27017
 	mongoHost string // host for building connection strings, e.g. localhost:27017
+
+	// connectFn is the seam between the LocalBackend methods and
+	// mongo.Connect, mirroring K8sBackend.initMongoFn. The real mongo driver
+	// almost never returns an error from Connect itself (a malformed URI
+	// surfaces lazily on the first RunCommand), so the connect-error branches
+	// are otherwise unreachable in tests; substituting connectFn lets a test
+	// drive those branches deterministically. Never overridden in prod paths.
+	connectFn func(ctx context.Context, opts ...*options.ClientOptions) (*mongo.Client, error)
+}
+
+// connect dials Mongo via the (overridable) connectFn seam, defaulting to the
+// real mongo.Connect.
+func (b *LocalBackend) connect(ctx context.Context, opts ...*options.ClientOptions) (*mongo.Client, error) {
+	if b.connectFn != nil {
+		return b.connectFn(ctx, opts...)
+	}
+	return mongo.Connect(ctx, opts...)
 }
 
 // newLocalBackend creates a LocalBackend.
@@ -49,7 +86,7 @@ func newLocalBackend(adminURI, mongoHost string) *LocalBackend {
 // User: usr_{token} with readWrite role scoped to db_{token}
 // Returns credentials the caller can use immediately.
 func (b *LocalBackend) Provision(ctx context.Context, token, tier string) (*Credentials, error) {
-	client, err := mongo.Connect(ctx, options.Client().ApplyURI(b.adminURI).
+	client, err := b.connect(ctx, options.Client().ApplyURI(b.adminURI).
 		SetServerSelectionTimeout(connectTimeout))
 	if err != nil {
 		return nil, fmt.Errorf("nosql.Provision: connect: %w", err)
@@ -119,7 +156,7 @@ func (b *LocalBackend) Provision(ctx context.Context, token, tier string) (*Cred
 // StorageBytes returns the storage size in bytes used by db_{token}.
 // Runs dbStats on the token database. Returns 0 on any error (fail-open).
 func (b *LocalBackend) StorageBytes(ctx context.Context, token, providerResourceID string) (int64, error) {
-	client, err := mongo.Connect(ctx, options.Client().ApplyURI(b.adminURI).
+	client, err := b.connect(ctx, options.Client().ApplyURI(b.adminURI).
 		SetServerSelectionTimeout(connectTimeout))
 	if err != nil {
 		slog.Error("nosql.StorageBytes: connect", "token", token, "error", err)
@@ -148,15 +185,7 @@ func (b *LocalBackend) StorageBytes(ctx context.Context, token, providerResource
 			slog.Debug("nosql.StorageBytes: dbStats miss for candidate", "token", token, "db", dbName, "error", err)
 			continue
 		}
-		switch v := result["storageSize"].(type) {
-		case int32:
-			return int64(v), nil
-		case int64:
-			return v, nil
-		case float64:
-			return int64(v), nil
-		}
-		return 0, nil
+		return decodeStorageSize(result), nil
 	}
 
 	// No candidate database exists yet — fail open.
@@ -167,7 +196,7 @@ func (b *LocalBackend) StorageBytes(ctx context.Context, token, providerResource
 // Deprovision drops the user and database for the given token.
 // Drops user first, then drops the database.
 func (b *LocalBackend) Deprovision(ctx context.Context, token, providerResourceID string) error {
-	client, err := mongo.Connect(ctx, options.Client().ApplyURI(b.adminURI).
+	client, err := b.connect(ctx, options.Client().ApplyURI(b.adminURI).
 		SetServerSelectionTimeout(connectTimeout))
 	if err != nil {
 		return fmt.Errorf("nosql.Deprovision: connect: %w", err)

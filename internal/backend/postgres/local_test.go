@@ -49,10 +49,10 @@ func TestRegradeApplyLimit_Normalization(t *testing.T) {
 		in   int
 		want int
 	}{
-		{0, -1},   // zero means "unset" → unlimited
-		{-1, -1},  // explicit unlimited stays -1
-		{8, 8},    // positive cap preserved
-		{20, 20},  // pro-tier cap preserved
+		{0, -1},  // zero means "unset" → unlimited
+		{-1, -1}, // explicit unlimited stays -1
+		{8, 8},   // positive cap preserved
+		{20, 20}, // pro-tier cap preserved
 	}
 	for _, tc := range cases {
 		got := normalizeRegradeConnLimit(tc.in)

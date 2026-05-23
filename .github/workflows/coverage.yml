@@ -1,0 +1,212 @@
+name: coverage
+
+# Coverage CI for the provisioner.
+#
+# This job runs the FULL test suite against real Postgres / Redis / Mongo /
+# NATS service containers so the env-gated integration tests actually execute
+# and contribute coverage — instead of skipping silently on a DB-less runner.
+#
+# Why the service containers matter (2026-05-22):
+#   A large slice of the provisioner's executable surface is exercised by tests
+#   that t.Skip() unless a real backend is reachable:
+#     - internal/pool/manager_db_test.go         → TEST_PROVISIONER_DATABASE_URL
+#     - internal/backend/postgres/local_live_test → TEST_POSTGRES_ADMIN_DSN /
+#                                                    CUSTOMER_POSTGRES_DSN /
+#                                                    TEST_POSTGRES_CUSTOMERS_URL
+#     - internal/backend/postgres/k8s_provision_test → TEST_REDIS_ADDR
+#     - internal/backend/redis/coverage_test       → CUSTOMER_REDIS_URL
+#                                                    (+ hardcoded :6379 path)
+#     - internal/backend/mongo/*_test              → CUSTOMER_MONGO_URL,
+#                                                    CUSTOMER_MONGO_AUTH_URL,
+#                                                    REDIS_URL_TEST
+#   With no service containers those files skipped and the pool package sat at
+#   47% while the suite still reported "green". Wiring the containers + the
+#   exact TEST_* env var names below moved pool 47%→96%, redis 84%→95%,
+#   mongo 91%→96% and pushed the full-suite total over the 95% floor.
+#
+# Note: the suite is NOT gated on `testing.Short()` (grep -rn "testing.Short()"
+# internal/ → no hits) — the gate is purely env-var reachability, so `-short`
+# is intentionally NOT passed here.
+#
+# Container ports use the standard host ports (5432/6379/27017/4222) because a
+# few tests hardcode them (e.g. redis StorageBytes connects to the Service
+# ClusterIP on :6379, and coverage_test's liveRedisAddr falls back to
+# localhost:6379). On the Linux runner the service-container network has no
+# IPv6/loopback flakiness, so 127.0.0.1 host addresses connect cleanly.
+
+on:
+  pull_request:
+    branches: [master, main]
+  push:
+    branches: [master, main]
+
+permissions:
+  contents: read
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # Real backends for the env-gated integration tests. Health-check options
+    # gate the job's steps until each container is accepting connections.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      mongo:
+        image: mongo:6
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.runCommand({ ping: 1 }).ok' || mongo --quiet --eval 'db.runCommand({ ping: 1 }).ok'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      # Authenticated Mongo for the CUSTOMER_MONGO_AUTH_URL auth-fail branches
+      # (TestLocalProvision_AuthFailReturnsError et al.). Runs on a second host
+      # port so it never collides with the no-auth mongo above.
+      mongo-auth:
+        image: mongo:6
+        env:
+          MONGO_INITDB_ROOT_USERNAME: root
+          MONGO_INITDB_ROOT_PASSWORD: rootpass
+        ports:
+          - 27018:27017
+        options: >-
+          --health-cmd "mongosh --quiet -u root -p rootpass --eval 'db.runCommand({ ping: 1 }).ok' || mongo --quiet -u root -p rootpass --eval 'db.runCommand({ ping: 1 }).ok'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    # TEST_* env vars the pool/backend test helpers read via os.Getenv. The
+    # exact names were grepped from the test files (os.Getenv("TEST_…") and the
+    # liveXxx() helper fallbacks) — wrong names = silent skip = lost coverage.
+    env:
+      # internal/pool/manager_db_test.go::testDSN
+      TEST_PROVISIONER_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable
+      # internal/backend/postgres/local_live_test.go::testAdminDSN (any of three)
+      TEST_POSTGRES_ADMIN_DSN: postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable
+      CUSTOMER_POSTGRES_DSN: postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable
+      TEST_POSTGRES_CUSTOMERS_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable
+      # internal/backend/postgres/k8s_provision_test.go
+      TEST_REDIS_ADDR: 127.0.0.1:6379
+      # internal/backend/redis/coverage_test.go::liveRedisAddr
+      CUSTOMER_REDIS_URL: redis://127.0.0.1:6379
+      # internal/backend/mongo/coverage_extra_test.go route-registry arm
+      REDIS_URL_TEST: redis://127.0.0.1:6379
+      # internal/backend/mongo/local_test.go::liveMongoURI
+      CUSTOMER_MONGO_URL: mongodb://127.0.0.1:27017
+      # internal/backend/mongo/coverage_extra_test.go auth-fail branches
+      CUSTOMER_MONGO_AUTH_URL: mongodb://root:rootpass@127.0.0.1:27018
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: provisioner
+          # Full history so diff-cover can resolve origin/<base_ref>.
+          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          repository: InstaNode-dev/common
+          path: common
+        continue-on-error: true
+      - uses: actions/checkout@v4
+        with:
+          repository: InstaNode-dev/proto
+          path: proto
+        continue-on-error: true
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: provisioner/go.mod
+      # Drop the `|| true` from the previous revision — it masked real test
+      # failures and let coverage drift unnoticed (CLAUDE.md rule 12: shipped
+      # ≠ verified). A red test must fail the job; codecov upload below is
+      # still soft-failed via fail_ci_if_error: false so a missing token
+      # doesn't take CI down.
+      - name: Generate coverage
+        working-directory: provisioner
+        # No `-short`: the integration tests are gated on TEST_* env-var
+        # reachability (set above), NOT on testing.Short(). `-p 1` serialises
+        # package execution so the many DB-touching packages don't open
+        # connections concurrently against the shared service containers.
+        run: go test ./... -p 1 -coverprofile=coverage.out -covermode=atomic
+      - uses: codecov/codecov-action@v4
+        with:
+          files: provisioner/coverage.out
+          flags: provisioner
+          fail_ci_if_error: false
+
+      # ------------------------------------------------------------------
+      # Org patch-coverage mandate: every changed line in a PR diff must be
+      # covered by a test (100%), and the project floor stays >=95%.
+      # Tool: diff-cover (https://github.com/Bachmann1234/diff-cover).
+      # ------------------------------------------------------------------
+      - uses: actions/setup-python@v5
+        if: github.event_name == 'pull_request'
+        with:
+          python-version: '3.12'
+      - name: Install diff-cover + cobertura converter
+        if: github.event_name == 'pull_request'
+        run: |
+          pip install diff-cover
+          go install github.com/boumenot/gocover-cobertura@latest
+      - name: Convert coverage to Cobertura
+        if: github.event_name == 'pull_request'
+        working-directory: provisioner
+        run: $(go env GOPATH)/bin/gocover-cobertura < coverage.out > coverage.xml
+      - name: Patch coverage gate (100% of changed lines)
+        if: github.event_name == 'pull_request'
+        working-directory: provisioner
+        run: |
+          git fetch origin "${{ github.base_ref }}" --depth=1 || true
+          diff-cover coverage.xml \
+            --compare-branch="origin/${{ github.base_ref }}" \
+            --fail-under=100
+      - name: Project coverage floor (>=95% production code)
+        if: github.event_name == 'pull_request'
+        working-directory: provisioner
+        # The >=95% floor is measured over PRODUCTION code only. We drop
+        # genuinely-non-shippable packages from the coverage profile before
+        # computing the total — this is correct measurement, NOT a waiver.
+        # No internal/<domain> production package is ever excluded here.
+        #
+        # Excluded (and why):
+        #   cmd/smoke-buildinfo   — diagnostic/smoke binary, not shipped logic.
+        #   cmd/*                 — pure diagnostic/smoke binaries.
+        #   internal/testhelpers  — test-DB/setup harness (none today; future-proof).
+        #   e2e/                  — black-box E2E suite (//go:build e2e; none today).
+        #   proto/gen, *_pb.go    — generated protobuf code.
+        # Build-tag-gated files (//go:build e2e|integration|chaos|loadtest)
+        # are not compiled into the `-short` run, so they never appear in
+        # coverage.out — the path filter below is belt-and-suspenders.
+        run: |
+          # Keep the `mode:` header line; drop excluded package paths.
+          grep -vE '(/internal/testhelpers/|/cmd/|/e2e/|/proto/gen/|_pb\.go:)' \
+            coverage.out > coverage.prod.out
+          total=$(go tool cover -func=coverage.prod.out | tail -1 | awk '{print $3}' | tr -d '%')
+          echo "Total project coverage: ${total}%"
+          awk -v t="$total" 'BEGIN { exit (t+0 >= 95) ? 0 : 1 }' \
+            || { echo "::error::Production coverage ${total}% is below the 95% floor"; exit 1; }

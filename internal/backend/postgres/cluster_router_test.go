@@ -23,13 +23,13 @@ func TestAdminURLForResource_RoutesByIndex(t *testing.T) {
 		prid string
 		want string
 	}{
-		{"", "url0"},          // legacy empty → cluster 0
-		{"local:0", "url0"},   // explicit index
-		{"local:2", "url2"},   // explicit index
-		{"local:9", "url0"},   // out of range → cluster 0
-		{"local:-1", "url0"},  // negative → cluster 0
-		{"local:x", "url0"},   // unparseable → cluster 0
-		{"neon:abc", "url0"},  // not a local resource → cluster 0
+		{"", "url0"},         // legacy empty → cluster 0
+		{"local:0", "url0"},  // explicit index
+		{"local:2", "url2"},  // explicit index
+		{"local:9", "url0"},  // out of range → cluster 0
+		{"local:-1", "url0"}, // negative → cluster 0
+		{"local:x", "url0"},  // unparseable → cluster 0
+		{"neon:abc", "url0"}, // not a local resource → cluster 0
 	}
 	for _, tc := range cases {
 		if got := r.AdminURLForResource(tc.prid); got != tc.want {

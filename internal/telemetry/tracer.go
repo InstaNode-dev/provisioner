@@ -18,6 +18,20 @@ import (
 	"google.golang.org/grpc/credentials"
 )
 
+// newExporter / newResource are indirection seams over the OTel SDK
+// constructors. Production points them at the real otlptracegrpc.New /
+// resource.New; tests swap them to force the otherwise-unreachable
+// construction-error arms of InitTracer (a misconfigured exporter or a failed
+// resource detector must fall back to a no-op shutdown, never crash boot).
+var (
+	newExporter = func(ctx context.Context, opts ...otlptracegrpc.Option) (sdktrace.SpanExporter, error) {
+		return otlptracegrpc.New(ctx, opts...)
+	}
+	newResource = func(ctx context.Context, opts ...resource.Option) (*resource.Resource, error) {
+		return resource.New(ctx, opts...)
+	}
+)
+
 // InitTracer configures the global OpenTelemetry tracer provider.
 //
 // Endpoint selection (in order of precedence):
@@ -92,13 +106,13 @@ func InitTracer(serviceName, otlpEndpoint string) func(context.Context) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	exporter, err := otlptracegrpc.New(ctx, opts...)
+	exporter, err := newExporter(ctx, opts...)
 	if err != nil {
 		slog.Error("telemetry.otlp_exporter_failed", "error", err, "endpoint", ep, "tls", useTLS)
 		return func(context.Context) error { return nil }
 	}
 
-	res, err := resource.New(ctx,
+	res, err := newResource(ctx,
 		resource.WithAttributes(semconv.ServiceName(serviceName)),
 	)
 	if err != nil {

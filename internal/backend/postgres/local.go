@@ -19,8 +19,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-
 	"instant.dev/provisioner/internal/poolident"
 )
 
@@ -47,8 +45,10 @@ const sqlCreateExtensionVector = "CREATE EXTENSION IF NOT EXISTS vector"
 // itself, so one or two attempts is normally enough.
 const deprovisionDropDBAttempts = 3
 
-// deprovisionDropDBRetryDelay is the pause between DROP DATABASE attempts.
-const deprovisionDropDBRetryDelay = 500 * time.Millisecond
+// deprovisionDropDBRetryDelay is the pause between DROP DATABASE attempts. It is
+// a package var (not a const) only so tests can shrink it to avoid a real
+// 500ms*N wait while still exercising the retry loop. Production value unchanged.
+var deprovisionDropDBRetryDelay = 500 * time.Millisecond
 
 // pgDatabaseInUseMarker is the Postgres error-message fragment for SQLSTATE
 // 55006 (object_in_use) raised by DROP DATABASE when a backend is still
@@ -109,7 +109,7 @@ func generatePassword(n int) (string, error) {
 	buf := make([]byte, n)
 	charsetLen := big.NewInt(int64(len(alphanumChars)))
 	for i := range buf {
-		idx, err := rand.Int(rand.Reader, charsetLen)
+		idx, err := randInt(rand.Reader, charsetLen)
 		if err != nil {
 			return "", fmt.Errorf("generatePassword: %w", err)
 		}
@@ -142,7 +142,7 @@ func (b *LocalBackend) Provision(ctx context.Context, token, tier string, connLi
 	defer b.router.ReleasePick(clusterIdx)
 
 	// Connect as admin.
-	conn, err := pgx.Connect(ctx, adminURL)
+	conn, err := pgxConnect(ctx, adminURL)
 	if err != nil {
 		return nil, fmt.Errorf("db.local.Provision: connect: %w", err)
 	}
@@ -183,7 +183,7 @@ func (b *LocalBackend) Provision(ctx context.Context, token, tier string, connLi
 	// Connect to the new database to grant schema privileges.
 	// Build the new DB URL by substituting the database name in the admin URL.
 	newDBURL := buildDBURL(adminURL, username, pass, dbName)
-	adminNewDB, err := pgx.Connect(ctx, buildAdminNewDBURL(adminURL, dbName))
+	adminNewDB, err := pgxConnect(ctx, buildAdminNewDBURL(adminURL, dbName))
 	if err != nil {
 		slog.Error("db.local.Provision: connect new db for schema grant (non-fatal)", "error", err)
 	} else {
@@ -238,7 +238,7 @@ func (b *LocalBackend) Provision(ctx context.Context, token, tier string, connLi
 // segment is stripped before the router parses it.
 func (b *LocalBackend) StorageBytes(ctx context.Context, token, providerResourceID string) (int64, error) {
 	adminURL := b.router.AdminURLForResource(poolident.BasePRID(providerResourceID))
-	conn, err := pgx.Connect(ctx, adminURL)
+	conn, err := pgxConnect(ctx, adminURL)
 	if err != nil {
 		return 0, fmt.Errorf("db.local.StorageBytes: connect: %w", err)
 	}
@@ -276,7 +276,7 @@ func (b *LocalBackend) Deprovision(ctx context.Context, token, providerResourceI
 	username := userNamePrefix + namingToken
 
 	adminURL := b.router.AdminURLForResource(poolident.BasePRID(providerResourceID))
-	conn, err := pgx.Connect(ctx, adminURL)
+	conn, err := pgxConnect(ctx, adminURL)
 	if err != nil {
 		return fmt.Errorf("db.local.Deprovision: connect: %w", err)
 	}
@@ -353,7 +353,7 @@ func (b *LocalBackend) Regrade(ctx context.Context, token, providerResourceID st
 	username := userNamePrefix + poolident.NamingToken(token, providerResourceID)
 
 	adminURL := b.router.AdminURLForResource(poolident.BasePRID(providerResourceID))
-	conn, err := pgx.Connect(ctx, adminURL)
+	conn, err := pgxConnect(ctx, adminURL)
 	if err != nil {
 		return RegradeResult{Applied: false}, fmt.Errorf("db.local.Regrade: connect: %w", err)
 	}

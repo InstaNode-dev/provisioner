@@ -85,7 +85,7 @@ func TestK8sRandHex(t *testing.T) {
 	}
 	// Must be valid hex.
 	for _, c := range s {
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
 			t.Errorf("k8sRandHex returned non-hex char %q", c)
 			break
 		}

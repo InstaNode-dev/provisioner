@@ -49,7 +49,7 @@ func (b *LocalBackend) Provision(ctx context.Context, token, tier string) (*Cred
 	if err != nil {
 		return nil, fmt.Errorf("queue.local.Provision: NATS health check failed (%s): %w", monitorURL, err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("queue.local.Provision: NATS unhealthy (HTTP %d from %s)", resp.StatusCode, monitorURL)
 	}

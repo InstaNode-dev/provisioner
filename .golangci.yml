@@ -1,0 +1,35 @@
+# golangci-lint v2 config — start conservative, expand once baseline is clean
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  # Default linter set is govet+errcheck+ineffassign+staticcheck+unused.
+  # We explicitly add misspell + gocyclo on top. gosimple folded into staticcheck in v2.
+  enable:
+    - errcheck       # checks unchecked errors
+    - govet          # standard vet
+    - ineffassign    # ineffective assignments
+    - staticcheck    # bug detection (subsumes gosimple in v2)
+    - unused         # unused code
+    - misspell       # spelling
+    - gocyclo        # cyclomatic complexity
+  settings:
+    gocyclo:
+      # Threshold raised above the highest current offender
+      # (Server.DeprovisionResource = 27) — these are inherently branchy
+      # switch/teardown functions; bumping the bar avoids a behavior-changing
+      # refactor while still flagging genuinely tangled new code.
+      min-complexity: 30
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gocyclo
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

@@ -422,17 +422,11 @@ func TestExecCommandConstruction(t *testing.T) {
 				t.Errorf("call[0] should be CONFIG GET maxmemory, got: %v", getCall.cmd)
 			}
 			// PASSWORD must appear as $REDIS_PASSWORD (shell variable), never as a literal.
+			// The password variable itself is fine; what we forbid is any hardcoded
+			// secret string. Since we never inject one, this check ensures the pattern
+			// `$REDIS_PASSWORD` appears in every redis-cli command.
 			for i, call := range fe.calls {
 				cmdStr := strings.Join(call.cmd, " ")
-				if strings.Contains(cmdStr, "$REDIS_PASSWORD") {
-					// Good — variable reference.
-				} else if strings.Contains(cmdStr, "REDIS_PASSWORD") {
-					// Also acceptable if it's the env var name without $.
-					// But the full literal password must not appear.
-				}
-				// The password variable itself is fine; what we forbid is any
-				// hardcoded secret string. Since we never inject one, this check
-				// ensures the pattern `$REDIS_PASSWORD` appears in every redis-cli command.
 				if !strings.Contains(cmdStr, `$REDIS_PASSWORD`) {
 					t.Errorf("call[%d] cmd does not reference $REDIS_PASSWORD: %v", i, call.cmd)
 				}
@@ -753,16 +747,5 @@ func notFoundErr(resource, name string) error {
 // Ensure notFoundErr is used (avoids "declared and not used" compile error).
 var _ = notFoundErr
 
-// fakeK8sSecretAbsent wraps fake.Clientset and returns NotFound for Secrets
-// with a specific name. Used to simulate the legacy-resource scenario where
-// the redis-auth Secret was never created.
-//
-// NOTE: This is no longer needed — fake.NewClientset without the secret
-// object already returns NotFound. Kept as documentation of the pattern.
-type fakeK8sSecretAbsent struct {
-	fake.Clientset
-	absentSecretName string
-}
-
-// Ensure it compiles.
+// Ensure the corev1/runtime imports stay referenced.
 var _ runtime.Object = (*corev1.Pod)(nil)

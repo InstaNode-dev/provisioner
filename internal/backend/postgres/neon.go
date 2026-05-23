@@ -116,7 +116,7 @@ func (b *NeonBackend) Provision(ctx context.Context, token, tier string, connLim
 	if err != nil {
 		return nil, fmt.Errorf("db.neon.Provision: http: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	respBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -178,7 +178,7 @@ func (b *NeonBackend) StorageBytes(ctx context.Context, token, providerResourceI
 	if err != nil {
 		return 0, fmt.Errorf("db.neon.StorageBytes: http: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	respBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -221,7 +221,7 @@ func (b *NeonBackend) Deprovision(ctx context.Context, token, providerResourceID
 	if err != nil {
 		return fmt.Errorf("db.neon.Deprovision: http: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(resp.Body)
@@ -255,7 +255,7 @@ func (b *NeonBackend) findProjectByName(ctx context.Context, projectName string)
 	if err != nil {
 		return "", fmt.Errorf("db.neon.findProjectByName: http: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	respBytes, err := io.ReadAll(resp.Body)
 	if err != nil {

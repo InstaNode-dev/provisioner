@@ -352,7 +352,7 @@ func (b *K8sBackend) StorageBytes(ctx context.Context, token, providerResourceID
 	if err != nil {
 		return 0, fmt.Errorf("k8s postgres.StorageBytes: connect: %w", err)
 	}
-	defer conn.Close(ctx)
+	defer func() { _ = conn.Close(ctx) }()
 
 	// Try the canonical DB name first, then the legacy 12-char-truncated name.
 	// A pod provisioned before the P1-W5-05 naming fix holds its data under the
@@ -451,7 +451,7 @@ func (b *K8sBackend) Regrade(ctx context.Context, token, providerResourceID stri
 	if err != nil {
 		return RegradeResult{Applied: false, SkipReason: fmt.Sprintf("resource not reachable: connect: %v", err)}, nil
 	}
-	defer conn.Close(ctx)
+	defer func() { _ = conn.Close(ctx) }()
 
 	// ALTER ROLE re-applies the tier's connection cap. -1 = unlimited (passed
 	// through verbatim). Identifier quoted with %q, mirroring the CREATE USER
@@ -736,7 +736,7 @@ func (b *K8sBackend) initDatabase(ctx context.Context, adminDSN, dbName, appUser
 	if err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}
-	defer conn.Close(ctx)
+	defer func() { _ = conn.Close(ctx) }()
 
 	// CONNECTION LIMIT enforces the tier's connection cap at the Postgres user
 	// level. -1 = unlimited (capped only by pod max_connections); a positive
@@ -762,7 +762,7 @@ func (b *K8sBackend) initDatabase(ctx context.Context, adminDSN, dbName, appUser
 	if dbConn, dbErr := pgx.Connect(ctx, dbDSN); dbErr == nil {
 		_, _ = dbConn.Exec(ctx, `CREATE EXTENSION IF NOT EXISTS vector`)
 		_, _ = dbConn.Exec(ctx, fmt.Sprintf(`ALTER EXTENSION vector OWNER TO %q`, appUser))
-		dbConn.Close(ctx)
+		_ = dbConn.Close(ctx)
 	}
 	return nil
 }

@@ -430,7 +430,7 @@ func (b *K8sBackend) StorageBytes(ctx context.Context, token, providerResourceID
 	if err != nil {
 		return 0, fmt.Errorf("k8s mongo.StorageBytes: connect: %w", err)
 	}
-	defer client.Disconnect(ctx)
+	defer func() { _ = client.Disconnect(ctx) }()
 
 	// Try the canonical DB name first, then every legacy scheme. A pod
 	// provisioned before the P0-5 naming fix holds its data under the legacy
@@ -792,7 +792,7 @@ func (b *K8sBackend) tryInitMongo(ctx context.Context, adminURI, dbName, appUser
 	if err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}
-	defer client.Disconnect(ctx)
+	defer func() { _ = client.Disconnect(ctx) }()
 
 	// Create the user in dbName (not admin). This way authSource=dbName works in the
 	// connection URL. MongoDB creates the database implicitly on first write.

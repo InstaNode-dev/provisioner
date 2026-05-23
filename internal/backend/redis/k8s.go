@@ -535,7 +535,7 @@ func (b *K8sBackend) StorageBytes(ctx context.Context, token, providerResourceID
 		Addr:     fmt.Sprintf("%s:6379", svc.Spec.ClusterIP),
 		Password: password,
 	})
-	defer rdb.Close()
+	defer func() { _ = rdb.Close() }()
 
 	info, err := rdb.Info(ctx, "memory").Result()
 	if err != nil {
@@ -665,7 +665,7 @@ func (b *K8sBackend) Regrade(ctx context.Context, token, providerResourceID stri
 		Addr:     fmt.Sprintf("%s:6379", svc.Spec.ClusterIP),
 		Password: password,
 	})
-	defer rdb.Close()
+	defer func() { _ = rdb.Close() }()
 
 	// Compute the target in bytes (what Redis uses internally).
 	// targetMaxmemoryMB <= 0 means unlimited → targetBytes = 0.

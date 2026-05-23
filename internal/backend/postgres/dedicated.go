@@ -120,7 +120,7 @@ func (p *DedicatedProvider) provisionNeon(ctx context.Context, token, tier strin
 	if err != nil {
 		return nil, fmt.Errorf("db.dedicated.provisionNeon: http: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	respBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -176,7 +176,7 @@ func (p *DedicatedProvider) neonStorageBytes(ctx context.Context, providerResour
 	if err != nil {
 		return 0, fmt.Errorf("db.dedicated.neonStorageBytes: http: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	respBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -214,7 +214,7 @@ func (p *DedicatedProvider) deprovisionNeon(ctx context.Context, token, provider
 	if err != nil {
 		return fmt.Errorf("db.dedicated.deprovisionNeon: http: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(resp.Body)

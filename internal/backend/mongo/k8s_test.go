@@ -117,7 +117,7 @@ func TestMongoK8sRandHex_LengthAndUniqueness(t *testing.T) {
 	}
 	// Hex-only characters.
 	for _, c := range a {
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
 			t.Errorf("non-hex char %q in %q", c, a)
 		}
 	}

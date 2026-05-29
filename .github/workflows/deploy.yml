@@ -98,7 +98,7 @@ jobs:
       - name: Set up Go (for unit tests + go.mod replace directives)
         uses: actions/setup-go@v6
         with:
-          go-version: '1.24'
+          go-version: '1.25'
 
       - name: Run unit tests (short, no integration deps)
         # go.mod uses `replace instant.dev/common => ../common` and

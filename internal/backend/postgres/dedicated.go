@@ -34,12 +34,17 @@ type DedicatedProvider struct {
 // NewDedicatedProvider creates a DedicatedProvider.
 // adminDSN is used when neonAPIKey is empty (local/dev simulation).
 // neonAPIKey triggers the real Neon API path.
+// SEC (2026-05-29): the httpClient uses neonHTTPTimeout (defined in neon.go)
+// so a hung Neon Management API connection cannot wedge the provisioning
+// gRPC handler indefinitely. Without this bound a default `&http.Client{}`
+// has NO timeout — a single Neon outage would pile up goroutines until the
+// pod OOMs. Matches the timeout already on NeonBackend.client.
 func NewDedicatedProvider(adminDSN, neonAPIKey string) *DedicatedProvider {
 	return &DedicatedProvider{
 		adminDSN:    adminDSN,
 		neonAPIKey:  neonAPIKey,
 		neonBaseURL: neonAPIBase, // reuse the constant from neon.go
-		httpClient:  &http.Client{},
+		httpClient:  &http.Client{Timeout: neonHTTPTimeout},
 	}
 }
 

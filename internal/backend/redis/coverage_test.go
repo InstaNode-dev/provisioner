@@ -1037,6 +1037,11 @@ func TestK8sBackend_Regrade_NoServiceSoftSkip(t *testing.T) {
 	b := newFakeK8sBackend(t)
 	ctx := context.Background()
 	const ns = "no-svc-regrade-ns"
+	// Namespace present (pre-orphan-check fix requires this) + secret present
+	// + service absent → soft-skip with the legacy-resource SkipReason.
+	_, _ = b.cs.CoreV1().Namespaces().Create(ctx, &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{Name: ns},
+	}, metav1.CreateOptions{})
 	_, _ = b.cs.CoreV1().Secrets(ns).Create(ctx, &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: "redis-auth", Namespace: ns},
 		Data:       map[string][]byte{"REDIS_PASSWORD": []byte("x")},
@@ -1054,8 +1059,9 @@ func TestK8sBackend_Regrade_NoServiceSoftSkip(t *testing.T) {
 }
 
 // TestK8sBackend_Regrade_DefaultProviderResourceID — when providerResourceID is
-// empty, the namespace is derived from the token. Secret missing → exec path
-// (no pods → soft-skip), but the namespace lookup still happens.
+// empty, the namespace is derived from the token (redisK8sNsPrefix+token). With
+// an empty cluster the derived namespace is missing → orphan short-circuit fires
+// → quiet skip with SkipReason="namespace not found (resource orphaned)".
 func TestK8sBackend_Regrade_DefaultProviderResourceID(t *testing.T) {
 	b := newFakeK8sBackend(t)
 	result, err := b.Regrade(context.Background(), "tok-derive", "", 50)
@@ -1064,6 +1070,9 @@ func TestK8sBackend_Regrade_DefaultProviderResourceID(t *testing.T) {
 	}
 	if result.Applied {
 		t.Error("Applied should be false for empty cluster")
+	}
+	if !strings.Contains(result.SkipReason, "namespace not found") {
+		t.Errorf("SkipReason = %q; want 'namespace not found ...' (derived ns missing → orphan path)", result.SkipReason)
 	}
 }
 
@@ -1263,6 +1272,9 @@ func TestK8sBackend_Regrade_DirectPath_HappyAndIdempotent(t *testing.T) {
 
 	b := newFakeK8sBackend(t)
 	const ns = "regrade-real-ns"
+	_, _ = b.cs.CoreV1().Namespaces().Create(ctx, &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{Name: ns},
+	}, metav1.CreateOptions{})
 	_, _ = b.cs.CoreV1().Secrets(ns).Create(ctx, &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: "redis-auth", Namespace: ns},
 		Data:       map[string][]byte{"REDIS_PASSWORD": []byte("")},
@@ -1307,6 +1319,9 @@ func TestK8sBackend_Regrade_DirectPath_Unlimited(t *testing.T) {
 
 	b := newFakeK8sBackend(t)
 	const ns = "regrade-unlim-ns"
+	_, _ = b.cs.CoreV1().Namespaces().Create(ctx, &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{Name: ns},
+	}, metav1.CreateOptions{})
 	_, _ = b.cs.CoreV1().Secrets(ns).Create(ctx, &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: "redis-auth", Namespace: ns},
 		Data:       map[string][]byte{"REDIS_PASSWORD": []byte("")},
@@ -1516,14 +1531,16 @@ func TestK8sBackend_StorageBytes_GetSecretError(t *testing.T) {
 }
 
 // TestK8sBackend_Regrade_GetSecretError covers the non-NotFound secret error
-// branch on Regrade.
+// branch on Regrade. The namespace fixture is required so the new orphan
+// short-circuit does not fire before the secret reactor runs.
 func TestK8sBackend_Regrade_GetSecretError(t *testing.T) {
-	cs := fake.NewClientset()
+	const ns = "ns"
+	cs := fake.NewClientset(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
 	cs.PrependReactor("get", "secrets", func(_ k8stesting.Action) (bool, runtime.Object, error) {
 		return true, nil, fmt.Errorf("apiserver unavailable")
 	})
 	b := &K8sBackend{cs: cs}
-	_, err := b.Regrade(context.Background(), "tok", "ns", 50)
+	_, err := b.Regrade(context.Background(), "tok", ns, 50)
 	if err == nil {
 		t.Error("Regrade should propagate non-NotFound secret errors")
 	}
@@ -1532,8 +1549,8 @@ func TestK8sBackend_Regrade_GetSecretError(t *testing.T) {
 // TestK8sBackend_Regrade_GetServiceError covers the non-NotFound service error
 // branch on Regrade.
 func TestK8sBackend_Regrade_GetServiceError(t *testing.T) {
-	cs := fake.NewClientset()
 	const ns = "svcerr-ns"
+	cs := fake.NewClientset(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
 	_, _ = cs.CoreV1().Secrets(ns).Create(context.Background(), &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: "redis-auth", Namespace: ns},
 		Data:       map[string][]byte{"REDIS_PASSWORD": []byte("x")},
@@ -1858,6 +1875,9 @@ func TestK8sBackend_Regrade_ConfigGetError(t *testing.T) {
 	b := newFakeK8sBackend(t)
 	ctx := context.Background()
 	const ns = "cgerr-ns"
+	_, _ = b.cs.CoreV1().Namespaces().Create(ctx, &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{Name: ns},
+	}, metav1.CreateOptions{})
 	_, _ = b.cs.CoreV1().Secrets(ns).Create(ctx, &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: "redis-auth", Namespace: ns},
 		Data:       map[string][]byte{"REDIS_PASSWORD": []byte("x")},

@@ -45,6 +45,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 )
 
 // ─── Tier sizing regression guards ──────────────────────────────────────────
@@ -489,6 +490,14 @@ func TestExecCommandConstruction_AlreadyCorrect(t *testing.T) {
 
 // ─── Integration-style tests: Regrade routing ────────────────────────────────
 
+// nsObject returns a minimal corev1.Namespace fixture for use with fake.NewClientset.
+// Required after the orphaned-resource short-circuit (k8s.go) — Regrade now returns
+// SkipReason="namespace not found (resource orphaned)" if the namespace is absent,
+// so every Regrade test that exercises the existing code paths must include it.
+func nsObject(name string) *corev1.Namespace {
+	return &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: name}}
+}
+
 // TestRegrade_SecretPresent_DoesNotUseExec asserts that when the redis-auth
 // Secret IS present, Regrade uses the direct-connection path and never calls
 // the exec fallback.
@@ -512,7 +521,7 @@ func TestRegrade_SecretPresent_DoesNotUseExec(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "redis", Namespace: ns},
 		Spec:       corev1.ServiceSpec{ClusterIP: "127.0.0.1"},
 	}
-	cs := fake.NewClientset(secret, svc)
+	cs := fake.NewClientset(nsObject(ns), secret, svc)
 
 	fe := &fakeExecor{}
 	b := &K8sBackend{cs: cs, execor: fe}
@@ -545,7 +554,7 @@ func TestRegrade_SecretAbsent_UsesExecPath(t *testing.T) {
 	// No secret — secret lookup returns NotFound.
 	// Pod is present and Running so exec can proceed.
 	pod := runningPod(ns, "redis-aaa", "redis")
-	cs := fake.NewClientset(pod)
+	cs := fake.NewClientset(nsObject(ns), pod)
 
 	fe := &fakeExecor{
 		responses: []fakeExecResponse{
@@ -596,7 +605,7 @@ func TestRegrade_ExecFails_SoftSkip(t *testing.T) {
 	const token = "tok"
 
 	pod := runningPod(ns, "redis-aaa", "redis")
-	cs := fake.NewClientset(pod)
+	cs := fake.NewClientset(nsObject(ns), pod)
 
 	fe := &fakeExecor{
 		responses: []fakeExecResponse{
@@ -633,7 +642,7 @@ func TestRegrade_NoPodRunning_SoftSkip(t *testing.T) {
 		},
 		Status: corev1.PodStatus{Phase: corev1.PodPending},
 	}
-	cs := fake.NewClientset(pod)
+	cs := fake.NewClientset(nsObject(ns), pod)
 
 	fe := &fakeExecor{}
 	b := &K8sBackend{cs: cs, execor: fe}
@@ -650,13 +659,15 @@ func TestRegrade_NoPodRunning_SoftSkip(t *testing.T) {
 	}
 }
 
-// TestRegrade_NoPodsAtAll_SoftSkip asserts that when the namespace has no pods
-// at all, the exec fallback returns a soft-skip.
+// TestRegrade_NoPodsAtAll_SoftSkip asserts that when the namespace EXISTS but has
+// no pods at all (e.g. a legacy pod was deleted but the namespace lingers), the
+// exec fallback returns a soft-skip.
 func TestRegrade_NoPodsAtAll_SoftSkip(t *testing.T) {
 	const ns = "instant-customer-tok"
 	const token = "tok"
 
-	cs := fake.NewClientset() // empty cluster
+	// Namespace exists, but no secret + no pods → exec fallback → no pod found.
+	cs := fake.NewClientset(nsObject(ns))
 
 	fe := &fakeExecor{}
 	b := &K8sBackend{cs: cs, execor: fe}
@@ -667,6 +678,78 @@ func TestRegrade_NoPodsAtAll_SoftSkip(t *testing.T) {
 	}
 	if result.Applied {
 		t.Errorf("Applied should be false when namespace has no pods")
+	}
+	// Distinct skip reason: not the orphan-namespace path.
+	if result.SkipReason == "namespace not found (resource orphaned)" {
+		t.Errorf("SkipReason should be exec-fallback reason, not orphan-ns reason; got %q", result.SkipReason)
+	}
+}
+
+// TestRegrade_NamespaceMissing_QuietSkip asserts the orphaned-resource short-circuit:
+// when the namespace is gone (deprovisioned tenant, force-deleted ns, wiped cluster),
+// Regrade returns a quiet skip with the orphan SkipReason and makes NO Secrets.Get
+// or Pods.List call — verified by checking the fakeExecor.calls count stays zero AND
+// the SkipReason exactly matches the orphan sentinel string.
+//
+// Regression guard: prevents the WARN-spam-per-tick behaviour observed in prod on
+// 2026-05-30 (2 orphaned namespaces emitting ~576 WARN/day combined).
+func TestRegrade_NamespaceMissing_QuietSkip(t *testing.T) {
+	const ns = "instant-customer-gone"
+	const token = "gone"
+
+	// Empty cluster — no namespace exists. The pre-fix code would have
+	// hit Secrets.Get → IsNotFound → exec-fallback → Pods.List → WARN.
+	cs := fake.NewClientset()
+
+	fe := &fakeExecor{}
+	b := &K8sBackend{cs: cs, execor: fe}
+
+	result, err := b.Regrade(context.Background(), token, ns, 50)
+	if err != nil {
+		t.Fatalf("Regrade must not propagate errors for missing namespace; got: %v", err)
+	}
+	if result.Applied {
+		t.Errorf("Applied should be false when namespace is missing")
+	}
+	const wantSkip = "namespace not found (resource orphaned)"
+	if result.SkipReason != wantSkip {
+		t.Errorf("SkipReason = %q; want %q (distinct from exec-fallback reasons so operators can differentiate orphans from real legacy drift)",
+			result.SkipReason, wantSkip)
+	}
+	// Critical: the exec path MUST NOT be entered for orphans. That was the
+	// pre-fix bug — fanout to Pods.List per orphan per tick.
+	if len(fe.calls) != 0 {
+		t.Errorf("fakeExecor must not be called when namespace is missing; got %d calls", len(fe.calls))
+	}
+}
+
+// TestRegrade_NamespaceLookupTransientError_PropagatesError asserts that a
+// non-IsNotFound error from the namespace lookup (e.g. permission denied,
+// apiserver transport failure) is surfaced to the caller — NOT swallowed as a
+// silent skip. The reconciler needs the error to schedule a retry; treating it
+// as "orphaned" would cause skipped grades the customer pays for.
+func TestRegrade_NamespaceLookupTransientError_PropagatesError(t *testing.T) {
+	const ns = "instant-customer-tok"
+	const token = "tok"
+
+	cs := fake.NewClientset(nsObject(ns))
+	// Inject a transient error on the namespace GET reactor.
+	cs.PrependReactor("get", "namespaces", func(_ ktesting.Action) (bool, runtime.Object, error) {
+		return true, nil, fmt.Errorf("etcd: leader changed")
+	})
+
+	fe := &fakeExecor{}
+	b := &K8sBackend{cs: cs, execor: fe}
+
+	result, err := b.Regrade(context.Background(), token, ns, 50)
+	if err == nil {
+		t.Fatalf("Regrade must propagate non-IsNotFound errors so the reconciler retries; got nil error, result=%+v", result)
+	}
+	if result.Applied {
+		t.Errorf("Applied should be false on namespace lookup error")
+	}
+	if len(fe.calls) != 0 {
+		t.Errorf("fakeExecor must not be called on namespace lookup error; got %d calls", len(fe.calls))
 	}
 }
 

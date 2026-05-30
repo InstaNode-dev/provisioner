@@ -623,6 +623,30 @@ func (b *K8sBackend) Regrade(ctx context.Context, token, providerResourceID stri
 		ns = redisK8sNsPrefix + token
 	}
 
+	// ── Orphaned-resource short-circuit ───────────────────────────────────────
+	//
+	// If the namespace itself is gone, the resource row is orphaned: deprovision
+	// raced ahead of platform-DB cleanup, the namespace was force-deleted, or a
+	// test cluster was wiped. Without this guard the reconciler hits the
+	// Secrets.Get → IsNotFound → exec-fallback → Pods.List → empty path on every
+	// sweep forever, logging WARN twice per orphan per ~5min tick (verified
+	// 2026-05-30 in prod: 2 orphaned namespaces emitting 576 WARN/day combined).
+	//
+	// Quiet skip: log at INFO (one line per tick is acceptable; debug-only would
+	// hide a real cluster-wide namespace outage) and return a distinct SkipReason
+	// so operators can differentiate orphaned rows ("namespace not found") from
+	// genuine legacy-pod drift ("exec fallback: no pod found"). Also saves two
+	// kube-apiserver round-trips (Secrets.Get + Pods.List) per orphaned row.
+	if _, err := b.cs.CoreV1().Namespaces().Get(ctx, ns, metav1.GetOptions{}); err != nil {
+		if k8serrors.IsNotFound(err) {
+			slog.Info("k8s.redis.Regrade: namespace not found — orphaned resource, skip",
+				"namespace", ns, "token", token)
+			return RegradeResult{Applied: false, SkipReason: "namespace not found (resource orphaned)"}, nil
+		}
+		// Other errors (permission, transport): surface so the caller can retry.
+		return RegradeResult{Applied: false}, fmt.Errorf("k8s redis.Regrade: get namespace: %w", err)
+	}
+
 	// ── Secret-based path (modern resources) ──────────────────────────────────
 	//
 	// Modern resources (provisioned after the redis-auth Secret convention) store

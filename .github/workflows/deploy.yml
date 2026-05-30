@@ -130,6 +130,7 @@ jobs:
             --build-arg VERSION="${{ steps.meta.outputs.version }}" \
             -t "${IMAGE_REPO}:${{ steps.meta.outputs.version }}" \
             -t "${IMAGE_REPO}:latest" \
+            -t "${IMAGE_REPO}:staging" \
             --push \
             .
 
@@ -159,10 +160,14 @@ jobs:
             "deployment/${K8S_DEPLOYMENT}" \
             "${K8S_CONTAINER}=${IMAGE}" \
             -n "${K8S_NAMESPACE}"
+          # 2026-05-30: bumped 180s → 300s after a real api rollout took
+          # ~240s (image pull + readiness on a fresh node) and the workflow
+          # timed out even though the pod came up healthy. Same change in
+          # api + worker deploy.yml. False-failure forces a manual rerun.
           kubectl rollout status \
             "deployment/${K8S_DEPLOYMENT}" \
             -n "${K8S_NAMESPACE}" \
-            --timeout=180s
+            --timeout=300s
 
       - name: Verify rolled-out image tag matches built SHA (rule-14 gate)
         # CLAUDE.md rule 14 build-SHA gate. The provisioner has no public

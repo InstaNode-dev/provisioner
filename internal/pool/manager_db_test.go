@@ -302,4 +302,11 @@ func TestManager_Discard_MarksFailed(t *testing.T) {
 	if err := m.Discard(ctx, nil); err != nil {
 		t.Errorf("Discard(nil) should be a no-op, got %v", err)
 	}
+
+	// Error path: a closed pool makes the UPDATE fail → Discard wraps and
+	// returns the error (covers the error-return branch).
+	pool.Close()
+	if err := m.Discard(ctx, &Item{ID: id, ResourceType: "postgres"}); err == nil {
+		t.Error("Discard on a closed pool must return the wrapped exec error")
+	}
 }

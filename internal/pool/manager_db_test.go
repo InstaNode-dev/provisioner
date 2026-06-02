@@ -269,3 +269,37 @@ func TestStartShutdown_Lifecycle(t *testing.T) {
 		t.Fatal("Shutdown did not return within 5s")
 	}
 }
+
+// TestManager_Discard_MarksFailed covers bug bash #3: Discard flips a claimed
+// (assigned) item to 'failed' so it is never handed out again and a sweeper
+// can reclaim it. DB-gated (skips without TEST_PROVISIONER_DATABASE_URL).
+func TestManager_Discard_MarksFailed(t *testing.T) {
+	m, pool, _ := newDBManager(t, Config{})
+	ctx := context.Background()
+
+	var id string
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO pool_items (resource_type, connection_url, status)
+		VALUES ('postgres', 'enc-url', 'assigned')
+		RETURNING id
+	`).Scan(&id); err != nil {
+		t.Fatalf("seed assigned pool_item: %v", err)
+	}
+
+	if err := m.Discard(ctx, &Item{ID: id, ResourceType: "postgres"}); err != nil {
+		t.Fatalf("Discard: %v", err)
+	}
+
+	var status string
+	if err := pool.QueryRow(ctx, `SELECT status FROM pool_items WHERE id = $1`, id).Scan(&status); err != nil {
+		t.Fatalf("select status: %v", err)
+	}
+	if status != "failed" {
+		t.Errorf("status = %q; want 'failed' after Discard", status)
+	}
+
+	// A nil item is a no-op (defensive guard).
+	if err := m.Discard(ctx, nil); err != nil {
+		t.Errorf("Discard(nil) should be a no-op, got %v", err)
+	}
+}

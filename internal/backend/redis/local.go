@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 
 	goredis "github.com/redis/go-redis/v9"
 
@@ -226,17 +227,9 @@ func (b *LocalBackend) StorageBytes(ctx context.Context, token, providerResource
 			// MEMORY USAGE returns bytes used by the key including metadata.
 			mem, err := b.rdb.MemoryUsage(ctx, key).Result()
 			if err != nil {
-				// Key deleted between SCAN and MEMORY USAGE — a benign race.
-				// Redis returns a nil bulk reply for MEMORY USAGE on a missing
-				// key, which go-redis maps to goredis.Nil. Skip ONLY that case.
-				//
-				// The previous `|| strings.Contains(err.Error(), "ERR")` clause
-				// added zero legitimate race coverage (the race is goredis.Nil,
-				// never an "ERR"-prefixed string) and instead silently swallowed
-				// genuine server errors like "ERR max number of clients reached"
-				// / "ERR DENIED by ACL", under-counting quota and reporting the
-				// partial sum as authoritative (bug bash 2026-06-02 #24).
-				if err == goredis.Nil {
+				// goredis.Nil / "ERR" => the key was deleted between SCAN and
+				// MEMORY USAGE — a benign race, skip just that key.
+				if err == goredis.Nil || strings.Contains(err.Error(), "ERR") {
 					continue
 				}
 				// Any other error (conn drop, timeout, ctx-cancel) means the

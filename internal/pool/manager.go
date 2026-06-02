@@ -204,6 +204,30 @@ func (m *Manager) Claim(ctx context.Context, resourceType string) (*Item, error)
 	return &item, nil
 }
 
+// Discard marks a previously-Claimed item as 'failed' so it is never handed
+// out again, and triggers a refill to replace it. Callers invoke this when
+// they cannot safely use a claimed item (e.g. the connection-limit regrade
+// failed, or the item carries no pool token) and fall back to live
+// provisioning. Without it the row stays 'assigned' forever with no owning
+// resource row — a slow leak of pre-provisioned backing infra that no sweeper
+// can distinguish from a legitimately in-use item (bug bash 2026-06-02 #3).
+func (m *Manager) Discard(ctx context.Context, item *Item) error {
+	if item == nil {
+		return nil
+	}
+	if _, err := m.db.Exec(ctx, `
+		UPDATE pool_items
+		SET    status = 'failed', assigned_at = now()
+		WHERE  id = $1
+	`, item.ID); err != nil {
+		return fmt.Errorf("pool.Discard item %s: %w", item.ID, err)
+	}
+	slog.Warn("pool.Discard: claimed item marked failed (unusable, falling back to live)",
+		"pool_id", item.ID, "resource_type", item.ResourceType)
+	m.triggerRefill(item.ResourceType)
+	return nil
+}
+
 // Stats returns the count of ready items per resource type.
 func (m *Manager) Stats(ctx context.Context) (map[string]int, error) {
 	rows, err := m.db.Query(ctx, `

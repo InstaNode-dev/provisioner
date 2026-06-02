@@ -36,8 +36,10 @@ import (
 // --- fake pool claimer for exercising the s.pool != nil branches ---
 
 type fakePoolClaimer struct {
-	items map[string]*pool.Item // per resource_type
-	err   error                 // when set, Claim returns this error
+	items      map[string]*pool.Item // per resource_type
+	err        error                 // when set, Claim returns this error
+	discarded  []string              // ids passed to Discard
+	discardErr error                 // when set, Discard returns this error
 }
 
 func (f *fakePoolClaimer) Claim(_ context.Context, resourceType string) (*pool.Item, error) {
@@ -48,6 +50,13 @@ func (f *fakePoolClaimer) Claim(_ context.Context, resourceType string) (*pool.I
 		return nil, nil
 	}
 	return f.items[resourceType], nil
+}
+
+func (f *fakePoolClaimer) Discard(_ context.Context, item *pool.Item) error {
+	if item != nil {
+		f.discarded = append(f.discarded, item.ID)
+	}
+	return f.discardErr
 }
 
 // --- failing mocks (return error on every op) ---
@@ -1601,5 +1610,71 @@ func TestBufconn_EmptyToken_ReturnsInvalidArgument(t *testing.T) {
 	}
 	if st, ok := status.FromError(err); !ok || st.Code() != codes.InvalidArgument {
 		t.Fatalf("expected InvalidArgument, got %v", err)
+	}
+}
+
+// --- bug bash #3: Discard-error log branches in provisionPostgres ---
+// The happy-path Discard (no error) is covered by the RegradeFailure /
+// MissingToken fallback tests above; these two force Discard to return an
+// error so the slog.Warn("...failed to discard...") branch is exercised. Both
+// still fall through to live provisioning.
+
+func TestProvisionPostgres_PoolHit_RegradeFail_DiscardError(t *testing.T) {
+	pg := &mockPostgresBackend{
+		regrade: func(context.Context, string, string, int) (postgres.RegradeResult, error) {
+			return postgres.RegradeResult{}, errors.New("regrade failed")
+		},
+		provision: func(context.Context, string, string, int) (*postgres.Credentials, error) {
+			return &postgres.Credentials{URL: "postgres://live:p@host/db_live", DatabaseName: "db_live", Username: "usr_live"}, nil
+		},
+	}
+	srv := server.NewWithBackends(
+		&config.Config{},
+		pg, &mockRedisBackend{}, &mockMongoBackend{}, &mockQueueBackend{},
+		nil, nil, nil, nil, nil, nil,
+	)
+	fp := &fakePoolClaimer{
+		items: map[string]*pool.Item{"postgres": {
+			ID: "pool-id-rf", ConnectionURL: "postgres://pooled", PoolToken: "pool-x",
+			ProviderResourceID: "local:0", DatabaseName: "db_pooled", Username: "usr_pooled",
+		}},
+		discardErr: errors.New("discard failed"),
+	}
+	srv.SetPool(fp)
+	if _, err := srv.ProvisionResource(context.Background(), &provisionerv1.ProvisionRequest{
+		Token: "real-tok", Tier: "hobby", ResourceType: commonv1.ResourceType_RESOURCE_TYPE_POSTGRES,
+	}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(fp.discarded) != 1 || fp.discarded[0] != "pool-id-rf" {
+		t.Errorf("expected Discard(pool-id-rf) called once on regrade failure; got %v", fp.discarded)
+	}
+}
+
+func TestProvisionPostgres_PoolHit_MissingToken_DiscardError(t *testing.T) {
+	pg := &mockPostgresBackend{
+		provision: func(context.Context, string, string, int) (*postgres.Credentials, error) {
+			return &postgres.Credentials{URL: "postgres://live:p@host/db_live", DatabaseName: "db_live", Username: "usr_live"}, nil
+		},
+	}
+	srv := server.NewWithBackends(
+		&config.Config{},
+		pg, &mockRedisBackend{}, &mockMongoBackend{}, &mockQueueBackend{},
+		nil, nil, nil, nil, nil, nil,
+	)
+	fp := &fakePoolClaimer{
+		items: map[string]*pool.Item{"postgres": {
+			ID: "pool-id-mt", ConnectionURL: "postgres://pooled", PoolToken: "",
+		}},
+		discardErr: errors.New("discard failed"),
+	}
+	srv.SetPool(fp)
+	if _, err := srv.ProvisionResource(context.Background(), &provisionerv1.ProvisionRequest{
+		Token: "real-tok", Tier: "hobby", ResourceType: commonv1.ResourceType_RESOURCE_TYPE_POSTGRES,
+	}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(fp.discarded) != 1 || fp.discarded[0] != "pool-id-mt" {
+		t.Errorf("expected Discard(pool-id-mt) called once on missing PoolToken; got %v", fp.discarded)
 	}
 }

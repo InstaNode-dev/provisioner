@@ -61,6 +61,10 @@ func teamIDFromContext(ctx context.Context) string {
 // (*pool.Manager).Claim so the concrete type continues to satisfy it.
 type PoolClaimer interface {
 	Claim(ctx context.Context, resourceType string) (*pool.Item, error)
+	// Discard releases a claimed item the caller cannot safely use, marking it
+	// so it is never handed out again (and refilling). Without it a claimed-
+	// but-unusable item leaks as a stuck 'assigned' row (bug bash #3).
+	Discard(ctx context.Context, item *pool.Item) error
 }
 
 // Server implements ProvisionerServiceServer.
@@ -415,6 +419,12 @@ func (s *Server) provisionPostgres(ctx context.Context, req *provisionerv1.Provi
 					// which applies the cap at CREATE USER time.
 					slog.Warn("server.provisionPostgres: pool item connection-limit regrade failed (falling back to live)",
 						"pool_id", item.ID, "tier", req.Tier, "conn_limit", connLimit, "error", rerr)
+					// Release the consumed item so it isn't leaked as a stuck
+					// 'assigned' row with no owning resource (bug bash #3).
+					if derr := s.pool.Discard(ctx, item); derr != nil {
+						slog.Warn("server.provisionPostgres: failed to discard unusable pool item (manual reclaim needed)",
+							"pool_id", item.ID, "error", derr)
+					}
 				} else {
 					slog.Info("server.provisionPostgres: pool item connection limit applied",
 						"pool_id", item.ID, "tier", req.Tier,
@@ -438,6 +448,11 @@ func (s *Server) provisionPostgres(ctx context.Context, req *provisionerv1.Provi
 				// provision rather than hand out an uncapped role.
 				slog.Warn("server.provisionPostgres: pool item missing PoolToken — cannot apply connection limit, falling back to live",
 					"pool_id", item.ID, "username", item.Username)
+				// Release the consumed item so it isn't leaked (bug bash #3).
+				if derr := s.pool.Discard(ctx, item); derr != nil {
+					slog.Warn("server.provisionPostgres: failed to discard unusable pool item (manual reclaim needed)",
+						"pool_id", item.ID, "error", derr)
+				}
 			}
 		}
 	}

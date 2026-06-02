@@ -10,8 +10,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"os"
-	"strings"
 
 	goredis "github.com/redis/go-redis/v9"
 
@@ -149,14 +149,28 @@ func (b *LocalBackend) Provision(ctx context.Context, token, tier string) (*Cred
 		}, nil
 	}
 
-	// ACL failed (Redis < 6 or ACL disabled) — fall back to key-namespace isolation.
-	// Return the shared Redis URL. Client must prefix all keys with {token}: to
-	// stay in their namespace.
-	url := fmt.Sprintf("redis://%s/0", userHost)
-	return &Credentials{
-		URL:       url,
-		KeyPrefix: keyPrefix,
-	}, nil
+	// ACL SETUSER failed. The LocalBackend serves the SHARED, multi-tenant
+	// redis-provision pool whose default user is nopass/+@all — so the old
+	// credential-less "redis://host/0" fallback handed this tenant UNRESTRICTED
+	// access to every other tenant's keys (the KeyPrefix is advisory, NOT
+	// enforced). That is a cross-tenant isolation failure, so we now fail
+	// CLOSED on the shared backend (bug bash 2026-06-02 #19).
+	//
+	// The credential-less, key-namespace-only fallback is only acceptable on a
+	// genuinely single-tenant deployment (or Redis < 6 with no ACL support in
+	// dev). Such deployments opt in explicitly via
+	// REDIS_ALLOW_INSECURE_NO_ACL_FALLBACK=true; prod leaves it unset and gets
+	// a hard error instead of a silent isolation downgrade.
+	if os.Getenv("REDIS_ALLOW_INSECURE_NO_ACL_FALLBACK") == "true" {
+		slog.Warn("cache.provisionLocal: ACL SETUSER failed — returning INSECURE credential-less shared URL (REDIS_ALLOW_INSECURE_NO_ACL_FALLBACK=true; no enforced cross-tenant isolation)",
+			"error", aclCmd.Err())
+		url := fmt.Sprintf("redis://%s/0", userHost)
+		return &Credentials{
+			URL:       url,
+			KeyPrefix: keyPrefix,
+		}, nil
+	}
+	return nil, fmt.Errorf("cache.provisionLocal: ACL SETUSER failed on shared multi-tenant Redis — refusing to return a credential-less shared URL (set REDIS_ALLOW_INSECURE_NO_ACL_FALLBACK=true only for single-tenant/dev): %w", aclCmd.Err())
 }
 
 // publicHostPort returns the host:port to embed in user-facing Redis URLs.
@@ -212,9 +226,17 @@ func (b *LocalBackend) StorageBytes(ctx context.Context, token, providerResource
 			// MEMORY USAGE returns bytes used by the key including metadata.
 			mem, err := b.rdb.MemoryUsage(ctx, key).Result()
 			if err != nil {
-				// goredis.Nil / "ERR" => the key was deleted between SCAN and
-				// MEMORY USAGE — a benign race, skip just that key.
-				if err == goredis.Nil || strings.Contains(err.Error(), "ERR") {
+				// Key deleted between SCAN and MEMORY USAGE — a benign race.
+				// Redis returns a nil bulk reply for MEMORY USAGE on a missing
+				// key, which go-redis maps to goredis.Nil. Skip ONLY that case
+				// (bug bash 2026-06-02 #24 / security review HIGH): the old
+				// `|| strings.Contains(err.Error(), "ERR")` clause added no
+				// real race coverage and silently swallowed genuine server
+				// errors ("ERR max number of clients reached", "ERR DENIED by
+				// ACL"), under-counting quota and reporting a partial sum as
+				// authoritative. Every other error propagates so quota is never
+				// decided on partial data.
+				if err == goredis.Nil {
 					continue
 				}
 				// Any other error (conn drop, timeout, ctx-cancel) means the

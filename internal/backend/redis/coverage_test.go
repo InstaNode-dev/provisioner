@@ -1587,19 +1587,37 @@ func TestK8sBackend_StorageBytes_GetServiceError(t *testing.T) {
 // TestLocalBackend_Provision_ACLFails_FallsBackToNamespace forces the
 // ACL-fallback branch by pointing the LocalBackend at a closed port — Do(ACL
 // SETUSER) errors and Provision returns the namespace-only URL.
-func TestLocalBackend_Provision_ACLFails_FallsBackToNamespace(t *testing.T) {
-	b := &LocalBackend{
-		rdb: goredis.NewClient(&goredis.Options{
-			Addr:        "127.0.0.1:1",
-			DialTimeout: 200 * time.Millisecond,
-			MaxRetries:  -1,
-		}),
-		redisHost: "127.0.0.1:1",
+func TestLocalBackend_Provision_ACLFails_FailsClosedUnlessOptIn(t *testing.T) {
+	newBackend := func() *LocalBackend {
+		return &LocalBackend{
+			rdb: goredis.NewClient(&goredis.Options{
+				Addr:        "127.0.0.1:1",
+				DialTimeout: 200 * time.Millisecond,
+				MaxRetries:  -1,
+			}),
+			redisHost: "127.0.0.1:1",
+		}
 	}
-	defer b.rdb.Close()
-	creds, err := b.Provision(context.Background(), "abc1234deadbeef", "anonymous")
+
+	// Default (no opt-in): an ACL SETUSER failure on the shared multi-tenant
+	// backend MUST fail closed — never hand out a credential-less shared URL
+	// that grants cross-tenant access (bug bash 2026-06-02 #19).
+	t.Setenv("REDIS_ALLOW_INSECURE_NO_ACL_FALLBACK", "")
+	b := newBackend()
+	if _, err := b.Provision(context.Background(), "abc1234deadbeef", "anonymous"); err == nil {
+		b.rdb.Close()
+		t.Fatal("Provision must fail closed when ACL SETUSER fails on the shared backend; got nil error")
+	}
+	b.rdb.Close()
+
+	// Explicit single-tenant/dev opt-in: the credential-less namespace fallback
+	// is permitted and still returns a redis:// URL embedding redisHost.
+	t.Setenv("REDIS_ALLOW_INSECURE_NO_ACL_FALLBACK", "true")
+	b2 := newBackend()
+	defer b2.rdb.Close()
+	creds, err := b2.Provision(context.Background(), "abc1234deadbeef", "anonymous")
 	if err != nil {
-		t.Fatalf("Provision (fallback): %v", err)
+		t.Fatalf("Provision (opt-in fallback): %v", err)
 	}
 	if !strings.Contains(creds.URL, "redis://") {
 		t.Errorf("fallback URL should still start with redis://; got %s", creds.URL)

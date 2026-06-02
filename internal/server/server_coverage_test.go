@@ -36,8 +36,10 @@ import (
 // --- fake pool claimer for exercising the s.pool != nil branches ---
 
 type fakePoolClaimer struct {
-	items map[string]*pool.Item // per resource_type
-	err   error                 // when set, Claim returns this error
+	items      map[string]*pool.Item // per resource_type
+	err        error                 // when set, Claim returns this error
+	discarded  []string              // ids passed to Discard
+	discardErr error                 // when set, Discard returns this error
 }
 
 func (f *fakePoolClaimer) Claim(_ context.Context, resourceType string) (*pool.Item, error) {
@@ -48,6 +50,13 @@ func (f *fakePoolClaimer) Claim(_ context.Context, resourceType string) (*pool.I
 		return nil, nil
 	}
 	return f.items[resourceType], nil
+}
+
+func (f *fakePoolClaimer) Discard(_ context.Context, item *pool.Item) error {
+	if item != nil {
+		f.discarded = append(f.discarded, item.ID)
+	}
+	return f.discardErr
 }
 
 // --- failing mocks (return error on every op) ---

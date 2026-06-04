@@ -165,6 +165,9 @@ func (b *LocalBackend) Provision(ctx context.Context, token, tier string, connLi
 		connLimitClause = fmt.Sprintf(" CONNECTION LIMIT %d", connLimit)
 	}
 	if _, err := conn.Exec(ctx, fmt.Sprintf("CREATE USER %q WITH PASSWORD '%s'%s", username, pass, connLimitClause)); err != nil {
+		// The database was already created — roll it back so a transient
+		// CREATE USER failure does not strand db_<token> with no reaper.
+		cleanupProvisionPartial(conn, dbName, username)
 		return nil, fmt.Errorf("db.local.Provision: CREATE USER: %w", err)
 	}
 
@@ -177,6 +180,9 @@ func (b *LocalBackend) Provision(ctx context.Context, token, tier string, connLi
 
 	// GRANT ALL PRIVILEGES ON DATABASE to the new user.
 	if _, err := conn.Exec(ctx, fmt.Sprintf("GRANT ALL PRIVILEGES ON DATABASE %q TO %q", dbName, username)); err != nil {
+		// Both the database and the user exist at this point — drop both so a
+		// failed GRANT does not strand db_<token> + usr_<token>.
+		cleanupProvisionPartial(conn, dbName, username)
 		return nil, fmt.Errorf("db.local.Provision: GRANT DATABASE: %w", err)
 	}
 
@@ -228,6 +234,29 @@ func (b *LocalBackend) Provision(ctx context.Context, token, tier string, connLi
 		Username:           username,
 		ProviderResourceID: b.router.ProviderResourceID(clusterIdx),
 	}, nil
+}
+
+// cleanupProvisionPartial rolls back a partially-provisioned database/user when
+// a post-CREATE DDL step in Provision fails. Without it, a transient CREATE USER
+// or GRANT failure leaves an orphaned db_<token> (and possibly usr_<token>) on
+// the shared cluster with no reaper to claim it back — the provisioner returns
+// an error to the api, so the platform never records a resource row to drive a
+// later Deprovision.
+//
+// Best-effort: each DROP is logged and swallowed. WITH (FORCE) terminates any
+// straggler backend so DROP DATABASE does not fail with "is being accessed by
+// other users". A fresh short-lived context is used so the cleanup still runs
+// even if the incoming request context is on the verge of its deadline. Both
+// DROPs use IF EXISTS so partial states (db created, user not) are safe.
+func cleanupProvisionPartial(conn pgConn, dbName, username string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := conn.Exec(ctx, fmt.Sprintf("DROP DATABASE IF EXISTS %q WITH (FORCE)", dbName)); err != nil {
+		slog.Error("db.local.Provision: rollback DROP DATABASE (best-effort)", "db", dbName, "error", err)
+	}
+	if _, err := conn.Exec(ctx, fmt.Sprintf("DROP USER IF EXISTS %q", username)); err != nil {
+		slog.Error("db.local.Provision: rollback DROP USER (best-effort)", "user", username, "error", err)
+	}
 }
 
 // StorageBytes returns the size of db_{token} in bytes using pg_database_size.

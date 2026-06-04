@@ -262,9 +262,15 @@ func (p *DedicatedProvider) provisionLocal(ctx context.Context, token, tier stri
 		return nil, fmt.Errorf("db.dedicated.provisionLocal: CREATE DATABASE: %w", err)
 	}
 	if _, err := conn.Exec(ctx, fmt.Sprintf("CREATE USER %q WITH PASSWORD '%s'", username, pass)); err != nil {
+		// Roll back the just-created database so a transient CREATE USER failure
+		// does not strand dedicated_db_<token> with no reaper.
+		cleanupProvisionPartial(conn, dbName, username)
 		return nil, fmt.Errorf("db.dedicated.provisionLocal: CREATE USER: %w", err)
 	}
 	if _, err := conn.Exec(ctx, fmt.Sprintf("GRANT ALL PRIVILEGES ON DATABASE %q TO %q", dbName, username)); err != nil {
+		// Both database and user exist — drop both so a failed GRANT does not
+		// strand dedicated_db_<token> + dedicated_usr_<token>.
+		cleanupProvisionPartial(conn, dbName, username)
 		return nil, fmt.Errorf("db.dedicated.provisionLocal: GRANT DATABASE: %w", err)
 	}
 

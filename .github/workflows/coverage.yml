@@ -101,6 +101,29 @@ jobs:
           --health-timeout 5s
           --health-retries 10
 
+      # NATS with JetStream + HTTP monitor (:8222) for the server-layer queue
+      # round-trip (internal/server/server_live_roundtrip_mqs_test.go::
+      # TestServer_Queue_*). The queue LocalBackend health-checks
+      # http://$NATS_HOST:8222/healthz at provision time — without a real NATS
+      # the gRPC queue provision path is never integration-exercised.
+      nats:
+        image: nats:2
+        ports:
+          - 4222:4222
+          - 8222:8222
+        options: >-
+          --health-cmd "wget -q -O- http://127.0.0.1:8222/healthz || exit 1"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      # NOTE: MinIO is NOT a `services:` container — GitHub Actions service
+      # containers cannot supply the required `server /data` command (services
+      # accept image/env/ports/options only, not args). MinIO is started as a
+      # `docker run` step below (see "Start MinIO for storage round-trip"), which
+      # the server-layer storage test (TestServer_Storage_GetStorageBytes_*)
+      # reaches at 127.0.0.1:9100.
+
     # TEST_* env vars the pool/backend test helpers read via os.Getenv. The
     # exact names were grepped from the test files (os.Getenv("TEST_…") and the
     # liveXxx() helper fallbacks) — wrong names = silent skip = lost coverage.
@@ -120,7 +143,19 @@ jobs:
       # internal/backend/mongo/local_test.go::liveMongoURI
       CUSTOMER_MONGO_URL: mongodb://127.0.0.1:27017
       # internal/backend/mongo/coverage_extra_test.go auth-fail branches
+      # ALSO: internal/server/server_live_roundtrip_mqs_test.go::liveMongoAdminURI
+      # (the gRPC-layer mongo Provision/StorageBytes/Deprovision round-trip uses
+      # the authenticated instance — the realistic prod createUser path).
       CUSTOMER_MONGO_AUTH_URL: mongodb://root:rootpass@127.0.0.1:27018
+      # internal/server/server_live_roundtrip_mqs_test.go::liveNATSHost — the
+      # queue LocalBackend health-checks http://$NATS_HOST:8222/healthz.
+      TEST_NATS_HOST: 127.0.0.1
+      # internal/server/server_live_roundtrip_mqs_test.go::liveStorageEndpoint —
+      # the storage GetStorageBytes round-trip against the MinIO started below.
+      TEST_MINIO_ENDPOINT: 127.0.0.1:9100
+      TEST_MINIO_ROOT_USER: minioadmin
+      TEST_MINIO_ROOT_PASSWORD: minioadmin
+      TEST_MINIO_BUCKET: itest-bucket
 
     steps:
       - uses: actions/checkout@v6
@@ -146,6 +181,26 @@ jobs:
       # ≠ verified). A red test must fail the job; codecov upload below is
       # still soft-failed via fail_ci_if_error: false so a missing token
       # doesn't take CI down.
+      # MinIO can't run as a `services:` container (no way to pass `server /data`).
+      # Start it here so TestServer_Storage_GetStorageBytes_LiveRoundTrip has a
+      # real S3-compatible endpoint at 127.0.0.1:9100. Env (MINIO_ROOT_USER/
+      # PASSWORD) are static literals — no untrusted workflow input is interpolated.
+      - name: Start MinIO for storage round-trip
+        run: |
+          docker run -d --name itest-minio \
+            -p 9100:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:latest server /data
+          # Wait for MinIO to report healthy before the test run.
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:9100/minio/health/live >/dev/null 2>&1; then
+              echo "minio healthy after ${i} tries"; break
+            fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:9100/minio/health/live >/dev/null
+
       - name: Generate coverage
         working-directory: provisioner
         # No `-short`: the integration tests are gated on TEST_* env-var

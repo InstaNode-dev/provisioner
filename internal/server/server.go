@@ -268,6 +268,18 @@ func (s *Server) breakerForMongo(useDedicated bool) *circuit.Breaker {
 	return s.breakers.MongoAdmin
 }
 
+// breakerForQueue — the shared NATS backend issues account/JWT provisioning on
+// the shared cluster (`queue_admin`); the dedicated k8s backend issues
+// kube-apiserver calls (`k8s_api`), the same split as Mongo. Queue was the only
+// backend with no breaker (sweep #2): a wedged NATS / kube-apiserver call could
+// pile up with no fast-fail and no /readyz signal.
+func (s *Server) breakerForQueue(useDedicated bool) *circuit.Breaker {
+	if useDedicated {
+		return s.breakers.K8sAPI
+	}
+	return s.breakers.QueueAdmin
+}
+
 // callBackend wraps a backend invocation behind the given breaker. Returns
 // circuit.ErrOpen verbatim when the breaker is open so the caller can map
 // it to a gRPC Unavailable via mapError. The breaker's caller-deadline
@@ -584,7 +596,9 @@ func (s *Server) provisionQueue(ctx context.Context, req *provisionerv1.Provisio
 	// Pro and team tiers with a dedicated k8s backend get their own NATS pod.
 	if isDedicatedTier(req.Tier) && s.dedicatedQueueBackend != nil {
 		slog.Info("server.provisionQueue: using dedicated backend", "token", req.Token, "tier", req.Tier)
-		creds, err := s.dedicatedQueueBackend.Provision(ctx, req.Token, req.Tier)
+		creds, err := callBackend(s.breakerForQueue(true), func() (*queue.Credentials, error) {
+			return s.dedicatedQueueBackend.Provision(ctx, req.Token, req.Tier)
+		})
 		if err != nil {
 			return nil, mapError("ProvisionResource.queue.dedicated", err)
 		}
@@ -611,7 +625,9 @@ func (s *Server) provisionQueue(ctx context.Context, req *provisionerv1.Provisio
 	}
 
 	slog.Info("server.provisionQueue: pool miss, provisioning live", "token", req.Token)
-	creds, err := s.queueBackend.Provision(ctx, req.Token, req.Tier)
+	creds, err := callBackend(s.breakerForQueue(false), func() (*queue.Credentials, error) {
+		return s.queueBackend.Provision(ctx, req.Token, req.Tier)
+	})
 	if err != nil {
 		return nil, mapError("ProvisionResource.queue", err)
 	}
@@ -718,12 +734,16 @@ func (s *Server) DeprovisionResource(ctx context.Context, req *provisionerv1.Dep
 			!strings.HasPrefix(req.ProviderResourceId, "instant-customer-") {
 			slog.Info("server.DeprovisionResource: queue using dedicated backend",
 				"token", req.Token, "provider_resource_id", req.ProviderResourceId)
-			if err := s.dedicatedQueueBackend.Deprovision(ctx, req.Token, req.ProviderResourceId); err != nil {
+			if err := callBackendVoid(s.breakerForQueue(true), func() error {
+				return s.dedicatedQueueBackend.Deprovision(ctx, req.Token, req.ProviderResourceId)
+			}); err != nil {
 				return nil, mapError("DeprovisionResource.queue.dedicated", err)
 			}
 			return &provisionerv1.DeprovisionResponse{Deprovisioned: true}, nil
 		}
-		if err := s.queueBackend.Deprovision(ctx, req.Token, req.ProviderResourceId); err != nil {
+		if err := callBackendVoid(s.breakerForQueue(false), func() error {
+			return s.queueBackend.Deprovision(ctx, req.Token, req.ProviderResourceId)
+		}); err != nil {
 			return nil, mapError("DeprovisionResource.queue", err)
 		}
 		return &provisionerv1.DeprovisionResponse{Deprovisioned: true}, nil

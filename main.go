@@ -5,14 +5,14 @@
 // Observability — relocated 2026-05-12 from the api repo's reference scaffold
 // (track B2 of the observability rollout). What this file wires up:
 //
-//   1. slog default handler decorated with instant.dev/common/logctx so every
-//      log line carries service / commit_id / trace_id / tid / team_id.
-//   2. New Relic Go agent (fail-open: an unset NEW_RELIC_LICENSE_KEY logs a
-//      warning and returns nil; a nil app is safe to pass to nrgrpc).
-//   3. nrgrpc.UnaryServerInterceptor chained with a trace-id stamper so
-//      W3C-propagated trace IDs reach downstream slog calls in handlers.
-//   4. HTTP sidecar on :8092 exposing /healthz with build metadata JSON.
-//      Same shape as api and worker /healthz so a single jq filter works.
+//  1. slog default handler decorated with instant.dev/common/logctx so every
+//     log line carries service / commit_id / trace_id / tid / team_id.
+//  2. New Relic Go agent (fail-open: an unset NEW_RELIC_LICENSE_KEY logs a
+//     warning and returns nil; a nil app is safe to pass to nrgrpc).
+//  3. nrgrpc.UnaryServerInterceptor chained with a trace-id stamper so
+//     W3C-propagated trace IDs reach downstream slog calls in handlers.
+//  4. HTTP sidecar on :8092 exposing /healthz with build metadata JSON.
+//     Same shape as api and worker /healthz so a single jq filter works.
 package main
 
 import (
@@ -77,6 +77,7 @@ func collectBreakerInspectors(bs *circuit.Breakers) []handlers.CircuitInspector 
 		breakerAdapter{b: bs.PostgresK8s},
 		breakerAdapter{b: bs.RedisAdmin},
 		breakerAdapter{b: bs.MongoAdmin},
+		breakerAdapter{b: bs.QueueAdmin},
 		breakerAdapter{b: bs.K8sAPI},
 	}
 }

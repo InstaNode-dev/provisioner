@@ -21,6 +21,8 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 
+	commonv1 "instant.dev/proto/common/v1"
+	provisionerv1 "instant.dev/proto/provisioner/v1"
 	"instant.dev/provisioner/internal/backend/mongo"
 	"instant.dev/provisioner/internal/backend/postgres"
 	"instant.dev/provisioner/internal/backend/queue"
@@ -29,8 +31,6 @@ import (
 	"instant.dev/provisioner/internal/config"
 	"instant.dev/provisioner/internal/pool"
 	"instant.dev/provisioner/internal/server"
-	commonv1 "instant.dev/proto/common/v1"
-	provisionerv1 "instant.dev/proto/provisioner/v1"
 )
 
 // --- fake pool claimer for exercising the s.pool != nil branches ---
@@ -340,6 +340,58 @@ func TestProvisionResource_Queue_DedicatedFailure_ReturnsError(t *testing.T) {
 		ResourceType: commonv1.ResourceType_RESOURCE_TYPE_QUEUE,
 	})
 	assertCode(t, err, codes.InvalidArgument)
+}
+
+// countingFailQueueBackend records its call count so a breaker short-circuit
+// (the tripped breaker must NOT invoke the backend) can be asserted. The error
+// is non-retryable so mapError classifies it Internal — distinguishable from
+// the Unavailable an open breaker returns.
+type countingFailQueueBackend struct{ calls int }
+
+func (b *countingFailQueueBackend) Provision(context.Context, string, string) (*queue.Credentials, error) {
+	b.calls++
+	return nil, errors.New("permission denied: nsc account create")
+}
+
+func (b *countingFailQueueBackend) Deprovision(context.Context, string, string) error {
+	b.calls++
+	return errors.New("permission denied: nsc account delete")
+}
+
+// TestServer_QueueCircuitTripsOnRepeatedFailures — sweep #2: queue/NATS was the
+// only backend with no circuit breaker. After the default threshold of shared
+// queue failures the QueueAdmin breaker must open and the next Provision must
+// short-circuit to Unavailable WITHOUT invoking the backend.
+func TestServer_QueueCircuitTripsOnRepeatedFailures(t *testing.T) {
+	qb := &countingFailQueueBackend{}
+	srv := server.NewWithBackends(
+		&config.Config{},
+		&mockPostgresBackend{}, &mockRedisBackend{}, &mockMongoBackend{}, qb,
+		nil, nil, nil, nil, nil, nil,
+	)
+	srv.SetBreakers(freshBreakers())
+
+	for i := 0; i < 5; i++ {
+		_, err := srv.ProvisionResource(context.Background(), &provisionerv1.ProvisionRequest{
+			Token: "tok", Tier: "hobby", ResourceType: commonv1.ResourceType_RESOURCE_TYPE_QUEUE,
+		})
+		if err == nil {
+			t.Fatalf("attempt %d: expected queue backend error, got nil", i+1)
+		}
+	}
+	if qb.calls != 5 {
+		t.Fatalf("queue backend should have been called 5 times before tripping, got %d", qb.calls)
+	}
+
+	// 6th call: the QueueAdmin breaker is open → short-circuit to Unavailable
+	// without touching the backend.
+	_, err := srv.ProvisionResource(context.Background(), &provisionerv1.ProvisionRequest{
+		Token: "tok", Tier: "hobby", ResourceType: commonv1.ResourceType_RESOURCE_TYPE_QUEUE,
+	})
+	assertCode(t, err, codes.Unavailable)
+	if qb.calls != 5 {
+		t.Fatalf("open QueueAdmin breaker should have short-circuited; backend called %d times (expected 5)", qb.calls)
+	}
 }
 
 // Dedicated provision error → mapError'd.

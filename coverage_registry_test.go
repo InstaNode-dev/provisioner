@@ -37,31 +37,32 @@ import (
 // collectBreakerInspectors fails this test.
 //
 // COVERAGE BLOCK (rule 17):
-//   Symptom:       a new circuit-protected backend is added to
-//                  *circuit.Breakers (new field, e.g. NATSAdmin) but
-//                  collectBreakerInspectors in main.go is not
-//                  extended. The new backend's circuit state never
-//                  surfaces on /readyz. A future tripped breaker
-//                  doesn't show up as a degraded check, the NR alert
-//                  filter (which keys on `circuit.opened` log lines)
-//                  fires but operators have no /readyz signal to
-//                  cross-reference.
-//   Enumeration:   reflect over the *circuit.Breakers struct fields
-//                  whose type is *circuit.Breaker. This IS the
-//                  registry.
-//   Sites found:   N fields on Breakers (currently 5: PostgresAdmin,
-//                  PostgresK8s, RedisAdmin, MongoAdmin, K8sAPI).
-//   Sites touched: each must be findable in the inspector slice
-//                  collectBreakerInspectors returns. The match is
-//                  by .Name() — every breaker carries the backend
-//                  name as its identity.
-//   Coverage test: missing-from-inspectors and missing-from-struct
-//                  both fail.
-//   Live verified: provisioner /readyz output today shows
-//                  backend_postgres_admin / backend_postgres_k8s /
-//                  backend_redis_admin / backend_mongo_admin /
-//                  backend_k8s_api — five degraded checks. This test
-//                  pins that count to whatever the struct says.
+//
+//	Symptom:       a new circuit-protected backend is added to
+//	               *circuit.Breakers (new field, e.g. NATSAdmin) but
+//	               collectBreakerInspectors in main.go is not
+//	               extended. The new backend's circuit state never
+//	               surfaces on /readyz. A future tripped breaker
+//	               doesn't show up as a degraded check, the NR alert
+//	               filter (which keys on `circuit.opened` log lines)
+//	               fires but operators have no /readyz signal to
+//	               cross-reference.
+//	Enumeration:   reflect over the *circuit.Breakers struct fields
+//	               whose type is *circuit.Breaker. This IS the
+//	               registry.
+//	Sites found:   N fields on Breakers (currently 5: PostgresAdmin,
+//	               PostgresK8s, RedisAdmin, MongoAdmin, K8sAPI).
+//	Sites touched: each must be findable in the inspector slice
+//	               collectBreakerInspectors returns. The match is
+//	               by .Name() — every breaker carries the backend
+//	               name as its identity.
+//	Coverage test: missing-from-inspectors and missing-from-struct
+//	               both fail.
+//	Live verified: provisioner /readyz output today shows
+//	               backend_postgres_admin / backend_postgres_k8s /
+//	               backend_redis_admin / backend_mongo_admin /
+//	               backend_k8s_api — five degraded checks. This test
+//	               pins that count to whatever the struct says.
 func TestBreakers_EveryStructFieldHasAnInspector(t *testing.T) {
 	bs := circuit.NewBreakers()
 	got := collectBreakerInspectors(bs)
@@ -90,6 +91,7 @@ func TestBreakers_EveryStructFieldHasAnInspector(t *testing.T) {
 		"PostgresAdmin": circuit.BackendPostgresAdmin,
 		"RedisAdmin":    circuit.BackendRedisAdmin,
 		"MongoAdmin":    circuit.BackendMongoAdmin,
+		"QueueAdmin":    circuit.BackendQueueAdmin,
 		"K8sAPI":        circuit.BackendK8sAPI,
 	}
 

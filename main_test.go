@@ -431,6 +431,7 @@ func TestCollectBreakerInspectors_AllBackendsSurfaced(t *testing.T) {
 		"postgres_k8s":   false,
 		"redis_admin":    false,
 		"mongo_admin":    false,
+		"queue_admin":    false,
 		"k8s_api":        false,
 	}
 	for _, ins := range got {

@@ -15,6 +15,7 @@ const (
 	BackendPostgresAdmin = "postgres_admin" // shared postgres-customers CREATE DATABASE / CREATE USER (local.go)
 	BackendRedisAdmin    = "redis_admin"    // shared redis-provision ACL SETUSER / namespace ops
 	BackendMongoAdmin    = "mongo_admin"    // shared mongo admin CREATE USER / role grants
+	BackendQueueAdmin    = "queue_admin"    // shared NATS account/JWT provisioning + deprovision
 	BackendK8sAPI        = "k8s_api"        // raw kube-apiserver client calls (kubectl-equivalent)
 )
 
@@ -40,6 +41,7 @@ type Breakers struct {
 	PostgresAdmin *Breaker
 	RedisAdmin    *Breaker
 	MongoAdmin    *Breaker
+	QueueAdmin    *Breaker
 	K8sAPI        *Breaker
 }
 
@@ -56,6 +58,7 @@ func NewBreakers() *Breakers {
 		PostgresAdmin: newDefault(BackendPostgresAdmin),
 		RedisAdmin:    newDefault(BackendRedisAdmin),
 		MongoAdmin:    newDefault(BackendMongoAdmin),
+		QueueAdmin:    newDefault(BackendQueueAdmin),
 		K8sAPI:        newDefault(BackendK8sAPI),
 	}
 }

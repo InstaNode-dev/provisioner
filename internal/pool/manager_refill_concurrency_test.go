@@ -71,9 +71,45 @@ func (c *concurrencyTracker) Peak() int {
 
 // --- mock backends: sleep + record concurrency, no real infra ---
 
+// deprovTracker records Deprovision calls the reaper makes against the mock
+// backends: the (token, providerResourceID) pairs, and an optional injected
+// error to drive the reaper's failure branch. Safe for concurrent use; nil-safe
+// so the F1 concurrency tests that don't set one keep working unchanged.
+type deprovTracker struct {
+	mu    sync.Mutex
+	calls []deprovCall
+	err   error // when non-nil, every Deprovision returns it
+}
+
+type deprovCall struct {
+	resourceType       string
+	token              string
+	providerResourceID string
+}
+
+func (d *deprovTracker) record(resourceType, token, prid string) error {
+	if d == nil {
+		return nil
+	}
+	d.mu.Lock()
+	d.calls = append(d.calls, deprovCall{resourceType, token, prid})
+	err := d.err
+	d.mu.Unlock()
+	return err
+}
+
+func (d *deprovTracker) snapshot() []deprovCall {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	out := make([]deprovCall, len(d.calls))
+	copy(out, d.calls)
+	return out
+}
+
 type mockPostgresBackend struct {
-	tr    *concurrencyTracker
-	calls atomic.Int32
+	tr     *concurrencyTracker
+	calls  atomic.Int32
+	deprov *deprovTracker
 }
 
 func (b *mockPostgresBackend) Provision(ctx context.Context, token, tier string, connLimit int) (*postgres.Credentials, error) {
@@ -90,12 +126,17 @@ func (b *mockPostgresBackend) Provision(ctx context.Context, token, tier string,
 func (b *mockPostgresBackend) StorageBytes(context.Context, string, string) (int64, error) {
 	return 0, nil
 }
-func (b *mockPostgresBackend) Deprovision(context.Context, string, string) error { return nil }
+func (b *mockPostgresBackend) Deprovision(_ context.Context, token, prid string) error {
+	return b.deprov.record("postgres", token, prid)
+}
 func (b *mockPostgresBackend) Regrade(context.Context, string, string, int) (postgres.RegradeResult, error) {
 	return postgres.RegradeResult{}, nil
 }
 
-type mockRedisBackend struct{ tr *concurrencyTracker }
+type mockRedisBackend struct {
+	tr     *concurrencyTracker
+	deprov *deprovTracker
+}
 
 func (b *mockRedisBackend) Provision(ctx context.Context, token, tier string) (*redis.Credentials, error) {
 	b.tr.enter()
@@ -110,9 +151,14 @@ func (b *mockRedisBackend) Provision(ctx context.Context, token, tier string) (*
 func (b *mockRedisBackend) StorageBytes(context.Context, string, string) (int64, error) {
 	return 0, nil
 }
-func (b *mockRedisBackend) Deprovision(context.Context, string, string) error { return nil }
+func (b *mockRedisBackend) Deprovision(_ context.Context, token, prid string) error {
+	return b.deprov.record("redis", token, prid)
+}
 
-type mockMongoBackend struct{ tr *concurrencyTracker }
+type mockMongoBackend struct {
+	tr     *concurrencyTracker
+	deprov *deprovTracker
+}
 
 func (b *mockMongoBackend) Provision(ctx context.Context, token, tier string) (*mongo.Credentials, error) {
 	b.tr.enter()
@@ -127,9 +173,14 @@ func (b *mockMongoBackend) Provision(ctx context.Context, token, tier string) (*
 func (b *mockMongoBackend) StorageBytes(context.Context, string, string) (int64, error) {
 	return 0, nil
 }
-func (b *mockMongoBackend) Deprovision(context.Context, string, string) error { return nil }
+func (b *mockMongoBackend) Deprovision(_ context.Context, token, prid string) error {
+	return b.deprov.record("mongodb", token, prid)
+}
 
-type mockQueueBackend struct{ tr *concurrencyTracker }
+type mockQueueBackend struct {
+	tr     *concurrencyTracker
+	deprov *deprovTracker
+}
 
 func (b *mockQueueBackend) Provision(ctx context.Context, token, tier string) (*queue.Credentials, error) {
 	b.tr.enter()
@@ -141,7 +192,9 @@ func (b *mockQueueBackend) Provision(ctx context.Context, token, tier string) (*
 	}
 	return &queue.Credentials{URL: "nats://h:4222", SubjectPrefix: token + "."}, nil
 }
-func (b *mockQueueBackend) Deprovision(context.Context, string, string) error { return nil }
+func (b *mockQueueBackend) Deprovision(_ context.Context, token, prid string) error {
+	return b.deprov.record("queue", token, prid)
+}
 
 // newConcurrencyTestManager builds a Manager wired to sleeping mock backends.
 // It has no *pgxpool.Pool — the tests only call provisionOneItemBackend, which

@@ -17,12 +17,13 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"instant.dev/common/crypto"
 	"instant.dev/provisioner/internal/backend/mongo"
-	"instant.dev/provisioner/internal/backend/queue"
 	"instant.dev/provisioner/internal/backend/postgres"
+	"instant.dev/provisioner/internal/backend/queue"
 	"instant.dev/provisioner/internal/backend/redis"
 )
 
@@ -73,9 +74,21 @@ type Config struct {
 // connection ceiling.
 const maxRefillConcurrency = 8
 
+// pgxDB is the narrow slice of *pgxpool.Pool the Manager actually uses
+// (Query / QueryRow / Exec). Declaring it as an interface lets a test inject a
+// fake that drives the post-Query error arms — a Scan failure, a Rows.Err
+// failure, a DELETE Exec failure — which a real Postgres connection never
+// surfaces deterministically. *pgxpool.Pool satisfies this interface as-is, so
+// production wiring (main.go) is unchanged; New still takes a *pgxpool.Pool.
+type pgxDB interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
 // Manager maintains a pool of pre-provisioned resources.
 type Manager struct {
-	db        *pgxpool.Pool
+	db        pgxDB
 	aesKey    []byte
 	postgresB postgres.Backend
 	redisB    redis.Backend
@@ -103,6 +116,31 @@ type Manager struct {
 
 // defaultTickInterval is the maintenance loop's periodic health-check period.
 const defaultTickInterval = 30 * time.Second
+
+// Reaper grace windows (sweep #8).
+//
+// failedReapGrace is how long a 'failed' pool_item (one Discard marked
+// unusable) must sit before the reaper deprovisions its backing infra and
+// deletes the row. Discard sets assigned_at = now() at the moment it marks the
+// item failed, so the grace measures time-since-discard. It is short because a
+// 'failed' row has, by construction, no owning resources row — Discard is only
+// called on the provisioner-side claim path BEFORE the item is ever returned
+// to api, so nothing else can be mid-bind on it. The grace exists only to
+// avoid racing a Discard that is still committing in a sibling request.
+//
+// stuckAssignedGrace is the age past which an 'assigned' row is reported on the
+// instant_pool_stuck_assigned gauge. It is deliberately NOT a deprovision
+// trigger: see reapStale and metrics.go for why the provisioner cannot safely
+// deprovision an old 'assigned' item.
+const (
+	failedReapGrace    = 10 * time.Minute
+	stuckAssignedGrace = 30 * time.Minute
+)
+
+// reapBatchLimit bounds how many failed rows one reap pass deprovisions, so a
+// large backlog cannot monopolise the maintenance goroutine (and the bounded
+// pgxpool) on a single tick. The remainder is picked up on the next tick.
+const reapBatchLimit = 50
 
 // New creates a Manager. Call Start to begin background maintenance.
 func New(db *pgxpool.Pool, aesKey []byte, cfg Config,
@@ -228,6 +266,170 @@ func (m *Manager) Discard(ctx context.Context, item *Item) error {
 	return nil
 }
 
+// reapStale is the hot-pool reaper (sweep #8). On each maintenance tick it:
+//
+//  1. Deprovisions + deletes 'failed' pool_items older than failedReapGrace.
+//     A 'failed' row is one Discard marked unusable on the provisioner-side
+//     claim path BEFORE the item was ever returned to api, so its backing
+//     infra (db_pool-<uuid> / usr_pool-<uuid> / keyspace pool-<uuid>:*) is
+//     owned by NO resources row and would otherwise leak forever — the
+//     worker's resource-TTL reaper never sees it. Deprovision is idempotent
+//     (DROP ... IF EXISTS), so reaping an item whose infra is already gone is
+//     a safe no-op.
+//
+//  2. Reports — but does NOT deprovision — 'assigned' pool_items older than
+//     stuckAssignedGrace on the instant_pool_stuck_assigned gauge. From the
+//     provisioner's own DB an orphaned (crashed-claim) 'assigned' row is
+//     indistinguishable from one a live api request successfully bound to a
+//     resources row: there is no write-back when the bind succeeds. The
+//     backing infra of a BOUND item is owned by that resources row and reaped
+//     by the worker's resource-TTL path; deprovisioning it here would destroy
+//     live customer infra (the truehomie-db DROP incident class). A safe
+//     orphan-'assigned' reaper needs an anti-join against the resources table,
+//     which lives in a different database than pool_items — so it cannot be
+//     done from the provisioner. The gauge gives the operator the signal; the
+//     fix is tracked in the PR description.
+//
+// reapStale never returns an error — it is best-effort background maintenance
+// and logs+counts every failure so a wedged reaper is observable rather than
+// fatal.
+func (m *Manager) reapStale(ctx context.Context) {
+	m.reapFailed(ctx)
+	m.reportStuckAssigned(ctx)
+}
+
+// reapFailed deprovisions the backing infra for, and deletes, 'failed'
+// pool_items older than failedReapGrace. Bounded to reapBatchLimit rows per
+// pass. Each row is deprovisioned through the resource-type's backend using
+// its pool_token as the naming token (the stored provider_resource_id carries
+// no pooltok marker, so NamingToken falls back to the token we pass — which is
+// exactly the pool_token the infra was named from). A Deprovision failure
+// leaves the row in place so the next tick retries; only a clean Deprovision
+// deletes the row, so infra is never orphaned by deleting its tracking row
+// first.
+func (m *Manager) reapFailed(ctx context.Context) {
+	rows, err := m.db.Query(ctx, `
+		SELECT id, resource_type, provider_resource_id, pool_token
+		FROM   pool_items
+		WHERE  status = 'failed'
+		AND    assigned_at IS NOT NULL
+		AND    assigned_at < now() - $1::interval
+		ORDER  BY assigned_at ASC
+		LIMIT  $2
+	`, failedReapGrace.String(), reapBatchLimit)
+	if err != nil {
+		slog.Error("pool.reapFailed: query", "error", err)
+		return
+	}
+
+	type stale struct {
+		id, resourceType, providerResourceID, poolToken string
+	}
+	var batch []stale
+	for rows.Next() {
+		var s stale
+		if err := rows.Scan(&s.id, &s.resourceType, &s.providerResourceID, &s.poolToken); err != nil {
+			slog.Error("pool.reapFailed: scan", "error", err)
+			rows.Close()
+			return
+		}
+		batch = append(batch, s)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		slog.Error("pool.reapFailed: rows", "error", err)
+		return
+	}
+
+	for _, s := range batch {
+		if err := m.deprovisionBacking(ctx, s.resourceType, s.poolToken, s.providerResourceID); err != nil {
+			slog.Warn("pool.reapFailed: deprovision failed (leaving row for retry)",
+				"pool_id", s.id, "resource_type", s.resourceType, "error", err)
+			poolReapTotal.WithLabelValues(s.resourceType, "failed", "deprovision_err").Inc()
+			continue
+		}
+		if _, err := m.db.Exec(ctx, `DELETE FROM pool_items WHERE id = $1`, s.id); err != nil {
+			slog.Error("pool.reapFailed: delete row after deprovision (infra freed, row orphaned until next tick)",
+				"pool_id", s.id, "error", err)
+			poolReapTotal.WithLabelValues(s.resourceType, "failed", "delete_err").Inc()
+			continue
+		}
+		slog.Info("pool.reapFailed: reaped leaked failed item",
+			"pool_id", s.id, "resource_type", s.resourceType, "pool_token", s.poolToken)
+		poolReapTotal.WithLabelValues(s.resourceType, "failed", "reaped").Inc()
+	}
+}
+
+// reportStuckAssigned refreshes the instant_pool_stuck_assigned gauge with the
+// per-type count of 'assigned' rows older than stuckAssignedGrace. It does NOT
+// deprovision — see reapStale's doc for why the provisioner cannot safely reap
+// 'assigned' items. The gauge is reset for every configured resource type each
+// pass so a type that drops back to zero stuck rows reports zero (a Set-only
+// gauge would otherwise hold a stale high-water mark).
+func (m *Manager) reportStuckAssigned(ctx context.Context) {
+	counts := make(map[string]int, len(m.targets))
+	for rt := range m.targets {
+		counts[rt] = 0
+	}
+
+	rows, err := m.db.Query(ctx, `
+		SELECT resource_type, count(*)
+		FROM   pool_items
+		WHERE  status = 'assigned'
+		AND    assigned_at IS NOT NULL
+		AND    assigned_at < now() - $1::interval
+		GROUP  BY resource_type
+	`, stuckAssignedGrace.String())
+	if err != nil {
+		slog.Error("pool.reportStuckAssigned: query", "error", err)
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var rt string
+		var n int
+		if err := rows.Scan(&rt, &n); err != nil {
+			slog.Error("pool.reportStuckAssigned: scan", "error", err)
+			return
+		}
+		counts[rt] = n
+	}
+	if err := rows.Err(); err != nil {
+		slog.Error("pool.reportStuckAssigned: rows", "error", err)
+		return
+	}
+
+	for rt, n := range counts {
+		poolStuckAssignedGauge.WithLabelValues(rt).Set(float64(n))
+		if n > 0 {
+			slog.Warn("pool.reportStuckAssigned: items stuck in 'assigned' past grace (operator signal — not auto-reaped)",
+				"resource_type", rt, "count", n, "grace", stuckAssignedGrace.String())
+		}
+	}
+}
+
+// deprovisionBacking destroys the backing infra for one pool item via the
+// resource-type's backend. token is the pool_token (the canonical naming token
+// the infra was provisioned under); providerResourceID is the row's stored
+// value (e.g. "local:0" for shared Postgres, "" for shared Redis/Mongo). The
+// backends derive the real db_/usr_/keyspace names from the naming token, so
+// passing the pool_token here targets exactly the infra the pool created.
+func (m *Manager) deprovisionBacking(ctx context.Context, resourceType, token, providerResourceID string) error {
+	switch resourceType {
+	case "postgres":
+		return m.postgresB.Deprovision(ctx, token, providerResourceID)
+	case "redis":
+		return m.redisB.Deprovision(ctx, token, providerResourceID)
+	case "mongodb":
+		return m.mongoB.Deprovision(ctx, token, providerResourceID)
+	case "queue":
+		return m.queueB.Deprovision(ctx, token, providerResourceID)
+	default:
+		return fmt.Errorf("pool.deprovisionBacking: unknown resource type: %s", resourceType)
+	}
+}
+
 // Stats returns the count of ready items per resource type.
 func (m *Manager) Stats(ctx context.Context) (map[string]int, error) {
 	rows, err := m.db.Query(ctx, `
@@ -283,6 +485,10 @@ func (m *Manager) run(ctx context.Context) {
 			for rt := range m.targets {
 				m.fillPool(ctx, rt)
 			}
+			// Reap leaked 'failed' items + surface stuck 'assigned' ones
+			// (sweep #8). Runs on the same cadence as the top-up so a leak is
+			// cleaned within one tick interval of crossing its grace.
+			m.reapStale(ctx)
 		}
 	}
 }

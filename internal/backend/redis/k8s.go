@@ -67,11 +67,11 @@ type PodExecor interface {
 }
 
 const (
-	redisK8sNsPrefix     = "instant-customer-"
-	redisK8sRoleLabel    = "instant.dev/role"
-	redisK8sRoleValue    = "customer-resource"
-	redisK8sReadyTO      = 3 * time.Minute
-	redisK8sReadyPoll    = 3 * time.Second
+	redisK8sNsPrefix  = "instant-customer-"
+	redisK8sRoleLabel = "instant.dev/role"
+	redisK8sRoleValue = "customer-resource"
+	redisK8sReadyTO   = 3 * time.Minute
+	redisK8sReadyPoll = 3 * time.Second
 
 	// redisMaxmemoryPolicyCapped is the maxmemory-policy for capped (non-unlimited)
 	// dedicated Redis tiers. "noeviction" makes writes fail loudly with an OOM
@@ -243,13 +243,13 @@ func sizingForTier(tier string) tierSizing {
 
 // K8sBackend provisions a dedicated Redis pod per token.
 type K8sBackend struct {
-	cs            kubernetes.Interface  // kubernetes.Interface allows fake.Clientset in tests
-	restCfg       *rest.Config          // stored for pod-exec transport construction
-	storageClass  string       // K8S_STORAGE_CLASS
-	image         string       // K8S_REDIS_IMAGE
-	externalHost  string       // K8S_EXTERNAL_HOST (legacy NodePort host; kept for back-compat)
-	publicHost    string       // K8S_REDIS_PUBLIC_HOST (e.g. redis.instanode.dev) — preferred URL host when set
-	storageSizeGi int          // K8S_REDIS_STORAGE_GI (legacy ceiling; tier sizing overrides per-resource)
+	cs            kubernetes.Interface // kubernetes.Interface allows fake.Clientset in tests
+	restCfg       *rest.Config         // stored for pod-exec transport construction
+	storageClass  string               // K8S_STORAGE_CLASS
+	image         string               // K8S_REDIS_IMAGE
+	externalHost  string               // K8S_EXTERNAL_HOST (legacy NodePort host; kept for back-compat)
+	publicHost    string               // K8S_REDIS_PUBLIC_HOST (e.g. redis.instanode.dev) — preferred URL host when set
+	storageSizeGi int                  // K8S_REDIS_STORAGE_GI (legacy ceiling; tier sizing overrides per-resource)
 
 	// execor is the pod-exec transport used by the Regrade legacy fallback path.
 	// nil at construction; replaced by spdyPodExecor in production and by a
@@ -572,13 +572,18 @@ func (b *K8sBackend) Deprovision(ctx context.Context, token, providerResourceID 
 		}
 	}
 
-	if err := b.cs.CoreV1().Namespaces().Delete(ctx, ns, metav1.DeleteOptions{}); err != nil {
-		if !k8serrors.IsNotFound(err) {
-			return fmt.Errorf("k8s redis.Deprovision: delete namespace %s: %w", ns, err)
+	// Delete BOTH route-registry keys regardless of the namespace-Delete
+	// outcome. The keys were captured above (password from the Secret, token
+	// from the request) BEFORE any early return, so a Secret-read failure or a
+	// namespace Delete error can no longer strand the password-route key. For a
+	// paid/permanent resource that key carries no TTL (persistRouteKey), so
+	// leaking it leaves the proxy routing a dead password forever — worse than
+	// a leaked namespace, which the orphan sweep eventually reaps. routeKeys is
+	// idempotent: deleting an already-absent key is a no-op.
+	routeKeys := func() {
+		if b.rdb == nil {
+			return
 		}
-		slog.Info("k8s.redis.deprovision.namespace_already_gone", "namespace", ns)
-	}
-	if b.rdb != nil {
 		delCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 		if err := b.rdb.Del(delCtx, b.routePrefix+token).Err(); err != nil {
@@ -590,6 +595,18 @@ func (b *K8sBackend) Deprovision(ctx context.Context, token, providerResourceID 
 			}
 		}
 	}
+
+	if err := b.cs.CoreV1().Namespaces().Delete(ctx, ns, metav1.DeleteOptions{}); err != nil {
+		if !k8serrors.IsNotFound(err) {
+			// Namespace Delete failed (apiserver error, RBAC, transient). Still
+			// clean up the route keys best-effort so the proxy stops routing a
+			// dead password before we surface the error for the caller to retry.
+			routeKeys()
+			return fmt.Errorf("k8s redis.Deprovision: delete namespace %s: %w", ns, err)
+		}
+		slog.Info("k8s.redis.deprovision.namespace_already_gone", "namespace", ns)
+	}
+	routeKeys()
 	slog.Info("k8s.redis.deprovisioned", "namespace", ns)
 	return nil
 }

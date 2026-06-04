@@ -48,3 +48,19 @@ Everything else in the gRPC handler layer — every `ProvisionResource`,
 redis, mongo, queue, and storage — IS driven by a real-backend round-trip
 (`server_live_roundtrip_test.go` + `server_live_roundtrip_mqs_test.go`) and sits
 at 100% function coverage.
+
+## Drift guard — the RPC-iterating done-bar test (rule 18)
+
+`internal/server/server_rpc_coverage_guard_test.go`
+(`TestGRPCSurface_EveryRPCHasRoundTripTest`) iterates the proto-generated
+`ProvisionerService_ServiceDesc.Methods` (the single source of truth for which
+RPCs exist) and FAILS CI if any RPC lacks a maintained, existing round-trip test
+— catching the silent-untested-RPC class the day a new RPC is added to
+`proto/provisioner/v1/provisioner.proto`. It is a pure descriptor + source-scan
+test (no backends, no env) so it runs unconditionally in the `go test -short`
+deploy gate, never skips, and reds on: an unmapped new RPC, a mapping pointing at
+a deleted/renamed test, or a stale mapping for a removed RPC.
+
+To intentionally exempt an RPC from round-trip coverage, add it to the
+`exemptedRPCs` set in that test AND add a justification row to this file. There
+are **no exemptions today** — every RPC has a real round-trip.

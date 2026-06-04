@@ -161,7 +161,6 @@ func TestDeprovision_RouteKeyCleanup_DelError(t *testing.T) {
 // up via the post-switch routeKeys() call.
 func TestDeprovision_AlreadyGone_StillDeletesRouteKeys(t *testing.T) {
 	const token = "tok-already-gone"
-	const password = "p4ssw0rd-gone"
 	ns := redisK8sNsPrefix + token
 
 	// No namespace object and no secret → Delete returns NotFound; password

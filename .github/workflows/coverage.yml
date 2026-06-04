@@ -101,21 +101,14 @@ jobs:
           --health-timeout 5s
           --health-retries 10
 
-      # NATS with JetStream + HTTP monitor (:8222) for the server-layer queue
+      # NATS (JetStream + HTTP monitor :8222) for the server-layer queue
       # round-trip (internal/server/server_live_roundtrip_mqs_test.go::
-      # TestServer_Queue_*). The queue LocalBackend health-checks
-      # http://$NATS_HOST:8222/healthz at provision time — without a real NATS
-      # the gRPC queue provision path is never integration-exercised.
-      nats:
-        image: nats:2
-        ports:
-          - 4222:4222
-          - 8222:8222
-        options: >-
-          --health-cmd "wget -q -O- http://127.0.0.1:8222/healthz || exit 1"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
+      # TestServer_Queue_*) is started as a `docker run` step below (see
+      # "Start NATS for queue round-trip"), NOT a `services:` container: the
+      # minimal nats:2 image has no wget/curl/nc, so a service-container
+      # `--health-cmd` can NEVER pass — GitHub Actions then marks the container
+      # unhealthy and aborts the whole job even though the server logged
+      # "Server is ready". docker-run + a runner-side curl wait avoids that.
 
       # NOTE: MinIO is NOT a `services:` container — GitHub Actions service
       # containers cannot supply the required `server /data` command (services
@@ -200,6 +193,26 @@ jobs:
             sleep 1
           done
           curl -fsS http://127.0.0.1:9100/minio/health/live >/dev/null
+
+      # NATS can't be a `services:` container (minimal nats:2 image has no
+      # wget/curl for a passing --health-cmd). Start it here with explicit
+      # -js (JetStream) + -m 8222 (HTTP monitor) and wait on /healthz from the
+      # runner, which DOES have curl. Reached by the queue round-trip at
+      # 127.0.0.1:4222 / :8222 (TEST_NATS_HOST=127.0.0.1).
+      - name: Start NATS for queue round-trip
+        run: |
+          docker run -d --name itest-nats \
+            -p 4222:4222 \
+            -p 8222:8222 \
+            nats:2 -js -m 8222
+          # Wait for the NATS HTTP monitor to report healthy before the tests.
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8222/healthz >/dev/null 2>&1; then
+              echo "nats healthy after ${i} tries"; break
+            fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8222/healthz >/dev/null
 
       - name: Generate coverage
         working-directory: provisioner

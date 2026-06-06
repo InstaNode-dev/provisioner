@@ -37,6 +37,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -137,7 +138,7 @@ func dropOutcome(err error) string {
 	switch {
 	case err == nil:
 		return "ok"
-	case err == circuit.ErrOpen:
+	case errors.Is(err, circuit.ErrOpen):
 		return "breaker_open"
 	default:
 		return "error"

@@ -3,11 +3,14 @@ package server_test
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"instant.dev/common/plans"
 	commonv1 "instant.dev/proto/common/v1"
 	provisionerv1 "instant.dev/proto/provisioner/v1"
 
@@ -223,7 +226,7 @@ func TestProvisionResource_BackendConnectError_ReturnsUnavailable(t *testing.T) 
 		&mockMongoBackend{},
 		&mockQueueBackend{},
 		nil, nil, nil, nil, nil, // storage + dedicated backends
-		nil,                     // pool
+		nil, // pool
 	)
 	_, err := srv.ProvisionResource(context.Background(), &provisionerv1.ProvisionRequest{
 		Token:        "tok",
@@ -244,7 +247,7 @@ func TestProvisionResource_AlreadyExists_ReturnsAlreadyExists(t *testing.T) {
 		&mockMongoBackend{},
 		&mockQueueBackend{},
 		nil, nil, nil, nil, nil, // storage + dedicated backends
-		nil,                     // pool
+		nil, // pool
 	)
 	_, err := srv.ProvisionResource(context.Background(), &provisionerv1.ProvisionRequest{
 		Token:        "tok",
@@ -506,37 +509,49 @@ func (m *mockRegraderRedisBackend) Regrade(ctx context.Context, token, id string
 	return redis.RegradeResult{Applied: true, AppliedMaxmemory: int64(targetMB) * 1024 * 1024}, nil
 }
 
-// TestRegradeResource_Redis_ProTier_AppliesProCap verifies that a pro-tier Redis
-// resource backed by a k8s-style provider_resource_id has maxmemory set to the
-// pro cap (512 MB from plans.yaml). team/growth get maxmemory=0 (unlimited).
+// TestRegradeResource_Redis_ProTier_AppliesCap verifies that a Redis resource
+// backed by a k8s-style provider_resource_id has maxmemory set to the tier's
+// registry-defined redis_memory_mb. Expectations are derived from the live plans
+// registry (rule 18) rather than hand-typed, so a registry change (e.g. the
+// strict-80 margin redesign that made every tier's redis_memory_mb finite) can
+// never silently drift this test. A tier whose redis_memory_mb is <= 0 (the "no
+// cap" sentinel; no current tier uses it post strict-80) yields maxmemory=0.
 func TestRegradeResource_Redis_ProTier_AppliesCap(t *testing.T) {
+	// wantRedisMB returns the maxmemory_mb the server is expected to apply for a
+	// tier, computed exactly as RegradeResource does: the registry value, with the
+	// <= 0 "no cap" sentinel mapped to 0.
+	wantRedisMB := func(tier string) int32 {
+		mb := plans.Default().StorageLimitMB(tier, "redis")
+		if mb < 0 {
+			mb = 0
+		}
+		return int32(mb)
+	}
 	cases := []struct {
-		tier            string
-		wantApplied     bool
-		wantAppliedMB   int32 // AppliedConnLimit field repurposed for Redis maxmemory_mb
-		wantSkipReason  string
+		tier           string
+		wantApplied    bool
+		wantAppliedMB  int32 // AppliedConnLimit field repurposed for Redis maxmemory_mb
+		wantSkipReason string
 	}{
 		{
 			tier:          "pro",
 			wantApplied:   true,
-			wantAppliedMB: 512, // plans.yaml pro redis_memory_mb = 512
+			wantAppliedMB: wantRedisMB("pro"),
 		},
 		{
 			tier:          "hobby",
 			wantApplied:   true,
-			wantAppliedMB: 50, // plans.yaml hobby redis_memory_mb = 50
+			wantAppliedMB: wantRedisMB("hobby"),
 		},
 		{
-			// team tier: redis_memory_mb = -1 (unlimited) → targetMaxmemoryMB = 0
 			tier:          "team",
 			wantApplied:   true,
-			wantAppliedMB: 0, // unlimited — maxmemory 0
+			wantAppliedMB: wantRedisMB("team"),
 		},
 		{
-			// growth tier: redis_memory_mb = 1024 (plans.yaml) → targetMaxmemoryMB = 1024
 			tier:          "growth",
 			wantApplied:   true,
-			wantAppliedMB: 1024, // plans.yaml growth redis_memory_mb = 1024
+			wantAppliedMB: wantRedisMB("growth"),
 		},
 	}
 
@@ -557,7 +572,7 @@ func TestRegradeResource_Redis_ProTier_AppliesCap(t *testing.T) {
 				&mockMongoBackend{},
 				&mockQueueBackend{},
 				nil, nil, nil, nil, nil, // storage + dedicated backends
-				nil,                     // pool
+				nil, // pool
 			)
 			resp, err := srv.RegradeResource(context.Background(), &provisionerv1.RegradeRequest{
 				Token:              "tok-" + tc.tier,
@@ -611,6 +626,80 @@ func TestRegradeResource_Redis_AlreadyCorrect_ReturnsSkip(t *testing.T) {
 	}
 	if resp.SkipReason != "already correct" {
 		t.Fatalf("unexpected skip_reason: %q", resp.SkipReason)
+	}
+}
+
+// TestRegradeResource_Redis_NoCapSentinel_SetsMaxmemoryZero exercises the "no
+// cap" sentinel branch in regradeRedis: when a tier's redis_memory_mb resolves
+// to a negative value, the server must target maxmemory=0 (Redis "no cap")
+// rather than passing the negative value through. No production tier triggers
+// this post the strict-80 margin redesign (every redis_memory_mb is finite), so
+// the branch is driven via a registry seam (SwapRegradeConnLimits) loading a
+// fixture tier with redis_memory_mb: -1 — a registry-derived test rather than a
+// hand-faked constant (CLAUDE.md rule 18).
+func TestRegradeResource_Redis_NoCapSentinel_SetsMaxmemoryZero(t *testing.T) {
+	// Minimal valid plans registry with one tier ("unlimited_redis") whose
+	// redis_memory_mb is the negative "no cap" sentinel. parse() requires an
+	// "anonymous" plan as the fallback, so include it.
+	yamlBody := `plans:
+  anonymous:
+    limits:
+      redis_memory_mb: 5
+  unlimited_redis:
+    limits:
+      redis_memory_mb: -1
+`
+	dir := t.TempDir()
+	planPath := filepath.Join(dir, "plans.yaml")
+	if err := os.WriteFile(planPath, []byte(yamlBody), 0o600); err != nil {
+		t.Fatalf("write fixture plans.yaml: %v", err)
+	}
+	reg, err := plans.Load(planPath)
+	if err != nil {
+		t.Fatalf("plans.Load fixture: %v", err)
+	}
+	if got := reg.StorageLimitMB("unlimited_redis", "redis"); got >= 0 {
+		t.Fatalf("fixture precondition: redis_memory_mb for unlimited_redis = %d, want < 0", got)
+	}
+	restore := server.SwapRegradeConnLimits(reg)
+	defer restore()
+
+	var gotTargetMB int
+	regraderBackend := &mockRegraderRedisBackend{
+		regrade: func(_ context.Context, _, _ string, targetMB int) (redis.RegradeResult, error) {
+			gotTargetMB = targetMB
+			return redis.RegradeResult{
+				Applied:          true,
+				AppliedMaxmemory: int64(targetMB) * 1024 * 1024,
+			}, nil
+		},
+	}
+	srv := server.NewWithBackends(
+		&config.Config{},
+		&mockPostgresBackend{},
+		regraderBackend,
+		&mockMongoBackend{},
+		&mockQueueBackend{},
+		nil, nil, nil, nil, nil,
+		nil,
+	)
+	resp, err := srv.RegradeResource(context.Background(), &provisionerv1.RegradeRequest{
+		Token:              "tok-nocap",
+		ResourceType:       commonv1.ResourceType_RESOURCE_TYPE_REDIS,
+		Tier:               "unlimited_redis",
+		ProviderResourceId: "instant-customer-tok-nocap",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotTargetMB != 0 {
+		t.Fatalf("negative redis_memory_mb sentinel: target maxmemory_mb passed to backend = %d, want 0", gotTargetMB)
+	}
+	if !resp.Applied {
+		t.Fatal("expected Applied=true for the no-cap regrade")
+	}
+	if resp.AppliedConnLimit != 0 {
+		t.Fatalf("AppliedConnLimit (maxmemory_mb) = %d, want 0 for no-cap tier", resp.AppliedConnLimit)
 	}
 }
 

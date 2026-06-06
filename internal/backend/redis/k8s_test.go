@@ -66,8 +66,8 @@ func TestSizingForTier_MaxmemoryMB_MatchesPlansYAML(t *testing.T) {
 		{"hobby_plus_yearly", 50, true}, // plans.yaml: hobby_plus_yearly mirrors hobby_plus
 		{"pro", 512, true},       // plans.yaml: pro redis_memory_mb = 512
 		{"pro_yearly", 512, true},// plans.yaml: pro_yearly mirrors pro
-		{"team", -1, false},      // unlimited — flag omitted
-		{"team_yearly", -1, false}, // plans.yaml: team_yearly mirrors team (unlimited)
+		{"team", -1, false},      // "no cap" pod-start default — flag omitted; Regrade reconciles to registry (team=1536, finite post strict-80)
+		{"team_yearly", -1, false}, // team_yearly mirrors team's pod-start sizing default
 		{"growth", 1024, true},   // plans.yaml: growth redis_memory_mb = 1024
 		{"unknown", 50, true},    // unknown → hobby fallback
 	}

@@ -79,8 +79,11 @@ const (
 	// instead of "allkeys-lru" silently evicting the customer's oldest keys.
 	// Silent eviction also contradicts --appendonly yes (durability). See P1-C.
 	redisMaxmemoryPolicyCapped = "noeviction"
-	// redisMaxmemoryPolicyUnlimited is the policy for unlimited tiers (team):
-	// no cap, so eviction never triggers; "noeviction" is Redis's default.
+	// redisMaxmemoryPolicyUnlimited is the policy used when a tier resolves to the
+	// "no cap" sentinel (maxmemoryMB <= 0): no cap, so eviction never triggers;
+	// "noeviction" is Redis's default. Post the strict-80 margin redesign
+	// (2026-06-05) every tier's redis_memory_mb is finite, so no current tier uses
+	// this policy — it is retained for the sentinel contract.
 	redisMaxmemoryPolicyUnlimited = "noeviction"
 
 	// redisK8sOwnerTeamLabel is applied to dedicated customer namespaces.
@@ -137,14 +140,19 @@ func routeKeyTTLForTier(tier string) time.Duration {
 // the default user (no ACL), so pod-level is the natural lever. Since each pod is
 // dedicated to one customer this is functionally a per-customer cap.
 //
-// maxmemoryMB is the Redis --maxmemory flag value in MB. A value of -1 means
-// unlimited (the flag is omitted entirely). This enforces the per-resource memory
-// limit advertised in plans.yaml at the Redis level. The noeviction policy is used
-// (see redisMaxmemoryPolicyCapped) so writes fail loudly with an OOM error at the
-// cap rather than silently evicting customer data. Values mirror plans.yaml
-// redis_memory_mb:
+// maxmemoryMB is the Redis --maxmemory flag value in MB. A value of <= 0 is the
+// "no cap" sentinel (the flag is omitted entirely). This enforces the per-resource
+// memory limit at the Redis level. The noeviction policy is used (see
+// redisMaxmemoryPolicyCapped) so writes fail loudly with an OOM error at the cap
+// rather than silently evicting customer data. These pod-start values are the
+// dedicated-pod sizing defaults; the runtime-enforced cap is reconciled to the
+// plans registry by RegradeResource (server.go) on provision and plan change.
 //
-//	anonymous: 5 MB, hobby: 50 MB, pro: 512 MB, growth: 1024 MB, team: unlimited (-1)
+//	anonymous: 5 MB, hobby: 50 MB, pro: 512 MB, growth: 1024 MB, team: -1 (no flag)
+//
+// NOTE: the registry's redis_memory_mb is finite for every tier post the strict-80
+// margin redesign (2026-06-05; team=1536), so the team -1 below is a pod-start
+// default that Regrade overrides — it no longer mirrors plans.yaml.
 type tierSizing struct {
 	cpuReq, memReq string
 	cpuLim, memLim string
@@ -156,7 +164,9 @@ type tierSizing struct {
 	// Bounds total simultaneous TCP clients connected to this pod.
 	maxClients int
 	// maxmemoryMB is the Redis --maxmemory limit in MB applied at pod start.
-	// -1 means unlimited (flag omitted). Mirrors plans.yaml redis_memory_mb.
+	// <= 0 is the "no cap" sentinel (flag omitted). The pod-start value is a sizing
+	// default; the runtime cap is reconciled to the plans registry by Regrade. The
+	// registry's redis_memory_mb is finite for every tier post strict-80 (2026-06-05).
 	// The noeviction maxmemory-policy is applied alongside this limit (P1-C).
 	maxmemoryMB int
 }
@@ -225,15 +235,17 @@ func sizingForTier(tier string) tierSizing {
 			maxmemoryMB: 1024, // plans.yaml: growth redis_memory_mb = 1024
 		}
 	case "team", "team_yearly":
-		// team_yearly mirrors team (plans.yaml: identical -1 limits, annual billing).
+		// team_yearly mirrors team (identical limits, annual billing).
 		return tierSizing{
 			cpuReq: "500m", memReq: "1Gi",
 			cpuLim: "4", memLim: "4Gi",
 			pvcMi:        51200, // 50Gi
 			qCPURequests: "1", qMemRequests: "2Gi",
 			qCPULimits: "8", qMemLimits: "8Gi",
-			maxClients:  1000,
-			maxmemoryMB: -1, // unlimited — team dedicated pods have no memory cap
+			maxClients: 1000,
+			// "no cap" pod-start default; Regrade reconciles to the registry value
+			// (plans.yaml: team redis_memory_mb = 1536, finite post strict-80).
+			maxmemoryMB: -1,
 		}
 	default:
 		// Unknown tier → conservative hobby-equivalent sizing.
@@ -624,8 +636,9 @@ type RegradeResult struct {
 //   - targetMaxmemoryMB > 0  → set maxmemory to that many MB + noeviction policy
 //     (P1-C: writes fail loudly at the cap, no silent eviction), then CONFIG
 //     REWRITE so the cap survives a pod restart.
-//   - targetMaxmemoryMB <= 0 → unlimited tier (team/growth): set maxmemory to 0
-//     (Redis "no cap") + CONFIG REWRITE so it explicitly overrides any leftover cap.
+//   - targetMaxmemoryMB <= 0 → "no cap" sentinel: set maxmemory to 0 (Redis "no
+//     cap") + CONFIG REWRITE so it explicitly overrides any leftover cap. No current
+//     tier resolves here post strict-80 (2026-06-05) — every redis_memory_mb is finite.
 //
 // Idempotent: reads CONFIG GET maxmemory first and short-circuits if the value
 // already matches, returning Applied=false + SkipReason="already correct".
@@ -851,7 +864,7 @@ func (b *K8sBackend) regradeViaExec(ctx context.Context, ns, token string, targe
 		return RegradeResult{Applied: false, SkipReason: "exec fallback: CONFIG GET output unparseable"}, nil
 	}
 
-	// Compute target bytes (0 = unlimited for team tier).
+	// Compute target bytes (targetMaxmemoryMB <= 0 → 0 bytes = Redis "no cap").
 	var targetBytes int64
 	if targetMaxmemoryMB > 0 {
 		targetBytes = int64(targetMaxmemoryMB) * 1024 * 1024
@@ -1104,10 +1117,11 @@ func (b *K8sBackend) applyDeployment(ctx context.Context, ns string, sz tierSizi
 								"--dir", "/data",
 								"--maxclients", fmt.Sprintf("%d", sz.maxClients),
 							}
-							// Only add --maxmemory when the tier has a defined cap.
-							// -1 means unlimited (team/growth) — omit the flag so Redis
-							// uses its default (no cap). This matches plans.yaml semantics
-							// where -1 = unlimited.
+							// Only add --maxmemory when the sizing has a defined cap.
+							// sz.maxmemoryMB <= 0 is the "no cap" sentinel — omit the
+							// flag so Redis uses its default (no cap). This is a pod-start
+							// default; Regrade later reconciles the cap to the registry
+							// value, which is finite for every tier post strict-80.
 							if sz.maxmemoryMB > 0 {
 								cmd = append(cmd,
 									"--maxmemory", fmt.Sprintf("%dmb", sz.maxmemoryMB),

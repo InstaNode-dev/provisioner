@@ -144,7 +144,12 @@ func sizingForTier(tier string) tierSizing {
 			pvcGi:        200,
 			qCPURequests: "1", qMemRequests: "4Gi",
 			qCPULimits: "8", qMemLimits: "16Gi",
-			connLimit: -1, // unlimited; capped only by pod max_connections
+			// "no cap" sizing default; the enforced cap comes from the registry via
+			// Regrade (plans.yaml: team postgres_connections=100, growth=20 — both
+			// finite post strict-80, 2026-06-05). Note sz.connLimit is also what
+			// Provision's initDatabase uses, so the role is briefly uncapped until the
+			// reconciler's first Regrade applies the finite registry value.
+			connLimit: -1,
 		}
 	default:
 		// Unknown tier → conservative hobby-equivalent sizing rather than fail-open.

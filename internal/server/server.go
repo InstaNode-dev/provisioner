@@ -378,7 +378,11 @@ func isDedicatedTier(tier string) bool {
 
 func (s *Server) provisionPostgres(ctx context.Context, req *provisionerv1.ProvisionRequest) (*provisionerv1.ProvisionResponse, error) {
 	// Resolve the connection limit for this tier from the shared plans registry.
-	// -1 = unlimited (team/growth); > 0 = enforced cap at the Postgres role level.
+	// <= 0 is the wire sentinel for "no role-level cap" (Postgres uses -1 for "no
+	// limit"); > 0 is an enforced cap at the Postgres role level. Post the strict-80
+	// margin redesign (2026-06-05) every tier's postgres_connections is finite
+	// (e.g. pro=20, growth=20, team=100), so no tier passes the sentinel today — the
+	// branch is kept for the wire contract, not because any current tier uses it.
 	// The provisioner owns the plans registry so the cap stays consistent with
 	// what RegradeResource applies on plan upgrades.
 	connLimit := regradeConnLimits.ConnectionsLimit(req.Tier, "postgres")
@@ -1031,8 +1035,10 @@ func (s *Server) regradePostgres(ctx context.Context, req *provisionerv1.Regrade
 // redisBackend does not implement redis.Regrader) return {applied:false} gracefully so
 // the shared redis-provision pod is never accidentally capped.
 //
-// Team/growth tiers (memory limit = -1 in plans.yaml) set maxmemory=0 (Redis "unlimited")
-// so existing pods are never accidentally capped.
+// A tier whose redis_memory_mb resolves to <= 0 sets maxmemory=0 (Redis "no cap").
+// Post the strict-80 margin redesign (2026-06-05) every tier's redis_memory_mb is
+// finite in plans.yaml (e.g. pro=512, growth=1024, team=1536), so no tier hits this
+// branch today — it remains for the sentinel contract, not for any current tier.
 func (s *Server) regradeRedis(ctx context.Context, req *provisionerv1.RegradeRequest) (*provisionerv1.RegradeResponse, error) {
 	// Resolve the effective provider ID (k8s namespace).
 	//   Case 1: prid is already "instant-customer-<something>" → use as-is.
@@ -1095,12 +1101,16 @@ func (s *Server) regradeRedis(ctx context.Context, req *provisionerv1.RegradeReq
 
 	// Memory cap comes from the shared plans registry.
 	// StorageLimitMB("redis") returns plans.yaml redis_memory_mb:
-	//   anonymous=5, hobby=50, pro=512, team/growth=-1 (unlimited).
-	// -1 (unlimited) → targetMaxmemoryMB=0 → Regrade sets maxmemory=0 (no cap).
+	//   anonymous=5, hobby=50, pro=512, growth=1024, team=1536.
+	// All current tiers are finite post the strict-80 margin redesign (2026-06-05).
+	// The < 0 branch below is the wire sentinel for "no cap" (-> targetMaxmemoryMB=0
+	// -> Regrade sets maxmemory=0); no current tier passes it, but it is kept so a
+	// future unlimited tier would behave correctly.
 	memLimitMB := regradeConnLimits.StorageLimitMB(req.Tier, "redis")
 	targetMaxmemoryMB := memLimitMB
 	if memLimitMB < 0 {
-		// Unlimited tier — explicitly clear any cap on the pod.
+		// "No cap" sentinel (no current tier passes it post strict-80) — explicitly
+		// clear any cap on the pod.
 		targetMaxmemoryMB = 0
 	}
 

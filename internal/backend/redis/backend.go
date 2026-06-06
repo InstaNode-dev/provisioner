@@ -49,7 +49,9 @@ type Backend interface {
 // without error, and the reconciler leaves the row for the next sweep.
 type Regrader interface {
 	// Regrade connects to the dedicated Redis pod and adjusts maxmemory to
-	// match targetMaxmemoryMB. targetMaxmemoryMB <= 0 means unlimited (maxmemory 0).
+	// match targetMaxmemoryMB. targetMaxmemoryMB <= 0 is the "no cap" sentinel
+	// (maxmemory 0); every tier's redis_memory_mb is finite post strict-80
+	// (2026-06-05), so the registry does not pass the sentinel today.
 	// Returns RegradeResult.Applied=false + SkipReason when the pod is already
 	// correctly configured (idempotent no-op) or unreachable (soft skip).
 	Regrade(ctx context.Context, token, providerResourceID string, targetMaxmemoryMB int) (RegradeResult, error)

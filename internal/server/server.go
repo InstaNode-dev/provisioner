@@ -674,7 +674,7 @@ func (s *Server) DeprovisionResource(ctx context.Context, req *provisionerv1.Dep
 			slog.Info("server.DeprovisionResource: postgres using dedicated backend",
 				"token", req.Token, "provider_resource_id", req.ProviderResourceId)
 			// Breaker: postgres_k8s — dedicated Postgres teardown.
-			if err := callBackendVoid(s.breakerForPostgres(true), func() error {
+			if err := s.guardedDrop(ctx, req, dropBackendDedicated, s.breakerForPostgres(true), func() error {
 				return s.dedicatedPostgresBackend.Deprovision(ctx, req.Token, req.ProviderResourceId)
 			}); err != nil {
 				return nil, mapError("DeprovisionResource.postgres.dedicated", err)
@@ -682,7 +682,7 @@ func (s *Server) DeprovisionResource(ctx context.Context, req *provisionerv1.Dep
 			return &provisionerv1.DeprovisionResponse{Deprovisioned: true}, nil
 		}
 		// Breaker: postgres_admin — shared cluster DROP DATABASE / DROP USER.
-		if err := callBackendVoid(s.breakerForPostgres(false), func() error {
+		if err := s.guardedDrop(ctx, req, dropBackendShared, s.breakerForPostgres(false), func() error {
 			return s.postgresBackend.Deprovision(ctx, req.Token, req.ProviderResourceId)
 		}); err != nil {
 			return nil, mapError("DeprovisionResource.postgres", err)
@@ -697,7 +697,7 @@ func (s *Server) DeprovisionResource(ctx context.Context, req *provisionerv1.Dep
 			slog.Info("server.DeprovisionResource: redis using dedicated backend",
 				"token", req.Token, "provider_resource_id", req.ProviderResourceId)
 			// Breaker: k8s_api — dedicated Redis pod teardown via kube-apiserver.
-			if err := callBackendVoid(s.breakerForRedis(true), func() error {
+			if err := s.guardedDrop(ctx, req, dropBackendDedicated, s.breakerForRedis(true), func() error {
 				return s.dedicatedRedisBackend.Deprovision(ctx, req.Token, req.ProviderResourceId)
 			}); err != nil {
 				return nil, mapError("DeprovisionResource.redis.dedicated", err)
@@ -705,7 +705,7 @@ func (s *Server) DeprovisionResource(ctx context.Context, req *provisionerv1.Dep
 			return &provisionerv1.DeprovisionResponse{Deprovisioned: true}, nil
 		}
 		// Breaker: redis_admin — shared Redis ACL DELUSER / namespace cleanup.
-		if err := callBackendVoid(s.breakerForRedis(false), func() error {
+		if err := s.guardedDrop(ctx, req, dropBackendShared, s.breakerForRedis(false), func() error {
 			return s.redisBackend.Deprovision(ctx, req.Token, req.ProviderResourceId)
 		}); err != nil {
 			return nil, mapError("DeprovisionResource.redis", err)
@@ -718,7 +718,7 @@ func (s *Server) DeprovisionResource(ctx context.Context, req *provisionerv1.Dep
 			slog.Info("server.DeprovisionResource: mongo using dedicated backend",
 				"token", req.Token, "provider_resource_id", req.ProviderResourceId)
 			// Breaker: k8s_api — dedicated Mongo pod teardown via kube-apiserver.
-			if err := callBackendVoid(s.breakerForMongo(true), func() error {
+			if err := s.guardedDrop(ctx, req, dropBackendDedicated, s.breakerForMongo(true), func() error {
 				return s.dedicatedMongoBackend.Deprovision(ctx, req.Token, req.ProviderResourceId)
 			}); err != nil {
 				return nil, mapError("DeprovisionResource.mongo.dedicated", err)
@@ -726,7 +726,7 @@ func (s *Server) DeprovisionResource(ctx context.Context, req *provisionerv1.Dep
 			return &provisionerv1.DeprovisionResponse{Deprovisioned: true}, nil
 		}
 		// Breaker: mongo_admin — shared MongoDB DROP USER / DROP DATABASE.
-		if err := callBackendVoid(s.breakerForMongo(false), func() error {
+		if err := s.guardedDrop(ctx, req, dropBackendShared, s.breakerForMongo(false), func() error {
 			return s.mongoBackend.Deprovision(ctx, req.Token, req.ProviderResourceId)
 		}); err != nil {
 			return nil, mapError("DeprovisionResource.mongo", err)
@@ -738,14 +738,14 @@ func (s *Server) DeprovisionResource(ctx context.Context, req *provisionerv1.Dep
 			!strings.HasPrefix(req.ProviderResourceId, "instant-customer-") {
 			slog.Info("server.DeprovisionResource: queue using dedicated backend",
 				"token", req.Token, "provider_resource_id", req.ProviderResourceId)
-			if err := callBackendVoid(s.breakerForQueue(true), func() error {
+			if err := s.guardedDrop(ctx, req, dropBackendDedicated, s.breakerForQueue(true), func() error {
 				return s.dedicatedQueueBackend.Deprovision(ctx, req.Token, req.ProviderResourceId)
 			}); err != nil {
 				return nil, mapError("DeprovisionResource.queue.dedicated", err)
 			}
 			return &provisionerv1.DeprovisionResponse{Deprovisioned: true}, nil
 		}
-		if err := callBackendVoid(s.breakerForQueue(false), func() error {
+		if err := s.guardedDrop(ctx, req, dropBackendShared, s.breakerForQueue(false), func() error {
 			return s.queueBackend.Deprovision(ctx, req.Token, req.ProviderResourceId)
 		}); err != nil {
 			return nil, mapError("DeprovisionResource.queue", err)

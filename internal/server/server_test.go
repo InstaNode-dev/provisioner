@@ -8,6 +8,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"instant.dev/common/plans"
 	commonv1 "instant.dev/proto/common/v1"
 	provisionerv1 "instant.dev/proto/provisioner/v1"
 
@@ -506,10 +507,24 @@ func (m *mockRegraderRedisBackend) Regrade(ctx context.Context, token, id string
 	return redis.RegradeResult{Applied: true, AppliedMaxmemory: int64(targetMB) * 1024 * 1024}, nil
 }
 
-// TestRegradeResource_Redis_ProTier_AppliesProCap verifies that a pro-tier Redis
-// resource backed by a k8s-style provider_resource_id has maxmemory set to the
-// pro cap (512 MB from plans.yaml). team/growth get maxmemory=0 (unlimited).
+// TestRegradeResource_Redis_ProTier_AppliesCap verifies that a Redis resource
+// backed by a k8s-style provider_resource_id has maxmemory set to the tier's
+// registry-defined redis_memory_mb. Expectations are derived from the live plans
+// registry (rule 18) rather than hand-typed, so a registry change (e.g. the
+// strict-80 margin redesign that made every tier's redis_memory_mb finite) can
+// never silently drift this test. A tier whose redis_memory_mb is <= 0 (the "no
+// cap" sentinel; no current tier uses it post strict-80) yields maxmemory=0.
 func TestRegradeResource_Redis_ProTier_AppliesCap(t *testing.T) {
+	// wantRedisMB returns the maxmemory_mb the server is expected to apply for a
+	// tier, computed exactly as RegradeResource does: the registry value, with the
+	// <= 0 "no cap" sentinel mapped to 0.
+	wantRedisMB := func(tier string) int32 {
+		mb := plans.Default().StorageLimitMB(tier, "redis")
+		if mb < 0 {
+			mb = 0
+		}
+		return int32(mb)
+	}
 	cases := []struct {
 		tier            string
 		wantApplied     bool
@@ -519,24 +534,22 @@ func TestRegradeResource_Redis_ProTier_AppliesCap(t *testing.T) {
 		{
 			tier:          "pro",
 			wantApplied:   true,
-			wantAppliedMB: 512, // plans.yaml pro redis_memory_mb = 512
+			wantAppliedMB: wantRedisMB("pro"),
 		},
 		{
 			tier:          "hobby",
 			wantApplied:   true,
-			wantAppliedMB: 50, // plans.yaml hobby redis_memory_mb = 50
+			wantAppliedMB: wantRedisMB("hobby"),
 		},
 		{
-			// team tier: redis_memory_mb = -1 (unlimited) → targetMaxmemoryMB = 0
 			tier:          "team",
 			wantApplied:   true,
-			wantAppliedMB: 0, // unlimited — maxmemory 0
+			wantAppliedMB: wantRedisMB("team"),
 		},
 		{
-			// growth tier: redis_memory_mb = 1024 (plans.yaml) → targetMaxmemoryMB = 1024
 			tier:          "growth",
 			wantApplied:   true,
-			wantAppliedMB: 1024, // plans.yaml growth redis_memory_mb = 1024
+			wantAppliedMB: wantRedisMB("growth"),
 		},
 	}
 

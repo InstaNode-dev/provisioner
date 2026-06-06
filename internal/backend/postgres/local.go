@@ -119,9 +119,12 @@ func generatePassword(n int) (string, error) {
 }
 
 // Provision creates a Postgres database and user for the given token.
-// connLimit is the CONNECTION LIMIT to apply to the role; -1 means unlimited
-// (omits the clause). This value comes from the API handler via plans.Registry
-// so the provisioner stays a dumb executor and the API remains the policy owner.
+// connLimit is the CONNECTION LIMIT to apply to the role; <= 0 is the "no cap"
+// sentinel (omits the clause; Postgres treats -1 as "no limit"). This value comes
+// from the plans registry so the provisioner stays a dumb executor and the policy
+// owner sets the cap. Every tier's postgres_connections is finite post the strict-80
+// margin redesign (2026-06-05), so the registry does not pass the sentinel today —
+// it is retained for the wire contract.
 func (b *LocalBackend) Provision(ctx context.Context, token, tier string, connLimit int) (*Credentials, error) {
 	dbName := dbNamePrefix + token
 	username := userNamePrefix + token
@@ -374,8 +377,10 @@ func (b *LocalBackend) Deprovision(ctx context.Context, token, providerResourceI
 // user on the shared local Postgres cluster. This is called by the entitlement
 // reconciler on plan upgrades/downgrades to ensure the role cap matches the new tier.
 //
-// connLimit <= 0 means unlimited (pass -1 from plans.Registry). Postgres uses -1
-// internally for "no limit"; ALTER ROLE with CONNECTION LIMIT -1 removes any cap.
+// connLimit <= 0 is the "no cap" sentinel. Postgres uses -1 internally for "no
+// limit"; ALTER ROLE with CONNECTION LIMIT -1 removes any cap. The registry returns
+// a finite value for every tier post strict-80 (2026-06-05), so this branch is the
+// wire contract, not a path any current tier exercises.
 func (b *LocalBackend) Regrade(ctx context.Context, token, providerResourceID string, connLimit int) (RegradeResult, error) {
 	// P0-2: a pool-claimed role is named from the pool token; resolve it from
 	// provider_resource_id so ALTER ROLE targets the role that actually exists.

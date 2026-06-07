@@ -8,7 +8,9 @@ package server
 // Unavailable.
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -86,5 +88,36 @@ func TestMapError_NonPgError_FallsBackToSubstring(t *testing.T) {
 	}
 	if mapError("op", nil) != nil {
 		t.Error("mapError(nil) must return nil")
+	}
+}
+
+// TestMapError_ContextErrors_AreRetryable guards fix/redis-pro-provision-hang.
+//
+// When a backend honours the caller's deadline and bails (the redis k8s Provision
+// fast-fail on a stalled Pro-tier PVC attach), the error wraps context.DeadlineExceeded
+// or context.Canceled. mapError MUST classify these via errors.Is — NOT a fragile
+// message substring — so the api treats them as soft/retryable (soft-delete + 503)
+// rather than a hard Internal/500. A wrapped context.DeadlineExceeded must map to
+// DeadlineExceeded even if the message does not contain the word "timeout".
+func TestMapError_ContextErrors_AreRetryable(t *testing.T) {
+	// The exact wrapped form returned by waitPodReady — note the message says
+	// "cancelled/timed out", which does NOT contain the substring "timeout" the
+	// old heuristic looked for. errors.Is is what makes this robust.
+	deadlineErr := fmt.Errorf("redis pod not ready (caller cancelled/timed out): %w", context.DeadlineExceeded)
+	if got := status.Code(mapError("ProvisionResource.redis.dedicated", deadlineErr)); got != codes.DeadlineExceeded {
+		t.Errorf("wrapped context.DeadlineExceeded → %v; want DeadlineExceeded (retryable, not Internal)", got)
+	}
+
+	canceledErr := fmt.Errorf("redis pod not ready (caller cancelled/timed out): %w", context.Canceled)
+	if got := status.Code(mapError("ProvisionResource.redis.dedicated", canceledErr)); got != codes.Unavailable {
+		t.Errorf("wrapped context.Canceled → %v; want Unavailable (retryable, not Internal)", got)
+	}
+
+	// Bare (unwrapped) context errors are also classified.
+	if got := status.Code(mapError("op", context.DeadlineExceeded)); got != codes.DeadlineExceeded {
+		t.Errorf("bare context.DeadlineExceeded → %v; want DeadlineExceeded", got)
+	}
+	if got := status.Code(mapError("op", context.Canceled)); got != codes.Unavailable {
+		t.Errorf("bare context.Canceled → %v; want Unavailable", got)
 	}
 }

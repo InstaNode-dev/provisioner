@@ -1169,6 +1169,19 @@ func mapError(op string, err error) error {
 		slog.Warn(fmt.Sprintf("server.%s", op), "circuit", "open", "error", err.Error())
 		return status.Errorf(codes.Unavailable, "%s: provisioner circuit open: %v", op, err)
 	}
+	// Context cancellation / deadline: surfaces when a backend honoured the
+	// caller's deadline and bailed (e.g. the redis k8s Provision PVC-attach
+	// fast-fail — fix/redis-pro-provision-hang). Map to a retryable status via
+	// errors.Is (NOT a fragile message substring) so the api treats it as a
+	// soft failure (soft-delete + 503) rather than a hard 500.
+	if errors.Is(err, context.DeadlineExceeded) {
+		slog.Warn(fmt.Sprintf("server.%s", op), "deadline", "exceeded", "error", err.Error())
+		return status.Errorf(codes.DeadlineExceeded, "%s: provision deadline exceeded: %v", op, err)
+	}
+	if errors.Is(err, context.Canceled) {
+		slog.Warn(fmt.Sprintf("server.%s", op), "canceled", true, "error", err.Error())
+		return status.Errorf(codes.Unavailable, "%s: provision canceled: %v", op, err)
+	}
 	msg := err.Error()
 	slog.Error(fmt.Sprintf("server.%s", op), "error", msg)
 

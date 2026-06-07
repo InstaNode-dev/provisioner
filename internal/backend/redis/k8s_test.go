@@ -34,6 +34,7 @@ package redis
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -46,6 +47,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
+
+	"instant.dev/provisioner/internal/ctxkeys"
 )
 
 // ─── Tier sizing regression guards ──────────────────────────────────────────
@@ -59,17 +62,17 @@ func TestSizingForTier_MaxmemoryMB_MatchesPlansYAML(t *testing.T) {
 		wantMB      int  // expected maxmemoryMB (mirrors plans.yaml redis_memory_mb)
 		expectLimit bool // true if --maxmemory flag should be applied
 	}{
-		{"anonymous", 5, true},   // plans.yaml: anonymous redis_memory_mb = 5
-		{"hobby", 50, true},      // plans.yaml: hobby redis_memory_mb = 50
-		{"hobby_yearly", 50, true}, // plans.yaml: hobby_yearly mirrors hobby
-		{"hobby_plus", 50, true}, // plans.yaml: hobby_plus redis_memory_mb = 50
+		{"anonymous", 5, true},          // plans.yaml: anonymous redis_memory_mb = 5
+		{"hobby", 50, true},             // plans.yaml: hobby redis_memory_mb = 50
+		{"hobby_yearly", 50, true},      // plans.yaml: hobby_yearly mirrors hobby
+		{"hobby_plus", 50, true},        // plans.yaml: hobby_plus redis_memory_mb = 50
 		{"hobby_plus_yearly", 50, true}, // plans.yaml: hobby_plus_yearly mirrors hobby_plus
-		{"pro", 512, true},       // plans.yaml: pro redis_memory_mb = 512
-		{"pro_yearly", 512, true},// plans.yaml: pro_yearly mirrors pro
-		{"team", -1, false},      // "no cap" pod-start default — flag omitted; Regrade reconciles to registry (team=1536, finite post strict-80)
-		{"team_yearly", -1, false}, // team_yearly mirrors team's pod-start sizing default
-		{"growth", 1024, true},   // plans.yaml: growth redis_memory_mb = 1024
-		{"unknown", 50, true},    // unknown → hobby fallback
+		{"pro", 512, true},              // plans.yaml: pro redis_memory_mb = 512
+		{"pro_yearly", 512, true},       // plans.yaml: pro_yearly mirrors pro
+		{"team", -1, false},             // "no cap" pod-start default — flag omitted; Regrade reconciles to registry (team=1536, finite post strict-80)
+		{"team_yearly", -1, false},      // team_yearly mirrors team's pod-start sizing default
+		{"growth", 1024, true},          // plans.yaml: growth redis_memory_mb = 1024
+		{"unknown", 50, true},           // unknown → hobby fallback
 	}
 	for _, tc := range cases {
 		t.Run(tc.tier, func(t *testing.T) {
@@ -188,7 +191,7 @@ func TestRouteKeyTTLForTier_PaidTiersNeverExpire(t *testing.T) {
 		{"pro", persistRouteKey},
 		{"growth", persistRouteKey},
 		{"team", persistRouteKey},
-		{"", persistRouteKey},        // empty/unknown → fail safe to persistent
+		{"", persistRouteKey}, // empty/unknown → fail safe to persistent
 		{"some_future_tier", persistRouteKey},
 	}
 	for _, tc := range cases {
@@ -355,17 +358,17 @@ func (f *fakeExecor) ExecInPod(_ context.Context, namespace, podName, containerN
 //     at the cap instead of silently evicting customer keys).
 func TestExecCommandConstruction(t *testing.T) {
 	cases := []struct {
-		tier           string
-		targetMB       int
+		tier            string
+		targetMB        int
 		wantTargetBytes int64
-		wantPolicy     string
-		wantMaxmem     string // expected substring in the CONFIG SET maxmemory command
+		wantPolicy      string
+		wantMaxmem      string // expected substring in the CONFIG SET maxmemory command
 	}{
 		{"anonymous", 5, 5 * 1024 * 1024, "noeviction", "5242880"},
 		{"hobby", 50, 50 * 1024 * 1024, "noeviction", "52428800"},
 		{"pro", 512, 512 * 1024 * 1024, "noeviction", "536870912"},
 		{"growth", 1024, 1024 * 1024 * 1024, "noeviction", "1073741824"},
-		{"team", -1, 0, "noeviction", "maxmemory 0"},  // unlimited — check full "maxmemory 0" substring
+		{"team", -1, 0, "noeviction", "maxmemory 0"}, // unlimited — check full "maxmemory 0" substring
 	}
 
 	for _, tc := range cases {
@@ -801,6 +804,167 @@ func TestRegrade_TeamTier_Unlimited(t *testing.T) {
 		if !strings.Contains(setPolicyStr, "noeviction") {
 			t.Errorf("team tier CONFIG SET maxmemory-policy should be noeviction; got: %v", fe.calls[2].cmd)
 		}
+	}
+}
+
+// ─── Provision caller-deadline / fast-fail guards (pro-provision-hang fix) ───
+
+// TestProvision_ProTier_HonoursCallerDeadline is the core regression guard for
+// fix/redis-pro-provision-hang.
+//
+// THE BUG: provisioning a Redis cache for a Pro/Team team HUNG (>60s, never
+// returned) while the anonymous provision returned in ~6s. The Pro tier uses a
+// real 10Gi PVC (pvcMi=10240); when the block-storage attach stalls, the Redis
+// pod never reaches Ready and waitPodReady polled for the full redisK8sReadyTO
+// (3 minutes). The old code derived the provisioning context from
+// context.Background() with a hardcoded 5-minute timeout, so it IGNORED the
+// caller's deadline entirely: even after the api gRPC call timed out, the
+// provisioner kept blocking the handler. The anonymous path never hit this
+// because emptyDir pods (pvcMi=0) go Ready in seconds.
+//
+// THE FIX: provisionContext derives from the caller's ctx, so the moment the api
+// gives up, Provision returns promptly with a (wrapped) context error.
+//
+// This test uses a fake clientset whose Redis pod NEVER becomes Ready (no
+// scheduler in the fake → no PodReady condition is ever set), simulating the
+// stalled-PVC-attach condition. With a short caller deadline, Provision MUST
+// return well before redisK8sReadyTO — proving it honours the caller's deadline.
+// If a future change reverts to context.Background(), this test fails (times out
+// the t.Fatal guard / takes ~3 minutes).
+func TestProvision_ProTier_HonoursCallerDeadline(t *testing.T) {
+	cs := fake.NewClientset() // empty cluster: the redis pod never becomes Ready
+	b := &K8sBackend{cs: cs, storageClass: "standard", image: "redis:7-alpine"}
+
+	// Caller deadline far shorter than redisK8sReadyTO (3m) and the ceiling (5m).
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err := b.Provision(ctx, "pro-token", "pro")
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("Provision should fail when the Redis pod never becomes Ready; got nil error")
+	}
+	// MUST return promptly — bounded by the caller deadline, NOT redisK8sReadyTO.
+	// Allow generous slack for the fake-client round trips, but it must be far
+	// below the 3-minute pod-ready ceiling that the old (background-context) code
+	// would have blocked for.
+	if elapsed > 30*time.Second {
+		t.Fatalf("PRO-PROVISION-HANG REGRESSION: Provision took %s; it must honour the "+
+			"caller's deadline (~300ms) and fast-fail, not block for redisK8sReadyTO (%s). "+
+			"This means the provisioning context no longer derives from the caller's ctx.",
+			elapsed, redisK8sReadyTO)
+	}
+	// The error must be the caller-deadline error so mapError can classify it as
+	// a retryable gRPC status (api soft-deletes + 503s rather than a hard 500).
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("Provision error should wrap context.DeadlineExceeded (got %v) so mapError "+
+			"surfaces a retryable status; a non-context error would map to Internal/500", err)
+	}
+}
+
+// TestProvision_AnonTier_HonoursCallerDeadline asserts the fast-fail is
+// tier-independent: even the anonymous path (which in prod is fast because it
+// uses emptyDir) returns promptly when the caller cancels. Under the fake
+// clientset the pod never goes Ready for any tier, so this verifies the
+// caller-deadline propagation rather than the emptyDir speedup.
+func TestProvision_AnonTier_HonoursCallerDeadline(t *testing.T) {
+	cs := fake.NewClientset()
+	b := &K8sBackend{cs: cs, storageClass: "standard", image: "redis:7-alpine"}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err := b.Provision(ctx, "anon-token", "anonymous")
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("Provision should fail when the Redis pod never becomes Ready; got nil error")
+	}
+	if elapsed > 30*time.Second {
+		t.Fatalf("Provision took %s; must fast-fail on caller deadline, not block %s", elapsed, redisK8sReadyTO)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("Provision error should wrap context.DeadlineExceeded; got %v", err)
+	}
+}
+
+// TestProvision_CallerCancel_FastFails asserts that an explicit caller
+// cancellation (not just a deadline) also unblocks Provision promptly. This
+// covers the api-cancels-the-RPC case (e.g. the agent disconnected) — the
+// provisioner must stop blocking, not grind on for minutes.
+func TestProvision_CallerCancel_FastFails(t *testing.T) {
+	cs := fake.NewClientset()
+	b := &K8sBackend{cs: cs, storageClass: "standard", image: "redis:7-alpine"}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// Cancel shortly after the call starts so waitPodReady is mid-poll.
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		cancel()
+	}()
+
+	start := time.Now()
+	_, err := b.Provision(ctx, "cancel-token", "pro")
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("Provision should fail when the caller cancels; got nil error")
+	}
+	if elapsed > 30*time.Second {
+		t.Fatalf("Provision took %s; caller cancellation must unblock it, not block %s", elapsed, redisK8sReadyTO)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("Provision error should wrap context.Canceled; got %v", err)
+	}
+}
+
+// TestProvisionContext_HonoursCallerDeadline verifies provisionContext's two
+// bounding layers:
+//  1. When the caller's deadline is sooner than the ceiling, the derived
+//     context's deadline equals the caller's (caller wins).
+//  2. The teamID context value is carried forward (so applyNamespace can label
+//     the namespace with instant.dev/owner-team).
+func TestProvisionContext_HonoursCallerDeadline(t *testing.T) {
+	callerDeadline := time.Now().Add(2 * time.Second) // sooner than redisK8sProvisionCeiling (5m)
+	parent, cancel := context.WithDeadline(context.Background(), callerDeadline)
+	defer cancel()
+	parent = context.WithValue(parent, ctxkeys.TeamIDKey, "team-xyz")
+
+	provCtx, provCancel := provisionContext(parent)
+	defer provCancel()
+
+	dl, ok := provCtx.Deadline()
+	if !ok {
+		t.Fatal("provisionContext result must have a deadline")
+	}
+	// The caller's 2s deadline is sooner than the 5m ceiling, so it must win.
+	if dl.After(callerDeadline.Add(50 * time.Millisecond)) {
+		t.Errorf("provisionContext deadline = %v; caller's sooner deadline (%v) should win over the ceiling", dl, callerDeadline)
+	}
+	if got, _ := provCtx.Value(ctxkeys.TeamIDKey).(string); got != "team-xyz" {
+		t.Errorf("provisionContext should carry teamID forward; got %q want %q", got, "team-xyz")
+	}
+}
+
+// TestProvisionContext_CeilingBoundsNoDeadlineCaller verifies that when the
+// caller passes a context with NO deadline (e.g. an internal background call),
+// the ceiling still bounds the provision so a wedged attach can't pin a
+// goroutine forever.
+func TestProvisionContext_CeilingBoundsNoDeadlineCaller(t *testing.T) {
+	provCtx, provCancel := provisionContext(context.Background())
+	defer provCancel()
+
+	dl, ok := provCtx.Deadline()
+	if !ok {
+		t.Fatal("provisionContext must impose the ceiling deadline even when the caller has none")
+	}
+	// Deadline should be ~redisK8sProvisionCeiling from now.
+	until := time.Until(dl)
+	if until <= 0 || until > redisK8sProvisionCeiling+time.Second {
+		t.Errorf("provisionContext ceiling deadline = %s from now; want ~%s", until, redisK8sProvisionCeiling)
 	}
 }
 

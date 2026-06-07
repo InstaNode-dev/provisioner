@@ -73,6 +73,30 @@ const (
 	redisK8sReadyTO   = 3 * time.Minute
 	redisK8sReadyPoll = 3 * time.Second
 
+	// redisK8sProvisionCeiling is the hard server-side ceiling on the whole
+	// Provision sequence (namespace → netpol → quota → secret → PVC → deployment
+	// → service → waitPodReady). It is a SAFETY CEILING, not the primary timeout:
+	// provisionCtx (see provisionContext) derives from the incoming gRPC ctx so
+	// the caller's deadline/cancellation propagates first.
+	//
+	// THE PRO-PROVISION-HANG BUG (fix/redis-pro-provision-hang):
+	// Pro/Team Redis uses a real PVC (pvcMi=10240 → 10Gi block storage); the
+	// anonymous tier uses an emptyDir (pvcMi=0) and skips the 5-10s DOKS volume
+	// attach entirely. When a Pro pod's PVC binding or block-storage attach stalls
+	// (CSI stuck, quota exhausted, slow attach), waitPodReady would poll for the
+	// full redisK8sReadyTO. The old code derived provCtx from context.Background()
+	// — DISCARDING the caller's deadline — so even after the api gRPC call timed
+	// out (e.g. 60s), the provisioner kept blocking the handler for up to 5
+	// minutes. From the api's side that is an unbounded hang. The anonymous path
+	// never hit it because emptyDir pods go Ready in seconds.
+	//
+	// The fix (provisionContext): derive from the caller's ctx so api cancellation
+	// returns the handler promptly with a clean error (mapped to a retryable gRPC
+	// status → api soft-deletes + 503s). This ceiling still bounds the worst case
+	// when the caller passes no deadline at all (e.g. an internal background call),
+	// so a wedged attach can never pin a goroutine forever.
+	redisK8sProvisionCeiling = 5 * time.Minute
+
 	// redisMaxmemoryPolicyCapped is the maxmemory-policy for capped (non-unlimited)
 	// dedicated Redis tiers. "noeviction" makes writes fail loudly with an OOM
 	// error at the memory cap so the agent/customer sees it and can upgrade —
@@ -404,6 +428,30 @@ func (b *K8sBackend) podExecor() PodExecor {
 	return b.execor
 }
 
+// provisionContext derives the context used for the whole Provision sequence.
+//
+// It bounds the provision in two layers so the call can NEVER hang the gRPC
+// handler indefinitely (the pro-provision-hang bug):
+//
+//  1. It derives from the incoming gRPC ctx (NOT context.Background()), so when
+//     the api caller's deadline fires or it cancels the RPC, the derived context
+//     is cancelled and every k8s call / waitPodReady poll returns promptly. This
+//     is what guarantees the api never observes an unbounded hang: the moment the
+//     api gives up, the provisioner stops blocking and returns an error.
+//  2. It applies redisK8sProvisionCeiling as a hard upper bound. context.WithTimeout
+//     uses min(parent deadline, ceiling), so a caller with a generous (or no)
+//     deadline still can't pin a goroutine on a wedged PVC attach past the ceiling.
+//
+// The teamID context value is carried forward so applyNamespace can label the
+// namespace with instant.dev/owner-team (pentest 2026-05-16 fix).
+func provisionContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	provCtx, cancel := context.WithTimeout(ctx, redisK8sProvisionCeiling)
+	if teamID, ok := ctx.Value(ctxkeys.TeamIDKey).(string); ok && teamID != "" {
+		provCtx = context.WithValue(provCtx, ctxkeys.TeamIDKey, teamID)
+	}
+	return provCtx, cancel
+}
+
 // Provision creates a dedicated Redis instance. The pod is started with --requirepass
 // and --maxclients injected via the container command. No post-start init step needed
 // (unlike Postgres).
@@ -416,19 +464,24 @@ func (b *K8sBackend) Provision(ctx context.Context, token, tier string) (*Creden
 
 	rollback := func(step string, cause error) error {
 		slog.Error("k8s.redis.provision.rollback", "step", step, "namespace", ns, "error", cause)
-		_ = b.cs.CoreV1().Namespaces().Delete(context.Background(), ns, metav1.DeleteOptions{})
+		// Rollback deletion uses a fresh background context with its own short
+		// timeout: the incoming ctx may already be cancelled (that is often WHY
+		// we are rolling back), but the namespace cleanup must still run so a
+		// failed provision does not leak a half-built namespace.
+		delCtx, delCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer delCancel()
+		_ = b.cs.CoreV1().Namespaces().Delete(delCtx, ns, metav1.DeleteOptions{})
 		return fmt.Errorf("k8s redis: %s: %w", step, cause)
 	}
 
-	// Use a fresh background context — pod startup can take minutes, far exceeding
-	// any gRPC request deadline on the incoming ctx.
-	// Carry the teamID value forward so applyNamespace can label the namespace
-	// with instant.dev/owner-team (pentest 2026-05-16 fix).
-	provCtx, provCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	// provCtx is bounded by BOTH the caller's deadline/cancellation and a hard
+	// server-side ceiling (see provisionContext + redisK8sProvisionCeiling). This
+	// is the core of the pro-provision-hang fix: the old code used
+	// context.WithTimeout(context.Background(), 5m), which ignored the caller's
+	// deadline and let a stalled Pro-tier PVC attach block the handler for the
+	// full 5 minutes even after the api had given up.
+	provCtx, provCancel := provisionContext(ctx)
 	defer provCancel()
-	if teamID, ok := ctx.Value(ctxkeys.TeamIDKey).(string); ok && teamID != "" {
-		provCtx = context.WithValue(provCtx, ctxkeys.TeamIDKey, teamID)
-	}
 
 	sz := sizingForTier(tier)
 
@@ -1193,6 +1246,16 @@ func (b *K8sBackend) applyService(ctx context.Context, ns string) (*corev1.Servi
 func (b *K8sBackend) waitPodReady(ctx context.Context, ns, labelSelector string) error {
 	deadline := time.Now().Add(redisK8sReadyTO)
 	for time.Now().Before(deadline) {
+		// Check the caller's context FIRST. When the api's gRPC deadline fires
+		// (the pro-provision-hang case: a stalled PVC attach keeps the Pro pod
+		// out of Ready), ctx is cancelled and we must return immediately with a
+		// retryable error rather than issue one more Pods.List or sleep another
+		// poll interval. This is what lets the provisioner fail FAST and clean
+		// (mapError → retryable gRPC status → api soft-deletes + 503s) instead
+		// of pinning the handler until the local 3-minute deadline.
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("redis pod not ready (caller cancelled/timed out): %w", err)
+		}
 		pods, err := b.cs.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{LabelSelector: labelSelector})
 		if err != nil {
 			return err
@@ -1206,7 +1269,7 @@ func (b *K8sBackend) waitPodReady(ctx context.Context, ns, labelSelector string)
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return fmt.Errorf("redis pod not ready (caller cancelled/timed out): %w", ctx.Err())
 		case <-time.After(redisK8sReadyPoll):
 		}
 	}

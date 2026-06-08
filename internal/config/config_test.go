@@ -23,6 +23,7 @@ var allConfigEnvKeys = []string{
 	"NEON_REGION_ID",
 	"REDIS_PROVISION_BACKEND",
 	"REDIS_PROVISION_HOST",
+	"REDIS_TIER_AWARE_ROUTING_ENABLED",
 	"MONGO_PROVISION_BACKEND",
 	"MONGO_ADMIN_URI",
 	"MONGO_HOST",
@@ -192,6 +193,12 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.K8sDedicatedBackend {
 		t.Errorf("K8sDedicatedBackend default = true; want false")
 	}
+
+	// Tier-aware Redis routing is opt-in: the default MUST be false so a deploy
+	// that does not set the env var is a no-op (behaviour identical to today).
+	if cfg.RedisTierAwareRoutingEnabled {
+		t.Errorf("RedisTierAwareRoutingEnabled default = true; want false (must be opt-in)")
+	}
 }
 
 // ── Load: override arm ───────────────────────────────────────────────────────
@@ -207,6 +214,7 @@ func TestLoad_Overrides(t *testing.T) {
 	t.Setenv("NEON_REGION_ID", "aws-eu-west-1")
 	t.Setenv("REDIS_PROVISION_BACKEND", "upstash")
 	t.Setenv("REDIS_PROVISION_HOST", "redis.example:6380")
+	t.Setenv("REDIS_TIER_AWARE_ROUTING_ENABLED", "true")
 	t.Setenv("MONGO_PROVISION_BACKEND", "k8s")
 	t.Setenv("MONGO_ADMIN_URI", "mongodb://admin:pw@m:27017")
 	t.Setenv("MONGO_HOST", "m.example:27017")
@@ -304,6 +312,10 @@ func TestLoad_Overrides(t *testing.T) {
 	if !cfg.K8sDedicatedBackend {
 		t.Errorf("K8sDedicatedBackend with =true; want true")
 	}
+
+	if !cfg.RedisTierAwareRoutingEnabled {
+		t.Errorf("RedisTierAwareRoutingEnabled with =true; want true")
+	}
 }
 
 // TestLoad_K8sDedicatedBackend_NonTrueIsFalse asserts only the exact string
@@ -314,6 +326,19 @@ func TestLoad_K8sDedicatedBackend_NonTrueIsFalse(t *testing.T) {
 		t.Setenv("K8S_DEDICATED_BACKEND", v)
 		if Load().K8sDedicatedBackend {
 			t.Errorf("K8S_DEDICATED_BACKEND=%q → true; want false (only exact \"true\")", v)
+		}
+	}
+}
+
+// TestLoad_RedisTierAwareRouting_NonTrueIsFalse asserts only the exact string
+// "true" enables tier-aware routing — any other value leaves it off
+// (fail-closed), so a typo'd env value can never silently change routing.
+func TestLoad_RedisTierAwareRouting_NonTrueIsFalse(t *testing.T) {
+	clearEnv(t)
+	for _, v := range []string{"1", "TRUE", "yes", "on", "false", "True", "enabled"} {
+		t.Setenv("REDIS_TIER_AWARE_ROUTING_ENABLED", v)
+		if Load().RedisTierAwareRoutingEnabled {
+			t.Errorf("REDIS_TIER_AWARE_ROUTING_ENABLED=%q → true; want false (only exact \"true\")", v)
 		}
 	}
 }

@@ -244,16 +244,30 @@ func (b *K8sBackend) Provision(ctx context.Context, token, tier string, connLimi
 
 	rollback := func(step string, cause error) error {
 		slog.Error("k8s.postgres.provision.rollback", "step", step, "namespace", ns, "error", cause)
-		_ = b.cs.CoreV1().Namespaces().Delete(context.Background(), ns, metav1.DeleteOptions{})
+		// Cleanup uses a FRESH background ctx with its own bound: the incoming ctx
+		// may already be cancelled (often WHY we are rolling back), but the
+		// namespace teardown must still run so a failed provision does not leak a
+		// half-built namespace. Bounded so a wedged apiserver can't pin the goroutine.
+		delCtx, delCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer delCancel()
+		_ = b.cs.CoreV1().Namespaces().Delete(delCtx, ns, metav1.DeleteOptions{})
 		return fmt.Errorf("k8s postgres: %s: %w", step, cause)
 	}
 
-	// Use a fresh background context for the provisioning sequence.
-	// The gRPC request context (ctx) has a short deadline that would cancel
-	// waitPodReady, which can legitimately take 1–3 minutes for pod startup.
+	// Bound the provisioning sequence by BOTH the caller's deadline/cancellation
+	// and a hard 5m server-side ceiling (min of the two). Deriving from the
+	// incoming gRPC ctx — NOT context.Background() — is the pro-provision-hang fix
+	// (mirrors redis/k8s.go provisionContext, #52): when the api caller's deadline
+	// fires or it cancels the RPC, every k8s call / waitPodReady poll returns
+	// promptly instead of blocking up to 5m on a wedged PVC/CSI attach. The api
+	// grants a generous provision deadline (provisionTimeout: 4m anon / 5m pro),
+	// so legitimate 30-90s pod startup is unaffected — only pathological hangs and
+	// early cancellations now fast-fail (mapError classifies the ctx error as a
+	// retryable gRPC status → api soft-deletes + 503s). The ceiling still backstops
+	// a caller that passes no deadline at all.
 	// Carry the teamID value forward so applyNamespace can label the namespace
 	// with instant.dev/owner-team (pentest 2026-05-16 fix).
-	provCtx, provCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	provCtx, provCancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer provCancel()
 	if teamID, ok := ctx.Value(ctxkeys.TeamIDKey).(string); ok && teamID != "" {
 		provCtx = context.WithValue(provCtx, ctxkeys.TeamIDKey, teamID)

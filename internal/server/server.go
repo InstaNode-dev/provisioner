@@ -151,10 +151,29 @@ func New(cfg *config.Config, poolMgr *pool.Manager) *Server {
 		}
 	}
 
+	// Redis shared backend. By default this is exactly the backend selected by
+	// REDIS_PROVISION_BACKEND, used for every non-dedicated tier — unchanged.
+	//
+	// REDIS_TIER_AWARE_ROUTING_ENABLED (default OFF) opts into tier-aware
+	// routing: the configured backend is wrapped in a redis.TierDispatchBackend
+	// that keeps Team on a dedicated pod (the configured backend, typically k8s)
+	// but moves every non-Team tier onto a shared ACL carve so a 5MB cache no
+	// longer costs a whole pod. Off = identical to today; this branch never runs
+	// in prod until an operator flips the flag.
+	redisBackend := redis.NewBackend(cfg.RedisProvisionBackend, cfg.RedisProvisionHost)
+	if cfg.RedisTierAwareRoutingEnabled {
+		sharedCarve := redis.NewSharedCarveBackend(cfg.RedisProvisionHost)
+		redisBackend = redis.NewTierDispatchBackend(sharedCarve, redisBackend)
+		slog.Info("provisioner: redis tier-aware routing ENABLED",
+			"configured_backend", cfg.RedisProvisionBackend,
+			"non_team_route", "shared_carve",
+			"team_route", "dedicated")
+	}
+
 	return NewWithBackends(
 		cfg,
 		postgres.NewBackend(cfg.PostgresProvisionBackend, cfg.PostgresCustomersURL, cfg.PostgresClusterURLs, cfg.NeonAPIKey, cfg.NeonRegionID),
-		redis.NewBackend(cfg.RedisProvisionBackend, cfg.RedisProvisionHost),
+		redisBackend,
 		mongo.NewBackend(cfg.MongoProvisionBackend, cfg.MongoAdminURI, cfg.MongoHost),
 		queue.NewBackend(cfg.QueueProvisionBackend, cfg.NATSHost),
 		minioBackend,

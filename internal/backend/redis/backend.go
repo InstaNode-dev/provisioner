@@ -12,7 +12,7 @@ import (
 // goredisParseURL / goredisNewClient — narrow aliases so we don't import the
 // goredis package directly in the factory body. Keeps the call sites readable
 // and the dependency obvious in this file alone.
-func goredisParseURL(s string) (*goredis.Options, error)   { return goredis.ParseURL(s) }
+func goredisParseURL(s string) (*goredis.Options, error)  { return goredis.ParseURL(s) }
 func goredisNewClient(o *goredis.Options) *goredis.Client { return goredis.NewClient(o) }
 
 func k8sEnv(key, fallback string) string {
@@ -124,6 +124,13 @@ func NewBackend(backendType, redisHost string) Backend {
 	default:
 		return newLocalBackend(redisHost)
 	}
+}
+
+// NewSharedCarveBackend creates a LocalBackend: an ACL user + key-prefix carve
+// on a SHARED Redis instance (many tenants per pod). It is the non-Team side of
+// tier-aware routing (see TierDispatchBackend). redisHost is "host:port".
+func NewSharedCarveBackend(redisHost string) Backend {
+	return newLocalBackend(redisHost)
 }
 
 // NewDedicatedBackend creates a DedicatedProvider for Team-tier Redis provisioning.

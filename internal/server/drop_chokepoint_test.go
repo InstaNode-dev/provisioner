@@ -19,6 +19,7 @@ import (
 	provisionerv1 "instant.dev/proto/provisioner/v1"
 
 	"instant.dev/provisioner/internal/circuit"
+	"instant.dev/provisioner/internal/dropguard"
 )
 
 // freshBreaker returns a closed breaker with a high threshold so a single
@@ -99,6 +100,95 @@ func TestGuardedDrop_BreakerOpen_DoesNotInvokeBackend_AndRecordsBreakerOpen(t *t
 	after := testutil.ToFloat64(dropTotal.WithLabelValues("RESOURCE_TYPE_POSTGRES", "shared", "breaker_open"))
 	if after != before+1 {
 		t.Fatalf("breaker_open counter: got %v want %v", after, before+1)
+	}
+}
+
+func TestGuardedDrop_RefusedToken_DoesNotInvokeBackend_AndRecordsRefused(t *testing.T) {
+	s := &Server{breakers: circuit.NewBreakers()}
+
+	cases := []struct {
+		name string
+		req  *provisionerv1.DeprovisionRequest
+	}{
+		{"reserved system token", dropReq("postgres")},
+		{"reserved cluster db as token", dropReq("instant_customers")},
+		{"admin role as token", dropReq("instanode_admin")},
+		{"empty token, no pool marker", &provisionerv1.DeprovisionRequest{
+			Token:              "",
+			ProviderResourceId: "local:0",
+			ResourceType:       commonv1.ResourceType_RESOURCE_TYPE_POSTGRES,
+			RequestId:          "req-test",
+		}},
+		{"sql metacharacters", dropReq(`x"; DROP DATABASE "postgres`)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			before := testutil.ToFloat64(dropTotal.WithLabelValues("RESOURCE_TYPE_POSTGRES", "shared", dropOutcomeRefused))
+			called := false
+			err := s.guardedDrop(context.Background(), tc.req, dropBackendShared, freshBreaker(), func() error {
+				called = true
+				return nil
+			})
+			if !errors.Is(err, dropguard.ErrRefused) {
+				t.Fatalf("expected dropguard.ErrRefused, got %v", err)
+			}
+			if called {
+				t.Fatal("backend fn must NOT be invoked for a refused drop target")
+			}
+			after := testutil.ToFloat64(dropTotal.WithLabelValues("RESOURCE_TYPE_POSTGRES", "shared", dropOutcomeRefused))
+			if after != before+1 {
+				t.Fatalf("refused counter: got %v want %v", after, before+1)
+			}
+		})
+	}
+}
+
+func TestGuardedDrop_PoolTokenFromPRID_IsValidated(t *testing.T) {
+	// A request whose provider_resource_id carries a pool-token marker resolves
+	// THAT token for naming — the guard must validate the resolved token, not
+	// the request token. A reserved pool-resolved token is refused even when
+	// the request token looks fine.
+	s := &Server{breakers: circuit.NewBreakers()}
+	req := &provisionerv1.DeprovisionRequest{
+		Token:              "96edf9eed8ed42929036b63298ec5b2b",
+		ProviderResourceId: "local:0;pooltok:instant_customers",
+		ResourceType:       commonv1.ResourceType_RESOURCE_TYPE_POSTGRES,
+		RequestId:          "req-test",
+	}
+	called := false
+	err := s.guardedDrop(context.Background(), req, dropBackendShared, freshBreaker(), func() error {
+		called = true
+		return nil
+	})
+	if !errors.Is(err, dropguard.ErrRefused) {
+		t.Fatalf("expected dropguard.ErrRefused for reserved pool-resolved token, got %v", err)
+	}
+	if called {
+		t.Fatal("backend fn must NOT be invoked for a refused pool-resolved token")
+	}
+}
+
+func TestGuardedDrop_LegitimateForms_StillExecute(t *testing.T) {
+	// Regression guard for the auto-deploy invariant: every token shape a real
+	// flow produces (uuid, dashless hex, pool token, e2e cohort) must still
+	// reach the backend.
+	s := &Server{breakers: circuit.NewBreakers()}
+	for _, tok := range []string{
+		"96edf9ee-d8ed-4292-9036-b63298ec5b2b",
+		"96edf9eed8ed42929036b63298ec5b2b",
+		"pool-96edf9ee-d8ed-4292-9036-b63298ec5b2b",
+		"e2e-tok",
+	} {
+		called := false
+		if err := s.guardedDrop(context.Background(), dropReq(tok), dropBackendShared, freshBreaker(), func() error {
+			called = true
+			return nil
+		}); err != nil {
+			t.Fatalf("guardedDrop(%q): unexpected error: %v", tok, err)
+		}
+		if !called {
+			t.Fatalf("guardedDrop(%q): backend fn was not invoked", tok)
+		}
 	}
 }
 

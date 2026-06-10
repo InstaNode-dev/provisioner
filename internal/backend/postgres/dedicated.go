@@ -330,6 +330,13 @@ func (p *DedicatedProvider) deprovisionLocal(ctx context.Context, token string) 
 	dbName := "dedicated_db_" + token
 	username := "dedicated_usr_" + token
 
+	// Name-convention guard (truehomie hardening, task D3): validate the FINAL
+	// constructed identifiers before the destructive statements run. Refusal is
+	// an error — a wrong-name bug must never reach DROP.
+	if guardErr := validateDropTargets("db.dedicated.deprovisionLocal", token, dbName, username); guardErr != nil {
+		return fmt.Errorf("db.dedicated.deprovisionLocal: %w", guardErr)
+	}
+
 	adminDSN := p.localAdminDSN()
 	conn, err := pgxConnect(ctx, adminDSN)
 	if err != nil {

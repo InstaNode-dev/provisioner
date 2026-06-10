@@ -252,6 +252,14 @@ func (b *LocalBackend) Provision(ctx context.Context, token, tier string, connLi
 // even if the incoming request context is on the verge of its deadline. Both
 // DROPs use IF EXISTS so partial states (db created, user not) are safe.
 func cleanupProvisionPartial(conn pgConn, dbName, username string) {
+	// Name-convention guard (truehomie hardening, task D3): this rollback path
+	// does NOT pass through the server's guardedDrop chokepoint, so it
+	// validates its own targets. A wrong-name bug must SKIP the drops, never
+	// execute them — the cost of a refusal is a leaked just-created db, not a
+	// destroyed customer one.
+	if validateDropTargets("db.local.cleanupProvisionPartial", "", dbName, username) != nil {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if _, err := conn.Exec(ctx, fmt.Sprintf("DROP DATABASE IF EXISTS %q WITH (FORCE)", dbName)); err != nil {
@@ -306,6 +314,14 @@ func (b *LocalBackend) Deprovision(ctx context.Context, token, providerResourceI
 	namingToken := poolident.NamingToken(token, providerResourceID)
 	dbName := dbNamePrefix + namingToken
 	username := userNamePrefix + namingToken
+
+	// Name-convention guard (truehomie hardening, task D3): validate the FINAL
+	// constructed identifiers right before the destructive statements run, so a
+	// future refactor that builds them differently is still covered. Refusal is
+	// an error (the caller's deprovision fails loudly) — never a wrong drop.
+	if guardErr := validateDropTargets("db.local.Deprovision", token, dbName, username); guardErr != nil {
+		return fmt.Errorf("db.local.Deprovision: %w", guardErr)
+	}
 
 	adminURL := b.router.AdminURLForResource(poolident.BasePRID(providerResourceID))
 	conn, err := pgxConnect(ctx, adminURL)

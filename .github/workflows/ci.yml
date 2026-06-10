@@ -55,6 +55,16 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # Migration-safety gate (truehomie-db DROP hardening, task D3): any
+      # destructive DDL (DROP TABLE/DATABASE/SCHEMA/COLUMN/ROLE/USER, TRUNCATE,
+      # DELETE FROM without WHERE) in a migrations/*.sql file fails CI unless
+      # the file carries an explicit `-- destructive: acknowledged <reason>`
+      # marker. Self-test runs first so a regression in the gate itself reds CI.
+      - name: Migration safety gate
+        run: |
+          bash scripts/check-migration-safety.sh --self-test
+          bash scripts/check-migration-safety.sh
+
       - name: Checkout proto sibling (replace ../proto)
         uses: actions/checkout@v6
         with:

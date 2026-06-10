@@ -20,6 +20,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 
+	"instant.dev/provisioner/internal/dropguard"
 	"instant.dev/provisioner/internal/poolident"
 )
 
@@ -196,6 +197,25 @@ func (b *LocalBackend) StorageBytes(ctx context.Context, token, providerResource
 // Deprovision drops the user and database for the given token.
 // Drops user first, then drops the database.
 func (b *LocalBackend) Deprovision(ctx context.Context, token, providerResourceID string) error {
+	// P0-2: a pool-claimed database/user are named from the pool token, not
+	// the request token. Resolve the canonical naming token from
+	// provider_resource_id so dropUser/dropDatabase target the real infra
+	// instead of no-op'ing on db_<real-token>, which would leak it forever.
+	namingToken := poolident.NamingToken(token, providerResourceID)
+
+	// Name-convention guard (truehomie hardening, task D3): every candidate
+	// user/database name below derives from this token; refuse the whole
+	// deprovision — before even connecting — when the token is empty,
+	// malformed, or a reserved system identifier. Per-candidate names are
+	// additionally validated in the loops so a future naming.go refactor
+	// stays covered.
+	if guardErr := dropguard.CheckNamingToken(namingToken); guardErr != nil {
+		slog.Error("provisioner.drop.refused",
+			"event", "provisioner.drop.refused", "site", "nosql.Deprovision",
+			"token", token, "naming_token", namingToken, "error", guardErr)
+		return fmt.Errorf("nosql.Deprovision: %w", guardErr)
+	}
+
 	client, err := b.connect(ctx, options.Client().ApplyURI(b.adminURI).
 		SetServerSelectionTimeout(connectTimeout))
 	if err != nil {
@@ -207,18 +227,18 @@ func (b *LocalBackend) Deprovision(ctx context.Context, token, providerResourceI
 		}
 	}()
 
-	// P0-2: a pool-claimed database/user are named from the pool token, not
-	// the request token. Resolve the canonical naming token from
-	// provider_resource_id so dropUser/dropDatabase target the real infra
-	// instead of no-op'ing on db_<real-token>, which would leak it forever.
-	namingToken := poolident.NamingToken(token, providerResourceID)
-
 	// Drop every candidate user. The resource was provisioned under exactly
 	// one scheme, but we cannot know which without a stored name, so we drop
 	// the canonical name and every legacy form. dropUser on a non-existent
 	// user is harmless (logged, non-fatal).
 	adminDB := client.Database("admin")
 	for _, username := range legacyMongoUserNames(namingToken) {
+		if guardErr := dropguard.CheckUserName(username); guardErr != nil {
+			slog.Error("provisioner.drop.refused",
+				"event", "provisioner.drop.refused", "site", "nosql.Deprovision",
+				"token", token, "user", username, "error", guardErr)
+			continue
+		}
 		if r := adminDB.RunCommand(ctx, bson.D{{Key: "dropUser", Value: username}}); r.Err() != nil {
 			slog.Debug("nosql.Deprovision: dropUser miss (continuing)", "token", token, "user", username, "error", r.Err())
 		}
@@ -229,6 +249,15 @@ func (b *LocalBackend) Deprovision(ctx context.Context, token, providerResourceI
 	// the canonical name still propagates.
 	canonicalDB := mongoDBName(namingToken)
 	for _, dbName := range legacyMongoDBNames(namingToken) {
+		if guardErr := dropguard.CheckDatabaseName(dbName); guardErr != nil {
+			slog.Error("provisioner.drop.refused",
+				"event", "provisioner.drop.refused", "site", "nosql.Deprovision",
+				"token", token, "db", dbName, "error", guardErr)
+			if dbName == canonicalDB {
+				return fmt.Errorf("nosql.Deprovision: %w", guardErr)
+			}
+			continue
+		}
 		if dropErr := client.Database(dbName).Drop(ctx); dropErr != nil {
 			if dbName == canonicalDB {
 				return fmt.Errorf("nosql.Deprovision: drop database %s: %w", dbName, dropErr)

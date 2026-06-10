@@ -18,6 +18,8 @@ import (
 	"log/slog"
 
 	goredis "github.com/redis/go-redis/v9"
+
+	"instant.dev/provisioner/internal/dropguard"
 )
 
 // DedicatedProvider provisions a dedicated Redis instance.
@@ -228,6 +230,14 @@ func (p *DedicatedProvider) deprovisionLocal(ctx context.Context, token, provide
 		probes = append(probes, legacy)
 	}
 	for _, username := range probes {
+		// Name-convention guard (truehomie hardening, task D3): refuse a
+		// DELUSER of any non-tenant-shaped name (e.g. "default", admin users).
+		if guardErr := dropguard.CheckUserName(username); guardErr != nil {
+			slog.Error("provisioner.drop.refused",
+				"event", "provisioner.drop.refused", "site", "cache.dedicated.deprovisionLocal",
+				"token", token, "user", username, "error", guardErr)
+			continue
+		}
 		if err := p.rdb.Do(ctx, "ACL", "DELUSER", username).Err(); err != nil {
 			// Best-effort — user may not exist.
 			slog.Warn("cache.dedicated.deprovisionLocal: ACL DELUSER (non-fatal)",

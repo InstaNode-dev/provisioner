@@ -25,6 +25,7 @@ import (
 	"instant.dev/provisioner/internal/backend/postgres"
 	"instant.dev/provisioner/internal/backend/queue"
 	"instant.dev/provisioner/internal/backend/redis"
+	"instant.dev/provisioner/internal/dropguard"
 )
 
 // Item is a pre-provisioned resource claimed from the pool.
@@ -416,6 +417,30 @@ func (m *Manager) reportStuckAssigned(ctx context.Context) {
 // backends derive the real db_/usr_/keyspace names from the naming token, so
 // passing the pool_token here targets exactly the infra the pool created.
 func (m *Manager) deprovisionBacking(ctx context.Context, resourceType, token, providerResourceID string) error {
+	// Name-convention guard + DDL-audit (truehomie hardening, task D3). The
+	// pool reaper is the ONE customer-infra drop dispatch that does not pass
+	// through server.guardedDrop (it has no gRPC request), so it carries its
+	// own copy of the chokepoint contract: validate the naming token, then
+	// emit the same `provisioner.drop` audit event BEFORE the backend executes
+	// — the NR DDL-trap alert correlates shared-cluster DROP statements
+	// against these events, and an un-logged drop path would page as
+	// unsanctioned.
+	if guardErr := dropguard.CheckNamingToken(token); guardErr != nil {
+		slog.Error("provisioner.drop.refused",
+			"event", "provisioner.drop.refused", "site", "pool.deprovisionBacking",
+			"token", token, "provider_resource_id", providerResourceID,
+			"resource_type", poolResourceTypeProto(resourceType), "error", guardErr)
+		return fmt.Errorf("pool.deprovisionBacking: %w", guardErr)
+	}
+	slog.Info("provisioner.drop",
+		"event", "provisioner.drop",
+		"token", token,
+		"provider_resource_id", providerResourceID,
+		"resource_type", poolResourceTypeProto(resourceType),
+		"backend", "shared",
+		"request_id", "",
+		"caller", "pool_reaper",
+	)
 	switch resourceType {
 	case "postgres":
 		return m.postgresB.Deprovision(ctx, token, providerResourceID)
@@ -720,3 +745,22 @@ func (m *Manager) migrate(ctx context.Context) error {
 
 // Keep rand imported for the uuid package's internal use.
 var _ = rand.Reader
+
+// poolResourceTypeProto maps a pool_items.resource_type value to the proto
+// enum string used by server.guardedDrop's audit events, so one NR query
+// (resource_type = 'RESOURCE_TYPE_POSTGRES' …) covers RPC drops and pool-reap
+// drops alike.
+func poolResourceTypeProto(resourceType string) string {
+	switch resourceType {
+	case "postgres":
+		return "RESOURCE_TYPE_POSTGRES"
+	case "redis":
+		return "RESOURCE_TYPE_REDIS"
+	case "mongodb":
+		return "RESOURCE_TYPE_MONGODB"
+	case "queue":
+		return "RESOURCE_TYPE_QUEUE"
+	default:
+		return "RESOURCE_TYPE_UNSPECIFIED"
+	}
+}

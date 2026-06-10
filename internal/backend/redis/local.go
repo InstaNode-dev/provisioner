@@ -15,6 +15,7 @@ import (
 
 	goredis "github.com/redis/go-redis/v9"
 
+	"instant.dev/provisioner/internal/dropguard"
 	"instant.dev/provisioner/internal/poolident"
 )
 
@@ -278,6 +279,14 @@ func (b *LocalBackend) Deprovision(ctx context.Context, token, providerResourceI
 	// exist or ACL may be disabled).
 	for _, username := range []string{aclUsername(namingToken), legacyACLUsername(namingToken)} {
 		if username == "" {
+			continue
+		}
+		// Name-convention guard (truehomie hardening, task D3): never DELUSER a
+		// non-tenant-shaped name — DELUSER "default" would brick the shared pod.
+		if guardErr := dropguard.CheckUserName(username); guardErr != nil {
+			slog.Error("provisioner.drop.refused",
+				"event", "provisioner.drop.refused", "site", "cache.local.Deprovision",
+				"token", token, "user", username, "error", guardErr)
 			continue
 		}
 		b.rdb.Do(ctx, "ACL", "DELUSER", username)

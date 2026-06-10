@@ -47,11 +47,13 @@ import (
 	provisionerv1 "instant.dev/proto/provisioner/v1"
 
 	"instant.dev/provisioner/internal/circuit"
+	"instant.dev/provisioner/internal/dropguard"
+	"instant.dev/provisioner/internal/poolident"
 )
 
 // dropTotal counts every customer-data drop the provisioner performs through the
 // sanctioned chokepoint, labelled by resource_type, backend (shared|dedicated),
-// and outcome (ok|error|breaker_open). A spike in this counter is the alertable
+// and outcome (ok|error|breaker_open|refused). A spike in this counter is the alertable
 // signal that drops are happening at an abnormal rate (the truehomie incident
 // class). Eager-registered (NewCounterVec via promauto on the default registry)
 // so the series exists at /metrics before the first drop — but only label
@@ -70,6 +72,12 @@ const (
 	dropBackendShared    dropBackend = "shared"
 	dropBackendDedicated dropBackend = "dedicated"
 )
+
+// dropOutcomeRefused is the dropTotal outcome label for a drop the
+// name-convention guard refused before any backend was invoked. A non-zero
+// refused count is ALWAYS a bug or an attack: some caller asked the
+// provisioner to destroy a target that no legitimate flow can name.
+const dropOutcomeRefused = "refused"
 
 // callerFromContext returns a best-effort identifier for the gRPC peer that
 // issued the request (e.g. "10.109.3.201:54422"), or "unknown" when the peer is
@@ -99,6 +107,30 @@ func (s *Server) guardedDrop(
 ) error {
 	resType := req.ResourceType.String()
 	caller := callerFromContext(ctx)
+
+	// Name-convention guard (truehomie hardening, task D3): the canonical
+	// naming token derives EVERY identifier a backend destroys (db_<token>,
+	// usr_<token>, keyspace <token>:*, namespace instant-customer-<token>).
+	// Refuse the drop outright when the token is empty, malformed, or a
+	// reserved system identifier — a bug constructing a wrong target must die
+	// here, BEFORE any backend executes. Legitimate deprovision flows are
+	// unaffected: every platform-issued token form passes dropguard.
+	namingToken := poolident.NamingToken(req.Token, req.ProviderResourceId)
+	if guardErr := dropguard.CheckNamingToken(namingToken); guardErr != nil {
+		dropTotal.WithLabelValues(resType, string(backend), dropOutcomeRefused).Inc()
+		slog.Error("provisioner.drop.refused",
+			"event", "provisioner.drop.refused",
+			"token", req.Token,
+			"provider_resource_id", req.ProviderResourceId,
+			"naming_token", namingToken,
+			"resource_type", resType,
+			"backend", string(backend),
+			"request_id", req.RequestId,
+			"caller", caller,
+			"error", guardErr,
+		)
+		return guardErr
+	}
 
 	// DDL-audit: the always-on, provisioner-side record of the drop. This is the
 	// in-app equivalent of the cluster's log_statement='ddl' trap.

@@ -26,24 +26,24 @@ func TestCheckNamingToken_AcceptsEveryLegitimateForm(t *testing.T) {
 
 func TestCheckNamingToken_RefusesDangerousForms(t *testing.T) {
 	invalid := []string{
-		"",                      // empty — would derive db_ / a *:* scan prefix
-		"postgres",              // system database
-		"template0",             // system database
-		"template1",             // system database
-		"instant_customers",     // the shared customer cluster's own database
-		"instant_platform",      // the platform database
-		"INSTANODE_ADMIN",       // admin role, case-insensitive
-		"instant_cust",          // provisioner admin role
-		"doadmin",               // DO managed-PG admin
-		"admin",                 // mongo system db / generic admin
-		"default",               // redis ACL admin user
-		"root",                  // generic admin
-		"db_*",                  // wildcard
-		"tok; DROP DATABASE x",  // SQL metacharacters
-		"a b",                   // whitespace
-		`a"b`,                   // quote
-		"%",                     // redis SCAN wildcard material
-		strings.Repeat("a", 64), // over-long
+		"",                       // empty — would derive db_ / a *:* scan prefix
+		"postgres",               // system database
+		"template0",              // system database
+		"template1",              // system database
+		"instant_customers",      // the shared customer cluster's own database
+		"instant_platform",       // the platform database
+		"INSTANODE_ADMIN",        // admin role, case-insensitive
+		"instant_cust",           // provisioner admin role
+		"doadmin",                // DO managed-PG admin
+		"admin",                  // mongo system db / generic admin
+		"default",                // redis ACL admin user
+		"root",                   // generic admin
+		"db_*",                   // wildcard
+		"tok; DROP DATABASE x",   // SQL metacharacters
+		"a b",                    // whitespace
+		`a"b`,                    // quote
+		"%",                      // redis SCAN wildcard material
+		strings.Repeat("a", 129), // over-long (absurdity bound)
 	}
 	for _, tok := range invalid {
 		err := CheckNamingToken(tok)
@@ -92,7 +92,7 @@ func TestCheckDatabaseName_RefusesSystemAndMisshapenNames(t *testing.T) {
 		"96edf9eed8ed42929036b63298ec5b2b", // missing prefix entirely
 		"customers",                        // arbitrary non-tenant name
 		`db_x"; DROP DATABASE "postgres`,   // injection-shaped
-		"db_" + strings.Repeat("a", 64),    // over-long
+		"db_" + strings.Repeat("a", 129),   // over-long (absurdity bound)
 		"dedicated_db_",                    // dedicated prefix, empty token
 	}
 	for _, name := range invalid {
@@ -139,7 +139,7 @@ func TestCheckUserName_RefusesSystemAndMisshapenNames(t *testing.T) {
 		"usr_instanode_admin",
 		"96edf9eed8ed42929036b63298ec5b2b", // missing prefix
 		"usr_a b",
-		"usr_" + strings.Repeat("a", 64),
+		"usr_" + strings.Repeat("a", 129),
 		"dedicated_usr_",
 	}
 	for _, name := range invalid {

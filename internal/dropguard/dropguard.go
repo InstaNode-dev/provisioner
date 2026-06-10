@@ -46,9 +46,15 @@ import (
 // errors.Is() a dropguard refusal regardless of the message text.
 var ErrRefused = errors.New("dropguard: destructive target refused")
 
-// maxIdentifierLen bounds every validated identifier. Postgres truncates
-// identifiers at 63 bytes; nothing legitimate is longer.
-const maxIdentifierLen = 63
+// maxIdentifierLen bounds every validated identifier. This is an ABSURDITY
+// bound only, deliberately looser than Postgres's own 63-byte identifier
+// truncation: Postgres truncates a long name CONSISTENTLY on CREATE and DROP
+// (so long-token resources — e.g. the live-cluster CI suite's
+// tok<nano>_<TestName> tokens — round-trip correctly), and Mongo allows
+// 64-byte database names. Refusing at 63 would wedge those legitimate
+// deprovisions; only a name far beyond anything any naming scheme produces is
+// refused.
+const maxIdentifierLen = 128
 
 // reservedTokens are naming tokens that must never be destroyed even when the
 // charset would otherwise allow them (e.g. a bug that flows a database or role

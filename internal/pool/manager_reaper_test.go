@@ -322,13 +322,26 @@ func (r *fakeRows) Scan(dest ...any) error {
 	if r.scanErrOn != 0 && r.delivered == r.scanErrOn {
 		return r.scanErr
 	}
-	// Populate string destinations with a placeholder so a non-error Scan in
-	// reportStuckAssigned (resource_type, count) does not panic. count is an int
-	// destination there; tolerate both.
+	// Populate string destinations positionally. reapFailed scans
+	// (id, resource_type, provider_resource_id, pool_token): resource_type must
+	// stay "postgres" so the dispatch routes to the tracked backend, but the
+	// pool_token (4th string) must be a VALID pool-token shape — dropguard
+	// (truehomie hardening, task D3) refuses "postgres" as a naming token, which
+	// would short-circuit deprovisionBacking before the backend is invoked.
+	// reportStuckAssigned scans (resource_type, count); count is an int.
+	sIdx := 0
 	for _, d := range dest {
 		switch v := d.(type) {
 		case *string:
-			*v = "postgres"
+			switch sIdx {
+			case 2:
+				*v = "local:0"
+			case 3:
+				*v = "pool-96edf9ee-d8ed-4292-9036-b63298ec5b2b"
+			default:
+				*v = "postgres"
+			}
+			sIdx++
 		case *int:
 			*v = 0
 		}

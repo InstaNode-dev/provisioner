@@ -221,7 +221,7 @@ jobs:
         # package execution so the many DB-touching packages don't open
         # connections concurrently against the shared service containers.
         run: go test ./... -p 1 -coverprofile=coverage.out -covermode=atomic
-      - uses: codecov/codecov-action@v6
+      - uses: codecov/codecov-action@v7
         with:
           files: provisioner/coverage.out
           flags: provisioner

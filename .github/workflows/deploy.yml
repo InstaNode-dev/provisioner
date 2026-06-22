@@ -63,12 +63,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout provisioner (this repo) into ./provisioner
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           path: provisioner
 
       - name: Checkout common sibling into ./common
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: ${{ vars.COMMON_REPO || format('{0}/common', github.repository_owner) }}
           # 2026-05-15: GITHUB_TOKEN is scoped to THIS repo only and 404s
@@ -78,7 +78,7 @@ jobs:
           path: common
 
       - name: Checkout proto sibling into ./proto
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: ${{ vars.PROTO_REPO || format('{0}/proto', github.repository_owner) }}
           token: ${{ secrets.REPO_ACCESS_TOKEN || secrets.GITHUB_TOKEN }}

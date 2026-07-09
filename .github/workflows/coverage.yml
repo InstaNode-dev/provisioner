@@ -151,17 +151,17 @@ jobs:
       TEST_MINIO_BUCKET: itest-bucket
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           path: provisioner
           # Full history so diff-cover can resolve origin/<base_ref>.
           fetch-depth: 0
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           repository: InstaNode-dev/common
           path: common
         continue-on-error: true
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           repository: InstaNode-dev/proto
           path: proto

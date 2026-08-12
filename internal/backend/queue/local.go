@@ -12,8 +12,71 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"time"
 )
+
+// natsClientPort is the NATS client-protocol port embedded in customer URLs.
+// Matches the port the k8s backend hardcodes in its own customer URLs (k8s.go)
+// and the port the nats-proxy listens on.
+const natsClientPort = "4222"
+
+// buildNATSURL constructs the user-facing NATS URL. Mirrors
+// postgres.buildDBURL / mongo.buildMongoURL: the public host wins when
+// configured, otherwise clusterHost — the in-cluster admin address, which is
+// only resolvable from inside the cluster. clusterHost carries no port (config
+// NATS_HOST is a bare hostname), so the client port is appended.
+//
+// This is the fix for the leak of internal cluster DNS into customer
+// connection strings: before it, /queue/new handed out
+// nats://nats.instant-data.svc.cluster.local:4222 on the shared backend,
+// because the public host was applied only in the "k8s" branch of NewBackend
+// and the cluster runs QUEUE_PROVISION_BACKEND=local.
+func buildNATSURL(clusterHost string) string {
+	host := publicHostPort()
+	if host == "" {
+		host = clusterHost + ":" + natsClientPort
+	}
+	return "nats://" + host
+}
+
+// publicHostPort returns the host:port to embed in user-facing NATS URLs, or ""
+// when no public host is configured (the caller then falls back to the
+// cluster-internal natsHost).
+//
+// Identical mechanism to postgres.publicHostPort (backend/postgres/local.go),
+// redis.publicHostPort (backend/redis/local.go) and mongo.publicHostPort
+// (backend/mongo/mongo.go) — env-resolved at Provision time so the shared/local
+// backend and the dedicated k8s backend agree on the customer-facing hostname.
+//
+// Resolution order:
+//  1. NATS_PUBLIC_HOST_PORT (e.g. "nats.instanode.dev:4222")
+//  2. NATS_PUBLIC_HOST + NATS_PUBLIC_PORT (port defaults to 4222)
+//  3. K8S_NATS_PUBLIC_HOST + NATS_PUBLIC_PORT — the env the k8s branch of
+//     NewBackend already reads, so a cluster that already advertises
+//     nats.instanode.dev for dedicated pods advertises it for shared ones too.
+//  4. "" — caller falls back to the in-cluster natsHost.
+//
+// Deliberately NO built-in default (the k8s branch defaults to
+// "nats.instanode.dev"): a dev box running the shared backend against localhost
+// must keep emitting localhost, not a production hostname.
+func publicHostPort() string {
+	if hp := os.Getenv("NATS_PUBLIC_HOST_PORT"); hp != "" {
+		return hp
+	}
+	host := os.Getenv("NATS_PUBLIC_HOST")
+	if host == "" {
+		host = os.Getenv("K8S_NATS_PUBLIC_HOST")
+	}
+	if host == "" {
+		return ""
+	}
+	port := os.Getenv("NATS_PUBLIC_PORT")
+	if port == "" {
+		port = natsClientPort
+	}
+	return host + ":" + port
+}
 
 // LocalBackend provisions NATS on the shared cluster.
 type LocalBackend struct {
@@ -63,7 +126,10 @@ func (b *LocalBackend) Provision(ctx context.Context, token, tier string) (*Cred
 
 	slog.Info("queue.local.provisioned", "token", token, "subject_prefix", prefix)
 	return &Credentials{
-		URL:           fmt.Sprintf("nats://%s:4222", b.natsHost),
+		// The health check above deliberately keeps using b.natsHost: the
+		// monitor port is cluster-internal. Only the customer-facing URL is
+		// rewritten to the public host.
+		URL:           buildNATSURL(b.natsHost),
 		SubjectPrefix: prefix,
 	}, nil
 }

@@ -67,6 +67,10 @@ The test suite uses mock backends for almost all tests, so `go test ./...` passe
 | `CUSTOMER_REDIS_URL` | Admin URL for redis-provision | `redis://redis-provision.instant-data.svc.cluster.local:6379` |
 | `CUSTOMER_MONGO_URL` | Admin URL for mongodb | `mongodb://root:root@mongodb.instant-data.svc.cluster.local:27017` |
 | `POSTGRES_CLUSTER_URLS` | Comma-separated list of admin DSNs (multi-cluster) | unset |
+| `REDIS_PROVISION_URL` | **Credentialed** admin URL for the shared redis-provision pool: `redis://[user]:password@host:port[/db]`. Required when the pool runs with `--requirepass` — without it `ACL SETUSER` fails and `/cache/new` 503s. Supersedes `REDIS_PROVISION_HOST`; a malformed value logs an error and falls back to it | unset |
+| `REDIS_PROVISION_HOST` | Bare `host:port` admin address for the shared Redis pool. Sends no AUTH — legacy / unauthenticated pools only | `localhost:6379` |
+| `MONGO_PUBLIC_HOST_PORT`, `MONGO_PUBLIC_HOST` (+ `MONGO_PUBLIC_PORT`) | Customer-facing host embedded in `/nosql/new` URLs on the shared backend. Falls back to `K8S_MONGO_PUBLIC_HOST`, then to the in-cluster admin host | unset (port `27017`) |
+| `NATS_PUBLIC_HOST_PORT`, `NATS_PUBLIC_HOST` (+ `NATS_PUBLIC_PORT`) | Customer-facing host embedded in `/queue/new` URLs on the shared backend. Falls back to `K8S_NATS_PUBLIC_HOST`, then to the in-cluster admin host | unset (port `4222`) |
 | `K8S_DEDICATED_BACKEND` | Enable k8s dedicated-pod backend for team / growth tier | `false` |
 | `K8S_EXTERNAL_HOST` | External hostname for dedicated k8s services | unset |
 | `K8S_STORAGE_CLASS` | Storage class for dedicated PVCs | `local-path` |

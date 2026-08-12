@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"regexp"
 
 	goredis "github.com/redis/go-redis/v9"
 
@@ -95,17 +96,71 @@ type LocalBackend struct {
 	redisHost string          // Redis host for building connection strings
 }
 
-// newLocalBackend creates a LocalBackend connecting to the given redisHost.
-// redisHost format: "host:port" (e.g. "localhost:6379").
-func newLocalBackend(redisHost string) *LocalBackend {
+// newLocalBackend creates a LocalBackend for the shared redis-provision pool.
+//
+// adminURL — REDIS_PROVISION_URL, "redis://[user]:password@host:port[/db]".
+// When set and parseable it becomes the admin connection. It is the ONLY way to
+// authenticate against a redis-provision pod started with --requirepass: the
+// bare-Addr client below sends no AUTH, so the first ACL SETUSER comes back
+// "ERR Protocol error: unauthenticated multibulk length" and Provision fails
+// closed (503 on /cache/new) rather than handing out a credential-less shared
+// URL. Mirrors mongo's (adminURI, mongoHost) split — the credentialed admin
+// endpoint and the customer-facing host are separate inputs.
+//
+// redisHost — REDIS_PROVISION_HOST, "host:port". The legacy, credential-less
+// form; still the fallback when adminURL is unset, so an unauthenticated pool
+// (dev, or prod before the --requirepass hardening) behaves exactly as before.
+//
+// The host recorded on the backend is always a bare host:port — opts.Addr, never
+// adminURL. Embedding adminURL would leak the admin password into the customer's
+// connection string through the Provision host fallback below.
+func newLocalBackend(adminURL, redisHost string) *LocalBackend {
+	if opts := parseAdminURL(adminURL); opts != nil {
+		return &LocalBackend{rdb: goredisNewClient(opts), redisHost: opts.Addr}
+	}
 	if redisHost == "" {
 		redisHost = defaultRedisAddr
 	}
-	rdb := goredis.NewClient(&goredis.Options{
+	rdb := goredisNewClient(&goredis.Options{
 		Addr: redisHost,
 	})
-	// Extract just the host portion for URL building (strip port if needed for URL).
 	return &LocalBackend{rdb: rdb, redisHost: redisHost}
+}
+
+// parseAdminURL parses REDIS_PROVISION_URL into go-redis client options.
+// Returns nil when the URL is unset (the normal legacy case) or malformed —
+// both leave the caller on the REDIS_PROVISION_HOST Addr fallback.
+//
+// A malformed URL is logged, not returned as an error: the factory chain
+// (NewBackend → newLocalBackend) has no error channel, and refusing to start
+// the provisioner over one typo is a worse outage than the 503 the (still
+// fail-closed) Provision path produces. The log line is the operator's only
+// signal, so it must be unmissable — and it must NOT contain the password,
+// which net/url parse errors echo back verbatim.
+func parseAdminURL(adminURL string) *goredis.Options {
+	if adminURL == "" {
+		return nil
+	}
+	opts, err := goredisParseURL(adminURL)
+	if err != nil {
+		slog.Error("cache.local: REDIS_PROVISION_URL is malformed — falling back to REDIS_PROVISION_HOST with NO credentials; ACL SETUSER will fail on a password-protected pool",
+			"error", redactCredentials(err.Error()))
+		return nil
+	}
+	return opts
+}
+
+// urlCredentialsRe matches the "user:password@" userinfo section of a URL
+// embedded in an arbitrary string. Only userinfo that carries a password (i.e.
+// contains ":") is matched — a bare "//user@host" leaks nothing worth hiding.
+var urlCredentialsRe = regexp.MustCompile(`(//)[^/@\s]*:[^/@\s]*@`)
+
+// redactCredentials strips URL userinfo from a string before it reaches a log
+// sink. net/url's *url.Error stringifies as `parse "<the whole URL>": …`, so
+// logging a ParseURL failure verbatim would publish the shared Redis admin
+// password to stdout — the exact secret the --requirepass hardening added.
+func redactCredentials(s string) string {
+	return urlCredentialsRe.ReplaceAllString(s, "$1***:***@")
 }
 
 // Provision creates a namespaced Redis "database" for the given token.

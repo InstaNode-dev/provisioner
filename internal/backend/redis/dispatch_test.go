@@ -339,7 +339,7 @@ func TestDispatchImplementsRegrader(t *testing.T) {
 // constructor returns a LocalBackend (ACL carve on a shared Redis) — the
 // non-Team side of tier-aware routing.
 func TestNewSharedCarveBackend_IsLocalBackend(t *testing.T) {
-	b := NewSharedCarveBackend("localhost:6379")
+	b := NewSharedCarveBackend("", "localhost:6379")
 	if _, ok := b.(*LocalBackend); !ok {
 		t.Fatalf("NewSharedCarveBackend returned %T, want *LocalBackend", b)
 	}

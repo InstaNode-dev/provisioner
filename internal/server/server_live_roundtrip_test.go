@@ -81,7 +81,9 @@ func liveServerWithRealRedis(redisAddr string) *server.Server {
 	return server.NewWithBackends(
 		&config.Config{},
 		nil,
-		redis.NewBackend("", redisAddr), // "" → LocalBackend(redisAddr)
+		// backendType "" → LocalBackend; adminURL "" → the credential-less
+		// REDIS_PROVISION_HOST Addr form, which is what the test's local Redis wants.
+		redis.NewBackend("", "", redisAddr),
 		nil, nil, nil,
 		nil, nil, nil, nil,
 		nil,

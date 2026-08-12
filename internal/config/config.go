@@ -16,6 +16,15 @@ type Config struct {
 	RedisProvisionBackend    string // REDIS_PROVISION_BACKEND, default "local"
 	RedisProvisionHost       string // REDIS_PROVISION_HOST, default "localhost:6379"
 
+	// RedisProvisionURL is the CREDENTIALED admin connection for the shared
+	// redis-provision pool: "redis://[user]:password@host:port[/db]"
+	// (REDIS_PROVISION_URL, default unset). It supersedes RedisProvisionHost,
+	// which can only express a bare "host:port" and therefore cannot AUTH
+	// against a pod started with --requirepass — every ACL SETUSER then fails
+	// and /cache/new 503s. Unset = unchanged legacy behaviour (Addr-only).
+	// Same role as PostgresCustomersURL / MongoAdminURI for their backends.
+	RedisProvisionURL string // REDIS_PROVISION_URL, default "" (falls back to RedisProvisionHost)
+
 	// RedisTierAwareRoutingEnabled is the kill-switch for tier-aware Redis
 	// backend routing (REDIS_TIER_AWARE_ROUTING_ENABLED). DEFAULT FALSE /
 	// fail-closed: when false (or unset) the shared redisBackend serves every
@@ -115,6 +124,9 @@ func Load() *Config {
 		NeonRegionID:             getenv("NEON_REGION_ID", "aws-us-east-1"),
 		RedisProvisionBackend:    getenv("REDIS_PROVISION_BACKEND", "local"),
 		RedisProvisionHost:       getenv("REDIS_PROVISION_HOST", "localhost:6379"),
+		// No default: an empty REDIS_PROVISION_URL means "use the legacy
+		// REDIS_PROVISION_HOST Addr form", so nothing that works today breaks.
+		RedisProvisionURL: os.Getenv("REDIS_PROVISION_URL"),
 		// Default false: tier-aware routing is opt-in. Any value other than the
 		// exact string "true" leaves it off (fail-closed) — same pattern as
 		// K8sDedicatedBackend.
@@ -170,6 +182,8 @@ func logStartupConfig(cfg *Config) {
 		"neon_api_key_set", cfg.NeonAPIKey != "",
 		"redis_provision_backend", cfg.RedisProvisionBackend,
 		"redis_provision_host", cfg.RedisProvisionHost,
+		// Presence only — the URL embeds the shared pool's admin password.
+		"redis_provision_url_set", cfg.RedisProvisionURL != "",
 		"redis_tier_aware_routing_enabled", cfg.RedisTierAwareRoutingEnabled,
 		"mongo_admin_uri_set", cfg.MongoAdminURI != "",
 		"mongo_host", cfg.MongoHost,

@@ -129,11 +129,11 @@ func TestGoredisHelpers(t *testing.T) {
 // TestNewBackend_LocalDefault exercises the default switch arm — any unknown
 // backendType falls back to newLocalBackend.
 func TestNewBackend_LocalDefault(t *testing.T) {
-	b := NewBackend("", "localhost:6379")
+	b := NewBackend("", "", "localhost:6379")
 	if _, ok := b.(*LocalBackend); !ok {
 		t.Errorf("NewBackend(\"\") returned %T; want *LocalBackend", b)
 	}
-	b2 := NewBackend("unknown-backend-name", "localhost:6379")
+	b2 := NewBackend("unknown-backend-name", "", "localhost:6379")
 	if _, ok := b2.(*LocalBackend); !ok {
 		t.Errorf("NewBackend(unknown) returned %T; want *LocalBackend", b2)
 	}
@@ -147,7 +147,7 @@ func TestNewBackend_K8sFallsBackOnInitError(t *testing.T) {
 	// returns a LocalBackend.
 	t.Setenv("K8S_KUBECONFIG", "")
 	// REDIS_URL etc. unset so the route-registry path is not exercised.
-	b := NewBackend("k8s", "localhost:6379")
+	b := NewBackend("k8s", "", "localhost:6379")
 	if _, ok := b.(*LocalBackend); !ok {
 		t.Fatalf("expected LocalBackend fallback on k8s init failure; got %T", b)
 	}
@@ -162,7 +162,7 @@ func TestNewBackend_K8sWithBadKubeconfig(t *testing.T) {
 		t.Fatalf("write tmp kubeconfig: %v", err)
 	}
 	t.Setenv("K8S_KUBECONFIG", tmp)
-	b := NewBackend("k8s", "localhost:6379")
+	b := NewBackend("k8s", "", "localhost:6379")
 	if _, ok := b.(*LocalBackend); !ok {
 		t.Fatalf("expected LocalBackend fallback for bad kubeconfig; got %T", b)
 	}
@@ -190,11 +190,11 @@ func TestNewK8sDedicatedBackend_ErrorWithoutKubeconfig(t *testing.T) {
 
 // TestNewLocalBackend_DefaultAddr verifies the empty-host fallback.
 func TestNewLocalBackend_DefaultAddr(t *testing.T) {
-	b := newLocalBackend("")
+	b := newLocalBackend("", "")
 	if b.redisHost != defaultRedisAddr {
 		t.Errorf("redisHost = %q; want %q (default)", b.redisHost, defaultRedisAddr)
 	}
-	b2 := newLocalBackend("custom:6380")
+	b2 := newLocalBackend("", "custom:6380")
 	if b2.redisHost != "custom:6380" {
 		t.Errorf("redisHost = %q; want custom:6380", b2.redisHost)
 	}
@@ -236,7 +236,7 @@ func TestPublicHostPort(t *testing.T) {
 // returned. Also exercises the publicHost env override.
 func TestLocalBackend_Provision_ACLPath(t *testing.T) {
 	addr := liveRedisAddr(t)
-	b := newLocalBackend(addr)
+	b := newLocalBackend("", addr)
 	defer b.rdb.Close()
 
 	t.Setenv("REDIS_PUBLIC_HOST_PORT", "redis.example.com:6379")
@@ -283,7 +283,7 @@ func TestLocalBackend_Provision_NoPublicHost(t *testing.T) {
 	os.Unsetenv("REDIS_PUBLIC_HOST")
 	os.Unsetenv("REDIS_PUBLIC_PORT")
 
-	b := newLocalBackend(addr)
+	b := newLocalBackend("", addr)
 	defer b.rdb.Close()
 	token := uniqueToken(t, "covnph-")
 	defer func() { _ = b.Deprovision(context.Background(), token, "") }()
@@ -301,7 +301,7 @@ func TestLocalBackend_Provision_NoPublicHost(t *testing.T) {
 // namespace and asserts StorageBytes returns the per-key memory sum.
 func TestLocalBackend_StorageBytes_PrefixSum(t *testing.T) {
 	addr := liveRedisAddr(t)
-	b := newLocalBackend(addr)
+	b := newLocalBackend("", addr)
 	defer b.rdb.Close()
 	token := uniqueToken(t, "covstor-")
 	defer func() { _ = b.Deprovision(context.Background(), token, "") }()
@@ -327,7 +327,7 @@ func TestLocalBackend_StorageBytes_PrefixSum(t *testing.T) {
 // the namespace keys are removed.
 func TestLocalBackend_Deprovision_DeletesACLAndKeys(t *testing.T) {
 	addr := liveRedisAddr(t)
-	b := newLocalBackend(addr)
+	b := newLocalBackend("", addr)
 	defer b.rdb.Close()
 	token := uniqueToken(t, "covdep-")
 
@@ -360,7 +360,7 @@ func TestLocalBackend_Deprovision_DeletesACLAndKeys(t *testing.T) {
 // path so Deprovision's SCAN loop exits without ever hitting DEL.
 func TestLocalBackend_Deprovision_NoOpWhenNoKeys(t *testing.T) {
 	addr := liveRedisAddr(t)
-	b := newLocalBackend(addr)
+	b := newLocalBackend("", addr)
 	defer b.rdb.Close()
 	tok := uniqueToken(t, "covdepempty-")
 	if err := b.Deprovision(context.Background(), tok, ""); err != nil {
@@ -1176,7 +1176,7 @@ users:
 	t.Setenv("REDIS_URL_FOR_ROUTES", "redis://"+addr)
 	t.Setenv("REDIS_PROXY_ROUTE_PREFIX", "cov_route:")
 	t.Setenv("REDIS_PROXY_PASSWORD_ROUTE_PREFIX", "cov_route_pw:")
-	b := NewBackend("k8s", "")
+	b := NewBackend("k8s", "", "")
 	if _, ok := b.(*K8sBackend); !ok {
 		t.Fatalf("NewBackend(k8s) returned %T; want *K8sBackend", b)
 	}
@@ -1208,7 +1208,7 @@ users: [{name: f, user: {token: t}}]
 	}
 	t.Setenv("K8S_KUBECONFIG", tmp)
 	t.Setenv("REDIS_URL_FOR_ROUTES", "::not-a-url::")
-	b := NewBackend("k8s", "")
+	b := NewBackend("k8s", "", "")
 	if _, ok := b.(*K8sBackend); !ok {
 		t.Fatalf("NewBackend(k8s) returned %T; want *K8sBackend", b)
 	}
@@ -1761,7 +1761,7 @@ func TestLocalBackend_Deprovision_ScanError(t *testing.T) {
 // keys exist (loop never enters).
 func TestLocalBackend_StorageBytes_EmptyNamespace(t *testing.T) {
 	addr := liveRedisAddr(t)
-	b := newLocalBackend(addr)
+	b := newLocalBackend("", addr)
 	defer b.rdb.Close()
 	got, err := b.StorageBytes(context.Background(), "no-such-token-"+uniqueToken(t, ""), "")
 	if err != nil {

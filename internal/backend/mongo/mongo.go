@@ -14,6 +14,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"os"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -27,6 +28,68 @@ import (
 // connectTimeout is the maximum time to wait for a MongoDB server to be found.
 // Short to fail-fast in tests and when MongoDB is not reachable.
 const connectTimeout = 3 * time.Second
+
+// defaultMongoPort is appended to a public hostname that carries no port of its
+// own. 27017 is the MongoDB wire default and what the mongo-proxy listens on —
+// the same port the k8s backend hardcodes when building customer URLs (k8s.go).
+const defaultMongoPort = "27017"
+
+// buildMongoURL constructs the user-facing connection URL for a provisioned
+// database. Mirrors postgres.buildDBURL (backend/postgres/local.go): the public
+// host wins when configured, otherwise clusterHost — the in-cluster admin
+// address, which is only resolvable from inside the cluster.
+//
+// This is the fix for the leak of internal cluster DNS into customer
+// connection strings: before it, /nosql/new handed out
+// mongodb://…@mongodb.instant-data.svc.cluster.local:27017/… on the shared
+// backend, because the public host was applied only in the "k8s" branch of
+// NewBackend and the cluster runs MONGO_PROVISION_BACKEND=local.
+func buildMongoURL(clusterHost, username, password, dbName string) string {
+	host := publicHostPort()
+	if host == "" {
+		host = clusterHost
+	}
+	return fmt.Sprintf("mongodb://%s:%s@%s/%s?authSource=admin", username, password, host, dbName)
+}
+
+// publicHostPort returns the host:port to embed in user-facing MongoDB URLs, or
+// "" when no public host is configured (the caller then falls back to the
+// cluster-internal mongoHost).
+//
+// Identical mechanism to postgres.publicHostPort (backend/postgres/local.go) and
+// redis.publicHostPort (backend/redis/local.go) — env-resolved at Provision
+// time, never a constructor argument, so the shared/local backend and the
+// dedicated k8s backend agree on the customer-facing hostname.
+//
+// Resolution order:
+//  1. MONGO_PUBLIC_HOST_PORT (e.g. "mongo.instanode.dev:27017")
+//  2. MONGO_PUBLIC_HOST + MONGO_PUBLIC_PORT (port defaults to 27017)
+//  3. K8S_MONGO_PUBLIC_HOST + MONGO_PUBLIC_PORT — the env the k8s branch of
+//     NewBackend already reads. Honouring it here is what makes the fix a pure
+//     code change: a cluster that already advertises mongo.instanode.dev for
+//     dedicated pods now advertises it for shared ones too, no ops change.
+//  4. "" — caller falls back to the in-cluster mongoHost.
+//
+// Deliberately NO built-in default (the k8s branch defaults to
+// "mongo.instanode.dev"): a dev box running the shared backend against
+// localhost:27017 must keep emitting localhost, not a production hostname.
+func publicHostPort() string {
+	if hp := os.Getenv("MONGO_PUBLIC_HOST_PORT"); hp != "" {
+		return hp
+	}
+	host := os.Getenv("MONGO_PUBLIC_HOST")
+	if host == "" {
+		host = os.Getenv("K8S_MONGO_PUBLIC_HOST")
+	}
+	if host == "" {
+		return ""
+	}
+	port := os.Getenv("MONGO_PUBLIC_PORT")
+	if port == "" {
+		port = defaultMongoPort
+	}
+	return host + ":" + port
+}
 
 // decodeStorageSize extracts the dbStats storageSize from a decoded result,
 // tolerating every BSON numeric encoding the server may use across versions
@@ -140,7 +203,7 @@ func (b *LocalBackend) Provision(ctx context.Context, token, tier string) (*Cred
 	}
 
 	// User is created in the admin database; include authSource so clients authenticate correctly.
-	url := fmt.Sprintf("mongodb://%s:%s@%s/%s?authSource=admin", username, password, b.mongoHost, dbName)
+	url := buildMongoURL(b.mongoHost, username, password, dbName)
 	slog.Info("nosql.Provision: provisioned",
 		"token", token,
 		"db", dbName,

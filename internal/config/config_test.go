@@ -23,6 +23,7 @@ var allConfigEnvKeys = []string{
 	"NEON_REGION_ID",
 	"REDIS_PROVISION_BACKEND",
 	"REDIS_PROVISION_HOST",
+	"REDIS_PROVISION_URL",
 	"REDIS_TIER_AWARE_ROUTING_ENABLED",
 	"MONGO_PROVISION_BACKEND",
 	"MONGO_ADMIN_URI",
@@ -142,6 +143,8 @@ func TestLoad_Defaults(t *testing.T) {
 		{"NeonRegionID", cfg.NeonRegionID, "aws-us-east-1"},
 		{"RedisProvisionBackend", cfg.RedisProvisionBackend, "local"},
 		{"RedisProvisionHost", cfg.RedisProvisionHost, "localhost:6379"},
+		// No default: unset means "use the RedisProvisionHost Addr form".
+		{"RedisProvisionURL", cfg.RedisProvisionURL, ""},
 		{"MongoProvisionBackend", cfg.MongoProvisionBackend, "local"},
 		{"MongoAdminURI", cfg.MongoAdminURI, "mongodb://root:root@localhost:27017"},
 		{"MongoHost", cfg.MongoHost, "localhost:27017"},
@@ -214,6 +217,7 @@ func TestLoad_Overrides(t *testing.T) {
 	t.Setenv("NEON_REGION_ID", "aws-eu-west-1")
 	t.Setenv("REDIS_PROVISION_BACKEND", "upstash")
 	t.Setenv("REDIS_PROVISION_HOST", "redis.example:6380")
+	t.Setenv("REDIS_PROVISION_URL", "redis://:poolpw@redis.example:6380/0")
 	t.Setenv("REDIS_TIER_AWARE_ROUTING_ENABLED", "true")
 	t.Setenv("MONGO_PROVISION_BACKEND", "k8s")
 	t.Setenv("MONGO_ADMIN_URI", "mongodb://admin:pw@m:27017")
@@ -261,6 +265,7 @@ func TestLoad_Overrides(t *testing.T) {
 		{"NeonRegionID", cfg.NeonRegionID, "aws-eu-west-1"},
 		{"RedisProvisionBackend", cfg.RedisProvisionBackend, "upstash"},
 		{"RedisProvisionHost", cfg.RedisProvisionHost, "redis.example:6380"},
+		{"RedisProvisionURL", cfg.RedisProvisionURL, "redis://:poolpw@redis.example:6380/0"},
 		{"MongoProvisionBackend", cfg.MongoProvisionBackend, "k8s"},
 		{"MongoAdminURI", cfg.MongoAdminURI, "mongodb://admin:pw@m:27017"},
 		{"MongoHost", cfg.MongoHost, "m.example:27017"},

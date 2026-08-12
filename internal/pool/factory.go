@@ -23,6 +23,7 @@ func NewWithConfig(db *pgxpool.Pool, aesKey []byte, cfg Config, appCfg *config.C
 	)
 	redisB := redis.NewBackend(
 		appCfg.RedisProvisionBackend,
+		appCfg.RedisProvisionURL,
 		appCfg.RedisProvisionHost,
 	)
 	mongoB := mongo.NewBackend(

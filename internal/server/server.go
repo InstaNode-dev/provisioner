@@ -160,9 +160,9 @@ func New(cfg *config.Config, poolMgr *pool.Manager) *Server {
 	// but moves every non-Team tier onto a shared ACL carve so a 5MB cache no
 	// longer costs a whole pod. Off = identical to today; this branch never runs
 	// in prod until an operator flips the flag.
-	redisBackend := redis.NewBackend(cfg.RedisProvisionBackend, cfg.RedisProvisionHost)
+	redisBackend := redis.NewBackend(cfg.RedisProvisionBackend, cfg.RedisProvisionURL, cfg.RedisProvisionHost)
 	if cfg.RedisTierAwareRoutingEnabled {
-		sharedCarve := redis.NewSharedCarveBackend(cfg.RedisProvisionHost)
+		sharedCarve := redis.NewSharedCarveBackend(cfg.RedisProvisionURL, cfg.RedisProvisionHost)
 		redisBackend = redis.NewTierDispatchBackend(sharedCarve, redisBackend)
 		slog.Info("provisioner: redis tier-aware routing ENABLED",
 			"configured_backend", cfg.RedisProvisionBackend,

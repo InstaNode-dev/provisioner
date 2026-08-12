@@ -78,7 +78,11 @@ type Credentials struct {
 // NewBackend creates a Backend using the given backend type string.
 // "k8s" → K8sBackend (dedicated pod per token, every tier).
 // "local" (default) → LocalBackend (ACL user on shared cluster).
-func NewBackend(backendType, redisHost string) Backend {
+//
+// adminURL (REDIS_PROVISION_URL) carries the credentials for the shared pool and
+// wins over redisHost (REDIS_PROVISION_HOST) when set — see newLocalBackend. The
+// two-input shape mirrors mongo.NewBackend(backendType, adminURI, mongoHost).
+func NewBackend(backendType, adminURL, redisHost string) Backend {
 	switch backendType {
 	case "k8s":
 		// Dedicated-pod-per-resource backend for every tier. Each /cache/new
@@ -103,7 +107,7 @@ func NewBackend(backendType, redisHost string) Backend {
 		b, err := newK8sBackend(kubeconfig, storageClass, image, externalHost, storageSizeGi)
 		if err != nil {
 			slog.Error("redis.k8s_backend_init_failed_fallback_to_local", "error", err)
-			return newLocalBackend(redisHost)
+			return newLocalBackend(adminURL, redisHost)
 		}
 		b.SetPublicHost(publicHost)
 		// Route registry — writes route records per provision so the
@@ -122,15 +126,16 @@ func NewBackend(backendType, redisHost string) Backend {
 		slog.Info("redis.backend_selected", "backend", "k8s", "external_host", externalHost, "public_host", publicHost)
 		return b
 	default:
-		return newLocalBackend(redisHost)
+		return newLocalBackend(adminURL, redisHost)
 	}
 }
 
 // NewSharedCarveBackend creates a LocalBackend: an ACL user + key-prefix carve
 // on a SHARED Redis instance (many tenants per pod). It is the non-Team side of
-// tier-aware routing (see TierDispatchBackend). redisHost is "host:port".
-func NewSharedCarveBackend(redisHost string) Backend {
-	return newLocalBackend(redisHost)
+// tier-aware routing (see TierDispatchBackend). adminURL is the credentialed
+// REDIS_PROVISION_URL (may be empty); redisHost is the "host:port" fallback.
+func NewSharedCarveBackend(adminURL, redisHost string) Backend {
+	return newLocalBackend(adminURL, redisHost)
 }
 
 // NewDedicatedBackend creates a DedicatedProvider for Team-tier Redis provisioning.

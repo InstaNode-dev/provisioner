@@ -166,7 +166,7 @@ jobs:
           repository: InstaNode-dev/proto
           path: proto
         continue-on-error: true
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version-file: provisioner/go.mod
       # Drop the `|| true` from the previous revision — it masked real test
@@ -232,7 +232,7 @@ jobs:
       # covered by a test (100%), and the project floor stays >=95%.
       # Tool: diff-cover (https://github.com/Bachmann1234/diff-cover).
       # ------------------------------------------------------------------
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         if: github.event_name == 'pull_request'
         with:
           python-version: '3.12'
